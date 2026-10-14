@@ -9,3 +9,7 @@ target/
 *.pth
 *.bin
 models/
+
+# The exception: docs/models/ holds notes about models (docs/models/lama.md), never weights. The
+# weight patterns above still apply inside it, so a .onnx dropped there stays untracked.
+!docs/models/

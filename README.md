@@ -15,16 +15,20 @@ patterns). The work list is that repo's `agents/TASKS.md`, the `MG-*` rows.
 commercial use needs a licence from Erik Kristianson. See `LICENSE.md`.
 
 
-**Status: pre-alpha, fake backend only.** MG-01 built the server: `caim serve` binds `127.0.0.1` on a free port, publishes
-the endpoint file, and speaks the whole job protocol of SPEC amendment 11. No models are installed yet, so the only
-backend is a built-in fake one that fills a masked area with the mean colour of the pixels around it. The model store
-is MG-02 and the ONNX runner is MG-04.
+**Status: pre-alpha, no real inference yet.** MG-01 built the server: `caim serve` binds `127.0.0.1` on a free port,
+publishes the endpoint file, and speaks the whole job protocol of SPEC amendment 11. MG-02 built the model store: a
+catalog compiled into the binary (`crates/caim/catalog/models.toml`), the licence gate that decides what CAIM may offer,
+SHA-256-checked downloads, and the `caim models ...` commands. Nothing runs a model yet - the only backend is a built-in
+fake one that fills a masked area with the mean colour of the pixels around it - and the ONNX runner is MG-04.
 
 ## Running it
 
 ```text
 caim                        # the same as: caim serve
 caim serve --fake-backend   # jobs run on the built-in mean-colour fill
+caim models list            # what the catalog offers, and what is installed
+caim models install <id>    # download one model, hashing it while it arrives
+caim models verify <id>     # re-hash an installed model against the catalog
 caim --version
 ```
 
@@ -45,8 +49,9 @@ Where that file lives:
 
 `CRAFT_AI_ENDPOINT`, set to a file path, moves it; that is how the tests keep several servers apart. On Windows the
 file inherits the per-user permissions `%LOCALAPPDATA%` already carries, so the token inside it is readable only by
-your own account. If `CRAFT_AI_ENDPOINT` points somewhere else, the file inherits that folder's permissions instead,
-so point it at a folder only you can read.
+your own account; on Linux and macOS the file is created with mode `0600`, so it is readable only by your own account
+there too, even in the moment between the temp file and the rename. If `CRAFT_AI_ENDPOINT` points somewhere else, the file
+inherits that folder's permissions instead, so point it at a folder only you can read.
 
 The server answers only `127.0.0.1`, only with the right `Authorization: Bearer <token>` header, and only when
 `Host:` is exactly `127.0.0.1:<port>` - which is what stops a page in your browser, or a DNS rebinding, from reaching
@@ -63,3 +68,61 @@ Press Enter in the terminal: that stops the server cleanly and removes `endpoint
 but MG-01 adds no dependency and `std` has no signal handler, so on Windows Ctrl+C ends the process where it stands
 and leaves the file behind. That is safe - a client that reads a stale file gets a refused connection and re-reads
 it, and the next start replaces the file - but Enter is the clean stop.
+
+## Models
+
+CAIM owns the model files; PhotoCraft never holds a copy. What exists is a catalog compiled into the binary,
+`crates/caim/catalog/models.toml`, one `[[model]]` block per model version with the SPEC amendment 14 manifest fields:
+`id`, `version`, `task`, `file`, `url` (HTTPS, pinned to a revision), `revision`, `sha256`, `size`, the three licences
+(`licence_code`, `licence_weights`, `licence_training_data` - amendment 13 counts the training data), `provenance`, and
+an optional `[model.override]` table (`by`, `date`, `reason`, `note`). The one entry today is LaMa; its facts and licence
+note are in `docs/models/lama.md`.
+
+```text
+caim models list                        # task, size, licences, and whether it is installed
+caim models install lama                # download it, hashing while it arrives
+caim models install lama --accept-note  # accept a flagged model's note first, then download
+caim models verify lama                 # re-hash the file on disk (startup does not)
+```
+
+Models live in the same data directory as `endpoint.json`:
+
+| Platform | Path |
+|---|---|
+| Windows | `%LOCALAPPDATA%\CraftAI\models\<id>\<version>\<file>` |
+| macOS | `~/Library/Application Support/CraftAI/models/<id>/<version>/<file>` |
+| Linux | `$XDG_DATA_HOME/CraftAI/models/...`, else `~/.local/share/CraftAI/models/<id>/<version>/<file>` |
+
+`CRAFT_AI_MODELS`, set to a folder, moves the whole models tree; that is how the tests keep out of the real store.
+
+A model counts as **installed** only when three things agree: the file is there, its size is what the catalog says, and
+a `verified.json` - written only after a successful SHA-256 check - names the same hash. Startup never re-hashes a
+200 MB file; `caim models verify <id>` does, and a failed check removes the record so the model stops counting as
+installed until it is downloaded again.
+
+A download goes to `<file>.part` in the same folder and is hashed as it streams. A server whose `Content-Length`, or
+whose bytes read, go past the catalog's `size` is refused; a hash or size mismatch deletes the `.part` file and names
+the expected and the actual value. Redirects are followed - Hugging Face hands the download to a CDN - but never down
+to plain HTTP. A model that is already installed makes no request at all. There is no resume yet (CAIM-03 puts resume
+in S2) and cancellation waits for MG-05; while a download runs the CLI prints a percentage.
+
+**The licence gate.** An entry is not offered - and the test over the embedded catalog fails in CI - when a field is
+missing or empty, when anything says `UNCLEAR`, when the URL is not HTTPS, when `sha256` is not 64 lowercase hex, when
+the file is not `.onnx` or `.safetensors`, when two entries share an id and version, or when a licence is on the deny
+list: GPL, LGPL, AGPL, anything with `NC` as a licence token such as `CC-BY-NC-4.0`, OpenRAIL, `research-only`, or
+`non-commercial`. A denylisted entry can be carried with a complete `[model.override]` from Erik - `by`, `date`,
+`reason` and `note` - and then it needs one acknowledgment: `caim models install lama` prints the note and stops, and
+`--accept-note` records `acknowledged.json` (id, version, the note's SHA-256, the time) next to the model and goes
+ahead. Change the note and it needs acknowledging again. LaMa is flagged for its Places365 training data, which is
+licensed for non-commercial research (decision D2 in the PhotoCraft task list).
+
+### Exit codes
+
+`caim --help` repeats these.
+
+| Code | Meaning |
+|---|---|
+| 0 | everything is fine |
+| 1 | something went wrong: the server could not start, a download failed, or a file or hash did not match the catalog |
+| 2 | the arguments do not make sense |
+| 3 | the model is unknown, is not installed, or its note needs acknowledging |
