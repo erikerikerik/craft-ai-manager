@@ -40,7 +40,14 @@ struct EndpointFile {
 /// The file for this platform, or None when the platform has nowhere to put one.
 #[must_use]
 pub fn default_endpoint_file() -> Option<PathBuf> {
-    platform_data_dir().map(|dir| dir.join(ENDPOINT_DIR).join(ENDPOINT_NAME))
+    data_dir().map(|dir| dir.join(ENDPOINT_NAME))
+}
+
+/// The folder CAIM keeps its files in: `%LOCALAPPDATA%\CraftAI` on Windows, and the platform
+/// equivalent elsewhere. The model store hangs off here too, so there is one place to look.
+#[must_use]
+pub fn data_dir() -> Option<PathBuf> {
+    platform_data_dir().map(|dir| dir.join(ENDPOINT_DIR))
 }
 
 fn platform_data_dir() -> Option<PathBuf> {

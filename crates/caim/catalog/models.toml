@@ -1,0 +1,30 @@
+# The model catalog (SPEC v1.1 amendment 14). One [[model]] block per model version, compiled into
+# the binary with include_str!. Every field is required: the licence gate in src/catalog.rs fails the
+# tests when one is missing, empty, UNCLEAR, non-HTTPS, or denylisted without a complete override.
+# Amendment 13: the training data counts, not just the code and the weights.
+#
+# Licences here were read from agents/models/lama.md in the PhotoCraft fork (task MG-03), which is
+# copied into docs/models/lama.md in this repo.
+
+[[model]]
+id = "lama"
+version = "1"
+task = "fill_masked_area"
+file = "lama_fp32.onnx"
+url = "https://huggingface.co/Carve/LaMa-ONNX/resolve/a3ee2fca54baebec351b8fa7786154ffa7555aa6/lama_fp32.onnx"
+revision = "a3ee2fca54baebec351b8fa7786154ffa7555aa6"
+sha256 = "1faef5301d78db7dda502fe59966957ec4b79dd64e16f03ed96913c7a4eb68d6"
+size = 208044816
+licence_code = "Apache-2.0"
+licence_weights = "Apache-2.0"
+licence_training_data = "research-only"
+provenance = "An ONNX port (Hugging Face Carve/LaMa-ONNX) of advimman's big-lama, trained on Places365; downloaded and checked on the CraftML PC on Oct 13, 2026 (docs/models/lama.md)."
+
+# Erik's override (decision D2, Oct 13, 2026): the weights are Apache-2.0 but Places365 is licensed
+# for non-commercial research, so this model is M1 and personal use only until it is replaced (D7).
+# The note is what caim models install shows, and what has to be acknowledged once.
+[model.override]
+by = "Erik"
+date = "2026-10-13"
+reason = "D2: M1 and personal use only; replace before any public release (D7)"
+note = "LaMa was trained on Places365, whose images are licensed for non-commercial research. Use it for personal work only."

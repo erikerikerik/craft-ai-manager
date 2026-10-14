@@ -13,24 +13,36 @@
 
 /// The built-in fake backend: a mean-colour fill, so MG-01 can answer jobs with no model installed.
 pub mod backend;
+/// The model catalog: what exists, its licences, and the gate that decides whether CAIM may offer it.
+pub mod catalog;
 /// The command line.
 pub mod cli;
 /// `endpoint.json`: where the port and token are published, atomically.
 pub mod endpoint;
 /// Errors, and the status each one is answered with.
 pub mod error;
+/// Downloading a model: the `Fetch` trait, the streaming SHA-256, and the size and hash checks.
+pub mod fetch;
 /// The HTTP/1.1 framing: request head, bounded body, one reply per connection.
 pub mod http;
 /// The PNG halves of the protocol: `image`, `mask`, `result.png`.
 pub mod image;
 /// The job queue, the worker thread, and the states a job moves through.
 pub mod job;
+/// The `caim models ...` commands.
+pub mod models;
 /// A bounded `multipart/form-data` parser for exactly the three parts the protocol defines.
 pub mod multipart;
 /// The JSON of the protocol: what a job asks for and what each endpoint answers.
 pub mod protocol;
 /// The loopback server itself.
 pub mod server;
+/// Where models live on disk, and what "installed" means.
+pub mod store;
+/// Plumbing shared by the unit tests: a scratch folder, a fixture catalog entry, and a fetcher that
+/// hands over bytes instead of a network. Not compiled into the binary.
+#[cfg(test)]
+pub(crate) mod testkit;
 /// The per-start token, and the constant-time check every request goes through.
 pub mod token;
 
@@ -40,21 +52,28 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Exit code for "the arguments do not make sense".
 pub const EXIT_USAGE: u8 = 2;
 
-/// Exit code for "the server could not start, or stopped badly".
-pub const EXIT_START: u8 = 1;
+/// Exit code for "something went wrong": the server could not start, a download failed, a file or a
+/// hash did not match what the catalog promised.
+pub const EXIT_FAILED: u8 = 1;
+
+/// Exit code for "this model is not available as asked": it is not in the catalog, it is not
+/// installed, or its note has to be acknowledged before it can be downloaded.
+pub const EXIT_MODEL: u8 = 3;
 
 pub use cli::{Action, USAGE, classify};
 pub use server::{ServeOptions, Server};
 
 #[cfg(test)]
 mod tests {
-    use super::{EXIT_START, EXIT_USAGE, VERSION};
+    use super::{EXIT_FAILED, EXIT_MODEL, EXIT_USAGE, VERSION};
 
     #[test]
-    fn the_crate_reports_a_version_and_two_distinct_exit_codes() {
+    fn the_crate_reports_a_version_and_three_distinct_exit_codes() {
         assert!(!VERSION.is_empty());
-        assert_ne!(EXIT_USAGE, EXIT_START);
-        const { assert!(EXIT_USAGE > 0 && EXIT_START > 0, "a shell needs a non-zero code to notice") };
+        assert_ne!(EXIT_USAGE, EXIT_FAILED);
+        assert_ne!(EXIT_MODEL, EXIT_USAGE);
+        assert_ne!(EXIT_MODEL, EXIT_FAILED);
+        const { assert!(EXIT_USAGE > 0 && EXIT_FAILED > 0 && EXIT_MODEL > 0, "a shell needs a non-zero code to notice") };
     }
 
     #[test]
