@@ -1,6 +1,7 @@
 MG-01 | craft-ai-manager | cargo test
 MG-02 | craft-ai-manager | cargo test
 BASE | craft-ai-manager | cargo test
+MG-04 | craft-ai-manager | cargo test
 # Regression guards. Before any PR merges, every command below must pass.
 # Format: <feature ID> | <repo> | <command>
 # Add your feature's tests here in the same PR that completes it. Never delete a line to make a

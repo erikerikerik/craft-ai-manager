@@ -1,0 +1,950 @@
+//! The LaMa runner (MG-04): the maths around the model, and the ONNX Runtime session itself.
+//!
+//! The tensor facts live in `docs/models/lama.md`: `image` is RGB 0-1, `mask` is 1 = fill, the
+//! output is RGB 0-255, and the size is fixed at 512x512. So a job crops the mask box plus padding,
+//! resizes the crop to 512, runs the model, resizes the answer back, and blends it in. Everything
+//! except [OrtSession] is plain arithmetic on vectors, which is what makes it testable with no model
+//! file at all (MG-04 item 6).
+//!
+//! Amendment 11 is the rule the blend is built around: pixels outside the mask come back bit for
+//! bit. That is why the blend uses the *original* mask value only - never the dilated mask the
+//! model sees, which exists to make LaMa repaint the edge of the selection as well.
+
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::time::{Duration, Instant};
+
+use ort::environment::Environment;
+
+use crate::backend::Filled;
+use crate::catalog::{self, Model};
+use crate::error::{Fail, Result};
+use crate::image::{CHANNELS, Frame};
+use crate::protocol::TASK_FILL;
+use crate::store;
+
+/// The size LaMa takes, in pixels, on a side. Fixed by the graph, not by us.
+pub const MODEL_SIZE: usize = 512;
+/// How far the model mask is grown, at 512 scale, so the edge of the selection is repainted too.
+pub const DILATE_PX: usize = 4;
+/// The smallest padding around the mask box, in image pixels.
+pub const MIN_PAD: usize = 32;
+/// The other padding rule: this percent of the box's longer side.
+pub const PAD_PERCENT: usize = 25;
+/// The catalog id of the model this runner can run.
+pub const LAMA_ID: &str = "lama";
+/// What `/result` reports when a job ran here.
+pub const LAMA_MODEL: &str = "lama";
+/// LaMa runs on the CPU: no GPU execution provider is compiled in.
+pub const LAMA_DEVICE: &str = "cpu";
+/// Everything CAIM does is local.
+pub const LAMA_PROVIDER: &str = "local";
+
+/// The stages of MG-05, and the progress each one reports.
+pub const PREPARE_PROGRESS: f64 = 0.2;
+pub const LOAD_PROGRESS: f64 = 0.25;
+pub const RUN_PROGRESS: f64 = 0.3;
+pub const RUN_END: f64 = 0.9;
+/// The `message` of each stage, which is what tells PhotoCraft where a job has got to.
+pub const MSG_PREPARE: &str = "Craft AI Manager is preparing the image.";
+pub const MSG_LOAD: &str = "Craft AI Manager is loading the LaMa model.";
+pub const MSG_RUN: &str = "Craft AI Manager is running LaMa.";
+pub const MSG_FINISH: &str = "Craft AI Manager is putting the fill back.";
+
+/// The sentence a job that was cancelled gets; `job` turns it into the `cancelled` state anyway.
+const CANCELLED: &str = "Craft AI Manager stopped the job.";
+/// How often the watcher thread looks for a `DELETE` while a run is going on.
+const WATCH_POLL: Duration = Duration::from_millis(20);
+/// The channel index that holds alpha, when the image has one.
+const ALPHA_CHANNEL: usize = 3;
+
+/// A rectangle inside an image. `width` and `height` are counts, so the far edge is `x + width`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Window {
+    pub x: usize,
+    pub y: usize,
+    pub width: usize,
+    pub height: usize,
+}
+
+impl Window {
+    /// The index of one pixel of the whole image this window sits in.
+    fn pixel(self, row: usize, column: usize, image_width: usize) -> Option<usize> {
+        let (x, y) = (self.x.checked_add(column)?, self.y.checked_add(row)?);
+        y.checked_mul(image_width)?.checked_add(x)
+    }
+}
+
+/// The box around every pixel the mask covers, or `None` when the mask covers nothing.
+#[must_use]
+pub fn mask_box(width: usize, height: usize, mask: &[u8]) -> Option<Window> {
+    let (mut left, mut top, mut right, mut bottom) = (usize::MAX, usize::MAX, 0usize, 0usize);
+    for row in 0..height {
+        for column in 0..width {
+            let covered = mask_box_covers(mask, row, column, width);
+            if !covered {
+                continue;
+            }
+            left = left.min(column);
+            top = top.min(row);
+            right = right.max(column.saturating_add(1));
+            bottom = bottom.max(row.saturating_add(1));
+        }
+    }
+    if right <= left || bottom <= top {
+        return None;
+    }
+    Some(Window { x: left, y: top, width: right - left, height: bottom - top })
+}
+
+/// Does the mask cover one pixel? A mask shorter than the image counts as clear, which the job's own
+/// checks are meant to prevent.
+fn mask_box_covers(mask: &[u8], row: usize, column: usize, width: usize) -> bool {
+    match row.checked_mul(width).and_then(|at| at.checked_add(column)) {
+        Some(at) => mask.get(at).copied().unwrap_or(0) > 0,
+        None => false,
+    }
+}
+
+/// The padding around a mask box: at least 32 px, and at least 25% of the box's longer side.
+#[must_use]
+pub fn pad_for(longer_side: usize) -> usize {
+    MIN_PAD.max(longer_side.saturating_mul(PAD_PERCENT) / 100)
+}
+
+/// The crop to send to the model: the box plus its padding, grown to a square where the image
+/// allows, and always clamped to the image. The box is inside the result whatever happens.
+#[must_use]
+pub fn crop_window(mask: Window, image_width: usize, image_height: usize) -> Window {
+    let pad = pad_for(mask.width.max(mask.height));
+    let left = mask.x.saturating_sub(pad);
+    let top = mask.y.saturating_sub(pad);
+    let right = mask.x.saturating_add(mask.width).saturating_add(pad).min(image_width);
+    let bottom = mask.y.saturating_add(mask.height).saturating_add(pad).min(image_height);
+    let (wide, tall) = (right.saturating_sub(left), bottom.saturating_sub(top));
+    let side = wide.max(tall);
+    // A square only when one fits in the image at all; otherwise the padded box, already clamped.
+    if side <= image_width && side <= image_height {
+        let centre_x = left.saturating_add(wide / 2);
+        let centre_y = top.saturating_add(tall / 2);
+        return Window {
+            x: centre_x.saturating_sub(side / 2).min(image_width.saturating_sub(side)),
+            y: centre_y.saturating_sub(side / 2).min(image_height.saturating_sub(side)),
+            width: side,
+            height: side,
+        };
+    }
+    Window { x: left, y: top, width: wide, height: tall }
+}
+/// Which filter one axis uses: area when the axis shrinks, bilinear when it grows (MG-04 item 3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Filter {
+    Area,
+    Bilinear,
+}
+
+#[must_use]
+pub const fn filter_for(source: usize, target: usize) -> Filter {
+    if target < source { Filter::Area } else { Filter::Bilinear }
+}
+
+/// The source indices and weights that build each pixel of a resized axis. Weights always add up to
+/// one, so a flat area stays flat whatever the direction, and the edges are clamped rather than
+/// wrapped or extrapolated.
+#[must_use]
+pub fn axis_weights(source: usize, target: usize) -> Vec<Vec<(usize, f64)>> {
+    if target == 0 {
+        return Vec::new();
+    }
+    if source == 0 {
+        return vec![Vec::new(); target];
+    }
+    let scale = f64::from(u32::try_from(source).unwrap_or(u32::MAX)) / f64::from(u32::try_from(target).unwrap_or(u32::MAX));
+    match filter_for(source, target) {
+        Filter::Bilinear => (0..target)
+            .map(|target_index| {
+                let centre = ((f64::from(u32::try_from(target_index).unwrap_or(u32::MAX)) + 0.5) * scale - 0.5)
+                    .clamp(0.0, f64::from(u32::try_from(source - 1).unwrap_or(u32::MAX)));
+                let before = centre.floor() as usize;
+                let after = (before + 1).min(source - 1);
+                let fraction = centre - before as f64;
+                weight_pair(before, after, fraction)
+            })
+            .collect(),
+        Filter::Area => (0..target)
+            .map(|target_index| {
+                let start = f64::from(u32::try_from(target_index).unwrap_or(u32::MAX)) * scale;
+                let end = (f64::from(u32::try_from(target_index).unwrap_or(u32::MAX)) + 1.0) * scale;
+                let first = start.floor().max(0.0) as usize;
+                let last = end.ceil().min(source as f64) as usize;
+                let span = (end - start).max(f64::EPSILON);
+                let mut list: Vec<(usize, f64)> = Vec::new();
+                for source_index in first..last.max(first.saturating_add(1)) {
+                    let overlap = end.min((source_index + 1) as f64) - start.max(source_index as f64);
+                    if overlap > 0.0 {
+                        list.push((source_index, overlap / span));
+                    }
+                }
+                if list.is_empty() {
+                    list.push((first.min(source - 1), 1.0));
+                }
+                list
+            })
+            .collect(),
+    }
+}
+
+/// One pair of bilinear weights, merged when both ends are the same source pixel.
+fn weight_pair(before: usize, after: usize, fraction: f64) -> Vec<(usize, f64)> {
+    if before == after {
+        return vec![(before, 1.0)];
+    }
+    vec![(before, 1.0 - fraction), (after, fraction)]
+}
+
+/// Resize one channel plane, row-major, area for a shrink and bilinear for a growth.
+#[must_use]
+pub fn resize_plane(plane: &[f32], width: usize, height: usize, target_width: usize, target_height: usize) -> Vec<f32> {
+    if target_width == 0 || target_height == 0 {
+        return Vec::new();
+    }
+    // Across first, then down: the widest intermediate plane is height x target_width, which keeps
+    // the memory near the size of the model input rather than the size of the crop.
+    let across = resample_across(plane, height, width, target_width);
+    resample_down(&across, height, target_width, target_height)
+}
+
+/// Resample every row of a plane from `width` to `target_width` samples.
+fn resample_across(plane: &[f32], rows: usize, width: usize, target_width: usize) -> Vec<f32> {
+    let weights = axis_weights(width, target_width);
+    let mut out = vec![0.0f32; rows.saturating_mul(target_width)];
+    for row in 0..rows {
+        let Some(row_start) = row.checked_mul(width) else { continue };
+        for (target_index, list) in weights.iter().enumerate() {
+            let mut sum = 0.0;
+            for (source_index, weight) in list {
+                if let Some(sample) = plane.get(row_start.saturating_add(*source_index)) {
+                    sum += f64::from(*sample) * weight;
+                }
+            }
+            if let Some(slot) = out.get_mut(row.saturating_mul(target_width).saturating_add(target_index)) {
+                *slot = sum as f32;
+            }
+        }
+    }
+    out
+}
+
+/// Resample a plane from `rows` rows to `target_rows`; the plane already has `target_width` samples a row.
+fn resample_down(plane: &[f32], rows: usize, target_width: usize, target_rows: usize) -> Vec<f32> {
+    let weights = axis_weights(rows, target_rows);
+    let mut out = vec![0.0f32; target_rows.saturating_mul(target_width)];
+    for (target_index, list) in weights.iter().enumerate() {
+        for (source_index, weight) in list {
+            let Some(source_start) = source_index.checked_mul(target_width) else { continue };
+            let Some(target_start) = target_index.checked_mul(target_width) else { continue };
+            for column in 0..target_width {
+                let (Some(sample), Some(slot)) = (plane.get(source_start.saturating_add(column)), out.get_mut(target_start.saturating_add(column))) else {
+                    continue;
+                };
+                *slot = (f64::from(*slot) + f64::from(*sample) * weight) as f32;
+            }
+        }
+    }
+    out
+}
+
+/// The mask of the crop at model size: `mask > 0` becomes 1.0. Nearest neighbour, because a
+/// resampled mask would lose the thin parts of a selection before the dilation gets them back.
+#[must_use]
+pub fn mask_plane(mask: &[u8], window: Window, image_width: usize, size: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; size.saturating_mul(size)];
+    for row in 0..size {
+        for column in 0..size {
+            let source_x = window.x.saturating_add(sample_in_window(column, window.width, size));
+            let source_y = window.y.saturating_add(sample_in_window(row, window.height, size));
+            let covered = match source_y.checked_mul(image_width).and_then(|at| at.checked_add(source_x)) {
+                Some(at) => mask.get(at).copied().unwrap_or(0) > 0,
+                None => false,
+            };
+            if let Some(slot) = out.get_mut(row.saturating_mul(size).saturating_add(column)) {
+                *slot = if covered { 1.0 } else { 0.0 };
+            }
+        }
+    }
+    out
+}
+
+/// Which sample of a window one model pixel stands for.
+fn sample_in_window(target: usize, window_size: usize, size: usize) -> usize {
+    if window_size == 0 || size == 0 {
+        return 0;
+    }
+    let centre = (f64::from(u32::try_from(target).unwrap_or(u32::MAX)) + 0.5) * f64::from(u32::try_from(window_size).unwrap_or(u32::MAX))
+        / f64::from(u32::try_from(size).unwrap_or(u32::MAX));
+    centre.floor().clamp(0.0, f64::from(u32::try_from(window_size - 1).unwrap_or(u32::MAX))) as usize
+}
+
+/// Grow a square mask plane by `radius` pixels in every direction (a square structuring element,
+/// done as two passes). This is the model mask only; the blend never sees it.
+#[must_use]
+pub fn dilate(plane: &[f32], size: usize, radius: usize) -> Vec<f32> {
+    if size == 0 || radius == 0 {
+        return plane.to_vec();
+    }
+    let across = dilate_across(plane, size, radius);
+    dilate_down(&across, size, radius)
+}
+
+fn dilate_across(plane: &[f32], size: usize, radius: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; plane.len()];
+    for row in 0..size {
+        for column in 0..size {
+            let mut best = 0.0f32;
+            for offset in 0..=2 * radius {
+                let source = column.saturating_add(offset).checked_sub(radius);
+                let Some(source) = source.filter(|source| *source < size) else { continue };
+                if let Some(sample) = plane.get(row.saturating_mul(size).saturating_add(source)) {
+                    best = best.max(*sample);
+                }
+            }
+            if let Some(slot) = out.get_mut(row.saturating_mul(size).saturating_add(column)) {
+                *slot = best;
+            }
+        }
+    }
+    out
+}
+
+fn dilate_down(plane: &[f32], size: usize, radius: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; plane.len()];
+    for row in 0..size {
+        for column in 0..size {
+            let mut best = 0.0f32;
+            for offset in 0..=2 * radius {
+                let source = row.saturating_add(offset).checked_sub(radius);
+                let Some(source) = source.filter(|source| *source < size) else { continue };
+                if let Some(sample) = plane.get(source.saturating_mul(size).saturating_add(column)) {
+                    best = best.max(*sample);
+                }
+            }
+            if let Some(slot) = out.get_mut(row.saturating_mul(size).saturating_add(column)) {
+                *slot = best;
+            }
+        }
+    }
+    out
+}
+/// The crop, resized to 512x512 and normalised to 0-1, as the three planes LaMa asks for.
+///
+/// Alpha never reaches the model: LaMa takes RGB, so the alpha channel is blended separately.
+#[must_use]
+pub fn model_input(image: &Frame, window: Window) -> Vec<f32> {
+    let max = f64::from(image.max_sample()).max(1.0);
+    let image_width = usize::try_from(image.width).unwrap_or(usize::MAX);
+    let plane_size = MODEL_SIZE.saturating_mul(MODEL_SIZE);
+    let mut out = vec![0.0f32; 3 * plane_size];
+    for channel in 0..3 {
+        let mut plane = vec![0.0f32; window.width.saturating_mul(window.height)];
+        for row in 0..window.height {
+            for column in 0..window.width {
+                let Some(at) =
+                    window.pixel(row, column, image_width).and_then(|pixel| pixel.checked_mul(image.channels).and_then(|base| base.checked_add(channel)))
+                else {
+                    continue;
+                };
+                let sample = image.samples.get(at).copied().unwrap_or(0);
+                if let Some(slot) = plane.get_mut(row.saturating_mul(window.width).saturating_add(column)) {
+                    *slot = (f64::from(sample) / max) as f32;
+                }
+            }
+        }
+        let resized = resize_plane(&plane, window.width, window.height, MODEL_SIZE, MODEL_SIZE);
+        copy_plane(&resized, &mut out, channel.saturating_mul(plane_size));
+    }
+    out
+}
+
+/// Copy one plane into the packed model input, starting at `start`.
+fn copy_plane(plane: &[f32], out: &mut [f32], start: usize) {
+    for (offset, sample) in plane.iter().enumerate() {
+        if let Some(slot) = out.get_mut(start.saturating_add(offset)) {
+            *slot = *sample;
+        }
+    }
+}
+
+/// The model's answer back at the crop's size: three planes of 0-1 samples, clipped from whatever
+/// the graph produced (LaMa is told to answer 0-255 but is not guaranteed to stay there).
+#[must_use]
+pub fn fill_back(output: &[f32], window: Window) -> Vec<Vec<f32>> {
+    let plane_size = MODEL_SIZE.saturating_mul(MODEL_SIZE);
+    let mut planes = Vec::with_capacity(3);
+    for channel in 0..3usize {
+        let start = channel.saturating_mul(plane_size);
+        let mut plane = vec![0.0f32; plane_size];
+        for offset in 0..plane_size {
+            if let Some(sample) = output.get(start.saturating_add(offset))
+                && let Some(slot) = plane.get_mut(offset)
+            {
+                *slot = (f64::from(*sample).clamp(0.0, 255.0) / 255.0) as f32;
+            }
+        }
+        planes.push(resize_plane(&plane, MODEL_SIZE, MODEL_SIZE, window.width, window.height));
+    }
+    planes
+}
+
+/// Put the fill back into the image: `out = in x (1 - m) + fill x m`, with `m` the **original** mask
+/// value over 255 - never the dilated mask the model saw.
+///
+/// Where the mask is 0 the pixel is skipped, so it comes back bit for bit (amendment 11). A 16-bit
+/// image keeps 16-bit precision for the pixels that are not filled; the fill itself is 8-bit
+/// precision scaled up, which MG-04 accepts. Alpha inside the mask moves towards fully opaque.
+#[must_use]
+pub fn blend(image: &Frame, mask: &[u8], window: Window, fill: &[Vec<f32>]) -> Frame {
+    let max = f64::from(image.max_sample());
+    let image_width = usize::try_from(image.width).unwrap_or(usize::MAX);
+    let mut out = image.clone();
+    for row in 0..window.height {
+        for column in 0..window.width {
+            let Some(pixel) = window.pixel(row, column, image_width) else { continue };
+            let coverage = mask.get(pixel).copied().unwrap_or(0);
+            if coverage == 0 {
+                continue;
+            }
+            let Some(base) = pixel.checked_mul(image.channels) else { continue };
+            let weight = f64::from(coverage) / 255.0;
+            let offset = row.saturating_mul(window.width).saturating_add(column);
+            for channel in 0..image.channels {
+                let Some(slot) = out.samples.get_mut(base.saturating_add(channel)) else { continue };
+                let source = f64::from(*slot);
+                // Alpha has no fill to blend towards, so a covered pixel becomes opaque instead.
+                let target = if channel >= ALPHA_CHANNEL {
+                    max
+                } else {
+                    match fill.get(channel).and_then(|plane| plane.get(offset)) {
+                        Some(sample) => f64::from(*sample) * max,
+                        None => source,
+                    }
+                };
+                let blended = (source * (1.0 - weight) + target * weight).round().clamp(0.0, max);
+                *slot = u16::try_from(blended as i64).unwrap_or(0);
+            }
+        }
+    }
+    out
+}
+
+/// The model itself, behind a trait so the stages and the maths can be tested with no model file
+/// at all (MG-04 item 6).
+pub trait Session: Send {
+    /// Run one crop. `image` and `mask` are the packed planes [model_input] and [mask_plane] make
+    /// (after dilation); the answer is the same shape, with samples meant to be 0-255.
+    fn run(&mut self, image: &[f32], mask: &[f32], cancel: &AtomicBool) -> Result<Vec<f32>>;
+}
+
+/// How a session is made: once per pipeline, on the first job that needs one.
+pub type Loader = Box<dyn Fn(&Path) -> Result<Box<dyn Session>> + Send + Sync>;
+
+/// One installed model and the session it runs on. The session is made lazily and kept, so the
+/// ~1.2 s model load is paid once per process rather than once per job (MG-04 item 2).
+pub struct Pipeline {
+    path: PathBuf,
+    session: Mutex<Option<Box<dyn Session>>>,
+    load: Loader,
+}
+
+/// A pipeline is described by its model file and whether the session has been loaded yet; the
+/// loader itself is a closure, so it is left out.
+impl std::fmt::Debug for Pipeline {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("Pipeline").field("path", &self.path).field("loaded", &self.session.lock().is_ok_and(|guard| guard.is_some())).finish()
+    }
+}
+
+impl Pipeline {
+    /// A pipeline that runs the ONNX file at `path` on ONNX Runtime.
+    #[must_use]
+    pub fn new(path: impl Into<PathBuf>) -> Arc<Pipeline> {
+        Self::with_loader(path, Box::new(load_ort_session))
+    }
+
+    /// The same with the session factory replaced, which is how a test walks the stages with a
+    /// stand-in instead of the 200 MB graph.
+    #[must_use]
+    pub fn with_loader(path: impl Into<PathBuf>, load: Loader) -> Arc<Pipeline> {
+        Arc::new(Pipeline { path: path.into(), session: Mutex::new(None), load })
+    }
+
+    /// Fill the masked area with the model, reporting the MG-05 stages as it goes.
+    ///
+    /// `cancel` is checked between every stage, and the session itself is asked to stop when the
+    /// job is cancelled while the run is going on.
+    pub fn run_fill(&self, image: &Frame, mask: &[u8], cancel: &AtomicBool, progress: &mut dyn FnMut(f64, &str)) -> Result<Filled> {
+        let started = Instant::now();
+        if !CHANNELS.iter().any(|channels| usize::from(*channels) == image.channels) {
+            return Err(Fail::bad_request("Craft AI Manager can only fill images with three or four channels."));
+        }
+        if mask.len() < image.pixel_count() {
+            return Err(Fail::internal("The mask is shorter than the image, which the job checks should have caught."));
+        }
+        let (Ok(width), Ok(height)) = (usize::try_from(image.width), usize::try_from(image.height)) else {
+            return Err(Fail::internal("The image is too large for this machine."));
+        };
+        if stopped(cancel) {
+            return Err(Fail::internal(CANCELLED));
+        }
+        progress(0.0, MSG_PREPARE);
+        let Some(box_) = mask_box(width, height, mask) else {
+            // Nothing is masked: the input comes back unchanged and the model never runs.
+            progress(1.0, MSG_FINISH);
+            return Ok(Filled { frame: image.clone(), elapsed_ms: elapsed_ms(&started), model: LAMA_MODEL, device: LAMA_DEVICE, provider: LAMA_PROVIDER });
+        };
+        let window = crop_window(box_, width, height);
+        let model_mask = dilate(&mask_plane(mask, window, width, MODEL_SIZE), MODEL_SIZE, DILATE_PX);
+        let model_image = model_input(image, window);
+        progress(PREPARE_PROGRESS, MSG_PREPARE);
+        if stopped(cancel) {
+            return Err(Fail::internal(CANCELLED));
+        }
+        let output = {
+            let mut guard = self.session.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut session = match guard.take() {
+                Some(session) => session,
+                None => {
+                    progress(LOAD_PROGRESS, MSG_LOAD);
+                    (self.load)(&self.path)?
+                }
+            };
+            if stopped(cancel) {
+                *guard = Some(session);
+                return Err(Fail::internal(CANCELLED));
+            }
+            progress(RUN_PROGRESS, MSG_RUN);
+            let output = session.run(&model_image, &model_mask, cancel);
+            *guard = Some(session);
+            output
+        };
+        if stopped(cancel) {
+            return Err(Fail::internal(CANCELLED));
+        }
+        let output = match output {
+            Ok(output) => output,
+            Err(fail) => {
+                // A run ORT stopped because the job was cancelled is a cancellation, not a failure.
+                return Err(if stopped(cancel) { Fail::internal(CANCELLED) } else { fail });
+            }
+        };
+        progress(RUN_END, MSG_FINISH);
+        let frame = blend(image, mask, window, &fill_back(&output, window));
+        progress(1.0, MSG_FINISH);
+        Ok(Filled { frame, elapsed_ms: elapsed_ms(&started), model: LAMA_MODEL, device: LAMA_DEVICE, provider: LAMA_PROVIDER })
+    }
+}
+
+/// Has a `DELETE` arrived?
+fn stopped(cancel: &AtomicBool) -> bool {
+    cancel.load(Ordering::Relaxed)
+}
+
+/// How long a job has been running, in whole milliseconds.
+fn elapsed_ms(started: &Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+/// The real session: an ONNX Runtime graph, held for as long as the pipeline lives.
+pub struct OrtSession {
+    /// Held so the environment outlives the session that was built from it.
+    _environment: Arc<Environment>,
+    session: ort::session::Session,
+}
+
+impl Session for OrtSession {
+    fn run(&mut self, image: &[f32], mask: &[f32], cancel: &AtomicBool) -> Result<Vec<f32>> {
+        let image_tensor = ort::value::Tensor::from_array(([1usize, 3, MODEL_SIZE, MODEL_SIZE], image.to_vec().into_boxed_slice())).map_err(ort_fail)?;
+        let mask_tensor = ort::value::Tensor::from_array(([1usize, 1, MODEL_SIZE, MODEL_SIZE], mask.to_vec().into_boxed_slice())).map_err(ort_fail)?;
+        let run_options = ort::session::RunOptions::new().map_err(ort_fail)?;
+        // MG-05: a `DELETE` during the run reaches ONNX Runtime's own `terminate`, so the inference
+        // stops in flight instead of waiting for its ~1.2 s to finish. `RunOptions` is `Sync` but
+        // not `Send`, so the watcher only ever borrows it, inside a scoped thread that cannot
+        // outlive this call.
+        std::thread::scope(|scope| -> Result<Vec<f32>> {
+            let done = Arc::new(AtomicBool::new(false));
+            let watcher = {
+                let (done, run_options) = (Arc::clone(&done), &run_options);
+                scope.spawn(move || {
+                    while !done.load(Ordering::Relaxed) {
+                        if cancel.load(Ordering::Relaxed) {
+                            let _ = run_options.terminate();
+                            break;
+                        }
+                        std::thread::sleep(WATCH_POLL);
+                    }
+                })
+            };
+            let outcome = self.session.run_with_options(ort::inputs!["image" => image_tensor, "mask" => mask_tensor], &run_options);
+            done.store(true, Ordering::Relaxed);
+            let _ = watcher.join();
+            let outputs = outcome.map_err(ort_fail)?;
+            let first = outputs.values().next().ok_or_else(|| Fail::internal("The LaMa model gave no output at all."))?;
+            let (_shape, samples) = first.try_extract_tensor::<f32>().map_err(ort_fail)?;
+            Ok(samples.to_vec())
+        })
+    }
+}
+
+/// ONNX Runtime allows one environment per process, so it is made once and shared.
+static ENVIRONMENT: OnceLock<std::result::Result<Arc<Environment>, String>> = OnceLock::new();
+
+/// The process-wide ONNX Runtime environment, with telemetry off: CAIM is local and offline.
+fn environment() -> Result<Arc<Environment>> {
+    let made = ENVIRONMENT.get_or_init(|| ort::init().with_telemetry(false).build().map(Arc::new).map_err(|error| error.to_string()));
+    match made {
+        Ok(environment) => Ok(Arc::clone(environment)),
+        Err(message) => Err(Fail::internal(format!("Craft AI Manager could not start ONNX Runtime: {message}"))),
+    }
+}
+
+/// Load the graph at `path`. This is the ~1.2 s the first job pays.
+pub fn load_ort_session(path: &Path) -> Result<Box<dyn Session>> {
+    let environment = environment()?;
+    let session = ort::session::Session::builder(&environment).map_err(ort_fail)?.commit_from_file(path).map_err(ort_fail)?;
+    Ok(Box::new(OrtSession { _environment: environment, session }))
+}
+
+/// Turn an ONNX Runtime error into the sentence a job fails with.
+fn ort_fail(error: ort::Error) -> Fail {
+    Fail::internal(format!("The LaMa model could not run: {error}"))
+}
+
+/// A pipeline for `model` when it is installed and acknowledged, and `None` otherwise.
+///
+/// "Installed" is MG-02's answer - the file, the promised size, and a `verified.json` that matches
+/// it. Nothing is re-hashed here: that would cost seconds at every start (MG-04 item 2).
+#[must_use]
+pub fn installed_pipeline(root: &Path, model: &Model) -> Option<Arc<Pipeline>> {
+    if model.id != LAMA_ID || model.task != TASK_FILL {
+        return None;
+    }
+    if !store::is_installed(root, model) || !store::is_acknowledged(root, model) {
+        return None;
+    }
+    Some(Pipeline::new(store::model_file(root, model)))
+}
+
+/// The backend `caim serve` should run jobs on: the installed, acknowledged LaMa, or `None`.
+///
+/// `root` replaces the model store when the caller names one, which is how a test can say
+/// "nothing is installed" without touching the model folder on the machine.
+#[must_use]
+pub fn ready_pipeline_in(root: Option<&Path>) -> Option<Arc<Pipeline>> {
+    let root = root.map(std::path::PathBuf::from).or_else(store::models_dir)?;
+    let model = catalog::load().ok()?.into_iter().find(|model| model.id == LAMA_ID && model.task == TASK_FILL)?;
+    installed_pipeline(&root, &model)
+}
+/// A stand-in for the ONNX session, shared by this crate's tests: no model file is involved, so the
+/// stages, the cancellation, and the queue can be tested on any machine (MG-04 item 6).
+#[cfg(test)]
+pub(crate) struct StandIn {
+    pub(crate) fill: f32,
+    pub(crate) step: Duration,
+    pub(crate) runs: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(test)]
+impl Session for StandIn {
+    /// Answers a flat grey, and notices a cancel partway through the run.
+    fn run(&mut self, image: &[f32], _mask: &[f32], cancel: &AtomicBool) -> Result<Vec<f32>> {
+        for _ in 0..20 {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(Fail::internal(CANCELLED));
+            }
+            std::thread::sleep(self.step);
+        }
+        self.runs.fetch_add(1, Ordering::SeqCst);
+        Ok(vec![self.fill; image.len()])
+    }
+}
+
+/// A pipeline whose session is a [StandIn]. `loads` counts how many sessions were made, so a test
+/// can see the model was loaded once and then kept.
+#[cfg(test)]
+pub(crate) fn stand_in_pipeline(
+    fill: f32,
+    step: Duration,
+    loads: &Arc<std::sync::atomic::AtomicUsize>,
+    runs: &Arc<std::sync::atomic::AtomicUsize>,
+) -> Arc<Pipeline> {
+    let (loads, runs) = (Arc::clone(loads), Arc::clone(runs));
+    let load: Loader = Box::new(move |_path: &Path| {
+        loads.fetch_add(1, Ordering::SeqCst);
+        Ok(Box::new(StandIn { fill, step, runs: Arc::clone(&runs) }))
+    });
+    Pipeline::with_loader("lama_fp32.onnx", load)
+}
+#[cfg(test)]
+mod tests {
+    use super::{
+        DILATE_PX, Filter, MODEL_SIZE, MSG_FINISH, MSG_LOAD, MSG_PREPARE, MSG_RUN, Window, blend, crop_window, dilate, fill_back, filter_for,
+        installed_pipeline, mask_box, mask_plane, model_input, pad_for, resize_plane, stand_in_pipeline,
+    };
+    use crate::error::Status;
+    use crate::image::Frame;
+    use crate::store;
+    use crate::testkit::{Scratch, test_model};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    /// A 4x4 image, one brightness per pixel, so a blend is easy to read.
+    fn image(channels: usize, bit_depth: u8) -> Frame {
+        let max = if bit_depth == 8 { 255 } else { 65535 };
+        let samples: Vec<u16> = (0..16).flat_map(|pixel| (0..channels).map(move |_| u16::try_from(pixel * 4 + 1).unwrap_or(1).min(max))).collect();
+        Frame { width: 4, height: 4, channels, bit_depth, samples }
+    }
+
+    /// A 4x4 mask covering the middle 2x2 with `value`, and nothing anywhere else.
+    fn centre_mask(value: u8) -> Vec<u8> {
+        (0..16)
+            .map(|pixel| {
+                let (row, column) = (pixel / 4, pixel % 4);
+                if (1..3).contains(&row) && (1..3).contains(&column) { value } else { 0 }
+            })
+            .collect()
+    }
+
+    /// The whole 4x4 image, as a crop.
+    fn whole() -> Window {
+        Window { x: 0, y: 0, width: 4, height: 4 }
+    }
+
+    #[test]
+    fn the_mask_box_is_the_smallest_rectangle_over_the_selection() {
+        let box_ = mask_box(4, 4, &centre_mask(255)).expect("the mask covers pixels");
+        assert_eq!(box_, Window { x: 1, y: 1, width: 2, height: 2 });
+        assert!(mask_box(4, 4, &[0u8; 16]).is_none(), "an empty mask has no box at all");
+    }
+
+    #[test]
+    fn the_padding_is_32_pixels_or_a_quarter_of_the_longer_side() {
+        assert_eq!(pad_for(10), 32, "a small box still gets its 32 pixels");
+        assert_eq!(pad_for(128), 32, "a quarter of 128 ties with the minimum");
+        assert_eq!(pad_for(200), 50, "a bigger box gets a quarter of its longer side");
+    }
+
+    #[test]
+    fn the_crop_pads_the_box_and_grows_it_to_a_square() {
+        let box_ = Window { x: 100, y: 100, width: 20, height: 10 };
+        let crop = crop_window(box_, 640, 480);
+        assert_eq!(crop, Window { x: 68, y: 63, width: 84, height: 84 }, "32 px of padding, then grown to a square");
+        assert!(crop.x <= box_.x && crop.y <= box_.y, "the crop starts before the box");
+        assert!(crop.x + crop.width >= box_.x + box_.width && crop.y + crop.height >= box_.y + box_.height, "and ends after it");
+    }
+
+    #[test]
+    fn the_crop_is_clamped_to_the_image_and_still_covers_the_selection() {
+        let (width, height) = (100usize, 40usize);
+        let mut mask = vec![0u8; width * height];
+        for row in 10..30 {
+            for column in 90..width {
+                mask[row * width + column] = 255;
+            }
+        }
+        let box_ = mask_box(width, height, &mask).expect("the mask covers pixels");
+        let crop = crop_window(box_, width, height);
+        assert!(crop.width <= width && crop.height <= height, "the crop never leaves the image");
+        assert_eq!(crop.x + crop.width, width, "it is clamped at the right edge");
+        assert_eq!(crop.y + crop.height, height, "and at the bottom edge");
+        assert!(crop.x <= box_.x && crop.y <= box_.y, "it still starts before the box");
+        assert!(crop.x + crop.width >= box_.x + box_.width && crop.y + crop.height >= box_.y + box_.height, "and still covers all of it");
+    }
+
+    #[test]
+    fn a_resize_lands_on_the_size_asked_for_and_a_flat_area_stays_flat() {
+        let plane = vec![0.4f32; 100];
+        let down = resize_plane(&plane, 10, 10, 4, 4);
+        assert_eq!(down.len(), 4 * 4, "10x10 down to 4x4");
+        assert!(down.iter().all(|sample| (f64::from(*sample) - 0.4).abs() < 1e-5), "area averaging keeps a flat area flat");
+        let up = resize_plane(&down, 4, 4, 9, 9);
+        assert_eq!(up.len(), 9 * 9, "and back up to 9x9");
+        assert!(up.iter().all(|sample| (f64::from(*sample) - 0.4).abs() < 1e-5), "bilinear keeps it flat too");
+        assert_eq!(filter_for(640, 512), Filter::Area, "a shrink uses area");
+        assert_eq!(filter_for(300, 512), Filter::Bilinear, "a growth uses bilinear");
+    }
+
+    #[test]
+    fn the_model_mask_is_one_where_the_selection_covers_and_zero_elsewhere() {
+        let plane = mask_plane(&centre_mask(10), whole(), 4, 4);
+        assert_eq!(plane.iter().filter(|sample| **sample == 1.0).count(), 4, "the middle 2x2, whatever the mask value");
+        assert!(plane.iter().all(|sample| *sample == 0.0 || *sample == 1.0), "the model mask is never soft");
+    }
+
+    #[test]
+    fn the_model_mask_is_dilated_by_four_pixels_at_512_scale() {
+        let mut plane = vec![0.0f32; MODEL_SIZE * MODEL_SIZE];
+        for row in 100..110 {
+            for column in 100..110 {
+                plane[row * MODEL_SIZE + column] = 1.0;
+            }
+        }
+        let grown = dilate(&plane, MODEL_SIZE, DILATE_PX);
+        assert_eq!(grown[99 * MODEL_SIZE + 104], 1.0, "four pixels above the box is inside the dilation");
+        assert_eq!(grown[95 * MODEL_SIZE + 104], 0.0, "five pixels above it is not");
+        assert_eq!(grown[104 * MODEL_SIZE + 99], 1.0, "four pixels to the left is inside");
+        assert_eq!(grown[104 * MODEL_SIZE + 95], 0.0, "five pixels to the left is not");
+        assert_eq!(grown.iter().filter(|sample| **sample > 0.0).count(), 18 * 18, "a 10x10 box grows by 4 px on every side");
+    }
+
+    #[test]
+    fn the_model_planes_are_512_square_and_come_back_at_the_crop_size() {
+        let planes = model_input(&image(3, 8), whole());
+        assert_eq!(planes.len(), 3 * MODEL_SIZE * MODEL_SIZE, "the image plane is 3 x 512 x 512");
+        assert!(planes.iter().all(|sample| (0.0..=1.0).contains(sample)), "the model is told 0-1");
+        let back = fill_back(&vec![255.0f32; planes.len()], whole());
+        assert_eq!(back.len(), 3, "the answer is read as RGB");
+        for plane in back {
+            assert_eq!(plane.len(), 4 * 4, "the answer is resized back to the crop");
+            assert!(plane.iter().all(|sample| (f64::from(*sample) - 1.0).abs() < 1e-3), "255 comes back as 1.0");
+        }
+    }
+
+    #[test]
+    fn pixels_outside_the_mask_come_back_bit_for_bit() {
+        for (channels, bit_depth) in [(3, 8), (4, 8), (3, 16), (4, 16)] {
+            let frame = image(channels, bit_depth);
+            let mask = centre_mask(255);
+            let out = blend(&frame, &mask, whole(), &vec![vec![0.25; 16]; 3]);
+            assert_eq!(out.bit_depth, bit_depth, "the depth is kept");
+            for (pixel, covered) in mask.iter().enumerate() {
+                if *covered == 0 {
+                    for channel in 0..channels {
+                        assert_eq!(out.sample(pixel, channel), frame.sample(pixel, channel), "({channels}, {bit_depth}) pixel {pixel} channel {channel}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_full_mask_takes_the_fill_and_a_soft_one_blends_between() {
+        let frame = image(3, 8);
+        let fill = vec![vec![0.5; 16]; 3];
+        let hard = blend(&frame, &centre_mask(255), whole(), &fill);
+        assert_eq!(hard.sample(5, 0), Some(128), "0.5 x 255 rounds to 128");
+        let soft = blend(&frame, &centre_mask(128), whole(), &fill);
+        assert_eq!(soft.sample(5, 0), Some(74), "a half-covered pixel sits half way from its own 21");
+        let frame16 = image(3, 16);
+        let hard16 = blend(&frame16, &centre_mask(255), whole(), &fill);
+        assert_eq!(hard16.sample(5, 0), Some(32768), "the fill is 8-bit precision scaled up into the 16-bit range");
+        assert_eq!(hard16.sample(0, 0), frame16.sample(0, 0), "and the untouched pixels keep their 16-bit precision");
+    }
+
+    #[test]
+    fn alpha_inside_the_mask_moves_towards_opaque_and_outside_it_does_not_move() {
+        let frame = Frame { width: 4, height: 4, channels: 4, bit_depth: 8, samples: vec![10; 64] };
+        let fill = vec![vec![0.0; 16]; 3];
+        assert_eq!(blend(&frame, &centre_mask(255), whole(), &fill).sample(5, 3), Some(255), "a fully covered pixel becomes opaque");
+        assert_eq!(blend(&frame, &centre_mask(128), whole(), &fill).sample(5, 3), Some(133), "a half-covered pixel moves half way there");
+        assert_eq!(blend(&frame, &centre_mask(255), whole(), &fill).sample(0, 3), Some(10), "an uncovered pixel keeps its alpha");
+    }
+
+    #[test]
+    fn the_stages_run_in_order_and_say_which_one_they_are() {
+        let (loads, runs) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let pipeline = stand_in_pipeline(128.0, Duration::ZERO, &loads, &runs);
+        let mut stages: Vec<(f64, String)> = Vec::new();
+        let filled = pipeline
+            .run_fill(&image(3, 8), &centre_mask(255), &AtomicBool::new(false), &mut |value, message| stages.push((value, message.to_string())))
+            .expect("the stand-in session runs");
+        assert_eq!(
+            stages.iter().map(|(_, message)| message.as_str()).collect::<Vec<_>>(),
+            [MSG_PREPARE, MSG_PREPARE, MSG_LOAD, MSG_RUN, MSG_FINISH, MSG_FINISH]
+        );
+        assert_eq!(stages.iter().map(|(value, _)| *value).collect::<Vec<_>>(), [0.0, 0.2, 0.25, 0.3, 0.9, 1.0], "prepare, load, run, finish");
+        assert_eq!((filled.model, filled.device, filled.provider), ("lama", "cpu", "local"));
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "the model ran once");
+    }
+
+    #[test]
+    fn a_cancelled_job_stops_at_the_stage_it_has_reached() {
+        let (loads, runs) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let pipeline = stand_in_pipeline(128.0, Duration::from_millis(2), &loads, &runs);
+        let fail =
+            pipeline.run_fill(&image(3, 8), &centre_mask(255), &AtomicBool::new(true), &mut |_, _| {}).expect_err("the job was cancelled before it started");
+        assert!(fail.sentence.contains("stopped the job"), "{fail}");
+        assert_eq!(loads.load(Ordering::SeqCst), 0, "a job cancelled while queued never loads the model");
+
+        // Cancelled while the run is going on: the session notices and stops.
+        let cancel = Arc::new(AtomicBool::new(false));
+        let watcher = {
+            let cancel = Arc::clone(&cancel);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(10));
+                cancel.store(true, Ordering::Relaxed);
+            })
+        };
+        let fail = pipeline.run_fill(&image(3, 8), &centre_mask(255), &cancel, &mut |_, _| {}).expect_err("the run is cancelled partway through");
+        watcher.join().expect("the watcher thread finishes");
+        assert!(fail.sentence.contains("stopped the job"), "{fail}");
+        assert_eq!(runs.load(Ordering::SeqCst), 0, "the run never completed");
+    }
+
+    #[test]
+    fn the_session_is_loaded_once_and_kept_for_the_next_job() {
+        let (loads, runs) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let pipeline = stand_in_pipeline(64.0, Duration::ZERO, &loads, &runs);
+        for _ in 0..2 {
+            pipeline.run_fill(&image(3, 8), &centre_mask(255), &AtomicBool::new(false), &mut |_, _| {}).expect("the stand-in session runs");
+        }
+        assert_eq!(loads.load(Ordering::SeqCst), 1, "the model is loaded once, on the first job");
+        assert_eq!(runs.load(Ordering::SeqCst), 2, "and reused by the second one");
+    }
+
+    #[test]
+    fn an_empty_mask_returns_the_input_unchanged_and_never_loads_the_model() {
+        let (loads, runs) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let pipeline = stand_in_pipeline(128.0, Duration::ZERO, &loads, &runs);
+        let frame = image(3, 8);
+        let filled = pipeline.run_fill(&frame, &[0u8; 16], &AtomicBool::new(false), &mut |_, _| {}).expect("an empty mask is a valid job");
+        assert_eq!(filled.frame, frame, "the input comes back exactly as it went in");
+        assert_eq!(loads.load(Ordering::SeqCst), 0, "there is nothing to do, so nothing is loaded");
+    }
+
+    #[test]
+    fn an_image_that_is_not_rgb_or_rgba_is_refused_before_anything_loads() {
+        let (loads, runs) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let pipeline = stand_in_pipeline(128.0, Duration::ZERO, &loads, &runs);
+        let frame = Frame { width: 4, height: 4, channels: 1, bit_depth: 8, samples: vec![7; 16] };
+        let fail = pipeline.run_fill(&frame, &[255; 16], &AtomicBool::new(false), &mut |_, _| {}).expect_err("grayscale is not in the contract");
+        assert_eq!(fail.status, Status::BadRequest, "{fail}");
+        assert_eq!(loads.load(Ordering::SeqCst), 0, "the refusal comes before the model load");
+    }
+
+    #[test]
+    fn a_pipeline_needs_the_file_the_record_and_the_acknowledgment() {
+        let scratch = Scratch::new("lama-pipeline");
+        let bytes: &[u8] = b"the bytes a small model would be made of";
+        let model = test_model(bytes, Some("Read the note before using this model."));
+        std::fs::create_dir_all(store::model_folder(&scratch.path, &model)).expect("the model folder");
+        std::fs::write(store::model_file(&scratch.path, &model), bytes).expect("the model file");
+        store::write_verified(&scratch.path, &model, &model.sha256, model.size).expect("the verified record");
+        assert!(installed_pipeline(&scratch.path, &model).is_none(), "the note has to be acknowledged first");
+        store::write_acknowledgement(&scratch.path, &model).expect("the note is acknowledged");
+        assert!(installed_pipeline(&scratch.path, &model).is_some(), "installed and acknowledged makes a pipeline");
+        std::fs::remove_file(store::model_file(&scratch.path, &model)).expect("the file goes away");
+        assert!(installed_pipeline(&scratch.path, &model).is_none(), "a missing file is not installed");
+    }
+
+    #[test]
+    fn this_runner_only_offers_the_model_it_can_run() {
+        let scratch = Scratch::new("lama-pipeline-task");
+        let bytes: &[u8] = b"the bytes a small model would be made of";
+        let mut model = test_model(bytes, None);
+        model.task = "select_subject".to_string();
+        std::fs::create_dir_all(store::model_folder(&scratch.path, &model)).expect("the model folder");
+        std::fs::write(store::model_file(&scratch.path, &model), bytes).expect("the model file");
+        store::write_verified(&scratch.path, &model, &model.sha256, model.size).expect("the verified record");
+        assert!(installed_pipeline(&scratch.path, &model).is_none(), "a model for another task is not offered here");
+    }
+}

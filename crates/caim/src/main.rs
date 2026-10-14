@@ -61,7 +61,7 @@ fn serve(fake_backend: bool) -> std::process::ExitCode {
         Some(path) => println!("endpoint file: {}", path.display()),
         None => println!("endpoint file: none, so a client needs {endpoint_variable} to find this port"),
     }
-    println!("backend: {}", if fake_backend { "fake-fill (the built-in mean-colour fill)" } else { "none: no model is installed yet" });
+    println!("backend: {}", server.backend_note());
     if std::io::stdin().is_terminal() {
         println!("press Enter to stop cleanly. Ctrl+C works too, but on Windows it ends the process where it stands and leaves the endpoint file behind.");
         watch_stdin(server.stop_signal());

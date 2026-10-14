@@ -19,14 +19,22 @@ pub const FAKE_DEVICE: &str = "cpu";
 pub const FAKE_PROVIDER: &str = "local";
 /// Amendment 11: progress arrives in ten steps.
 pub const PROGRESS_STEPS: u32 = 10;
+/// The `message` every step carries: the fake backend has no stages to name, only steps.
+pub const FAKE_MESSAGE: &str = "Craft AI Manager is filling the masked area.";
 /// The channel index that holds alpha, when the image has one.
 const ALPHA_CHANNEL: usize = 3;
 
-/// A finished fill: the image to send back, and how long the work took.
+/// A finished fill: the image to send back, how long the work took, and what produced it.
+///
+/// The three labels are what `/result` reports, so a fake result can never be mistaken for a real
+/// one and MG-04's real one says which model and device ran.
 #[derive(Clone, Debug)]
 pub struct Filled {
     pub frame: Frame,
     pub elapsed_ms: u64,
+    pub model: &'static str,
+    pub device: &'static str,
+    pub provider: &'static str,
 }
 
 /// Fill the masked area.
@@ -34,7 +42,7 @@ pub struct Filled {
 /// `cancel` is checked between the steps, as amendment 11 asks (the fake backend works in row
 /// groups), so a `DELETE` stops a running job quickly. `progress` is called exactly ten times and
 /// `step_delay` spaces those steps, which is what makes the queue and cancellation testable.
-pub fn run_fill(image: &Frame, mask: &[u8], cancel: &AtomicBool, step_delay: Duration, progress: &mut dyn FnMut(f64)) -> Result<Filled> {
+pub fn run_fill(image: &Frame, mask: &[u8], cancel: &AtomicBool, step_delay: Duration, progress: &mut dyn FnMut(f64, &str)) -> Result<Filled> {
     let started = Instant::now();
     let channels = image.channels;
     let width = usize::try_from(image.width).map_err(|_| Fail::internal("The image width does not fit this machine."))?;
@@ -55,12 +63,13 @@ pub fn run_fill(image: &Frame, mask: &[u8], cancel: &AtomicBool, step_delay: Dur
         let first_row = clamp_row(total_rows.saturating_mul(u64::from(step - 1)) / u64::from(PROGRESS_STEPS), rows);
         let last_row = clamp_row(total_rows.saturating_mul(u64::from(step)) / u64::from(PROGRESS_STEPS), rows);
         blend_rows(&mut out, mask, &mean, max, first_row..last_row, width, channels);
-        progress(f64::from(step) / f64::from(PROGRESS_STEPS));
+        progress(f64::from(step) / f64::from(PROGRESS_STEPS), FAKE_MESSAGE);
         if !step_delay.is_zero() && step < PROGRESS_STEPS {
             std::thread::sleep(step_delay);
         }
     }
-    Ok(Filled { frame: out, elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX) })
+    let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    Ok(Filled { frame: out, elapsed_ms, model: FAKE_MODEL, device: FAKE_DEVICE, provider: FAKE_PROVIDER })
 }
 
 /// A row index computed from a big multiple, kept inside the image.
@@ -146,7 +155,7 @@ mod tests {
     }
 
     fn fill(image: &Frame, mask: &[u8], steps: &mut Vec<f64>) -> Frame {
-        run_fill(image, mask, &quiet(), Duration::ZERO, &mut |progress| steps.push(progress)).expect("the fill runs").frame
+        run_fill(image, mask, &quiet(), Duration::ZERO, &mut |progress, _| steps.push(progress)).expect("the fill runs").frame
     }
 
     #[test]
@@ -205,7 +214,7 @@ mod tests {
     #[test]
     fn a_mask_shorter_than_the_image_is_refused_not_guessed() {
         let image = frame(3, 8, &[0; 12]);
-        let fail = run_fill(&image, &[0, 0], &quiet(), Duration::ZERO, &mut |_| {}).expect_err("the mask is too short");
+        let fail = run_fill(&image, &[0, 0], &quiet(), Duration::ZERO, &mut |_, _| {}).expect_err("the mask is too short");
         assert!(fail.sentence.contains("mask is shorter"), "{fail}");
     }
 
@@ -213,7 +222,7 @@ mod tests {
     fn a_cancelled_job_stops_before_the_first_step() {
         let cancel = AtomicBool::new(true);
         let image = frame(3, 8, &[0; 12]);
-        let fail = run_fill(&image, &[0, 0, 0, 0], &cancel, Duration::ZERO, &mut |_| {}).expect_err("the job is cancelled before it starts");
+        let fail = run_fill(&image, &[0, 0, 0, 0], &cancel, Duration::ZERO, &mut |_, _| {}).expect_err("the job is cancelled before it starts");
         assert!(fail.to_string().contains("stopped the job"), "{fail}");
         assert!(cancel.load(Ordering::Relaxed), "the flag is the caller's, so it stays set");
     }

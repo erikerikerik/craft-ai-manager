@@ -18,7 +18,8 @@ use crate::endpoint::{self, ENDPOINT_ENV};
 use crate::error::{Fail, Result, Status, quoted};
 use crate::http::{self, Head, Response, read_head, write_error, write_response};
 use crate::image;
-use crate::job::{self, Runner, State};
+use crate::job::{self, Backend, Runner, State};
+use crate::lama;
 use crate::multipart;
 use crate::protocol::{self, JobRequest};
 use crate::token::{self, bearer_matches};
@@ -45,6 +46,8 @@ const PNG: &str = "image/png";
 pub struct ServeOptions {
     /// Run jobs on the built-in fake backend.
     pub fake_backend: bool,
+    /// Where to look for installed models. `None` means `CRAFT_AI_MODELS`, else the platform path.
+    pub models_root: Option<PathBuf>,
     /// Where to write the endpoint file. `None` means `CRAFT_AI_ENDPOINT`, else the platform path.
     pub endpoint_file: Option<PathBuf>,
     /// Read timeout per connection.
@@ -61,6 +64,7 @@ impl Default for ServeOptions {
     fn default() -> Self {
         Self {
             fake_backend: false,
+            models_root: None,
             endpoint_file: None,
             read_timeout: READ_TIMEOUT,
             max_connections: MAX_CONNECTIONS,
@@ -74,7 +78,8 @@ impl Default for ServeOptions {
 struct Context {
     port: u16,
     token: String,
-    fake_backend: bool,
+    /// Whether a backend is running, which is what `/v1/tasks` and `POST /v1/jobs` answer with.
+    fill_offered: bool,
     read_timeout: Duration,
     runner: Arc<Runner>,
 }
@@ -85,6 +90,8 @@ pub struct Server {
     port: u16,
     token: String,
     endpoint_path: Option<PathBuf>,
+    /// Which backend this start picked, for the line `caim serve` prints.
+    backend_note: &'static str,
     stop: Arc<AtomicBool>,
     accept: Option<JoinHandle<()>>,
     runner: Arc<Runner>,
@@ -98,7 +105,16 @@ impl Server {
             TcpListener::bind((LOCAL_HOST, 0)).map_err(|error| Fail::internal(format!("Craft AI Manager could not listen on 127.0.0.1: {error}")))?;
         let port = listener.local_addr().map_err(|error| Fail::internal(format!("Craft AI Manager could not find its own port: {error}")))?.port();
         listener.set_nonblocking(true).map_err(|error| Fail::internal(format!("Craft AI Manager could not set up its listener: {error}")))?;
-        let runner = Arc::new(Runner::new(options.fake_backend, options.max_queue, options.step_delay)?);
+        // MG-04 item 2: without `--fake-backend`, LaMa is offered only when MG-02 says it is
+        // installed and acknowledged. Nothing is re-hashed at start; `verified.json` is the proof.
+        let backend = if options.fake_backend {
+            Backend::Fake { step_delay: options.step_delay }
+        } else {
+            lama::ready_pipeline_in(options.models_root.as_deref()).map_or(Backend::NoModel, Backend::Lama)
+        };
+        let fill_offered = !matches!(backend, Backend::NoModel);
+        let backend_note = backend.note();
+        let runner = Arc::new(Runner::new(backend, options.max_queue)?);
         let endpoint_path = options.endpoint_file.clone().or_else(endpoint::endpoint_file_from_env);
         if let Some(path) = endpoint_path.as_ref()
             && let Err(error) = endpoint::write(path, port, &token)
@@ -107,19 +123,13 @@ impl Server {
             return Err(error);
         }
         let stop = Arc::new(AtomicBool::new(false));
-        let context = Arc::new(Context {
-            port,
-            token: token.clone(),
-            fake_backend: options.fake_backend,
-            read_timeout: options.read_timeout,
-            runner: Arc::clone(&runner),
-        });
+        let context = Arc::new(Context { port, token: token.clone(), fill_offered, read_timeout: options.read_timeout, runner: Arc::clone(&runner) });
         let accept_stop = Arc::clone(&stop);
         let handle = std::thread::Builder::new()
             .name("caim-accept".to_string())
             .spawn(move || accept_loop(listener, context, accept_stop, options.max_connections))
             .map_err(|error| Fail::internal(format!("Craft AI Manager could not start its listener thread: {error}")))?;
-        Ok(Server { port, token, endpoint_path, stop, accept: Some(handle), runner })
+        Ok(Server { port, token, endpoint_path, backend_note, stop, accept: Some(handle), runner })
     }
 
     /// The port the operating system gave us.
@@ -132,6 +142,12 @@ impl Server {
     #[must_use]
     pub fn token(&self) -> &str {
         &self.token
+    }
+
+    /// Which backend this start is running, for the terminal.
+    #[must_use]
+    pub const fn backend_note(&self) -> &'static str {
+        self.backend_note
     }
 
     /// Where the endpoint file is, if this start wrote one.
@@ -271,7 +287,7 @@ fn route(stream: &mut TcpStream, context: &Context, head: &Head) -> Result<()> {
         return if method == "GET" { send(stream, Status::Ok, Some(JSON), &protocol::health(&format!("caim/{VERSION}"))) } else { unknown_path(stream, path) };
     }
     if path == PATH_TASKS {
-        return if method == "GET" { send(stream, Status::Ok, Some(JSON), &protocol::tasks(context.fake_backend)) } else { unknown_path(stream, path) };
+        return if method == "GET" { send(stream, Status::Ok, Some(JSON), &protocol::tasks(context.fill_offered)) } else { unknown_path(stream, path) };
     }
     if path == PATH_JOBS {
         return if method == "POST" { submit(stream, context, head) } else { unknown_path(stream, path) };
@@ -314,7 +330,7 @@ fn submit(stream: &mut TcpStream, context: &Context, head: &Head) -> Result<()> 
     let body = http::read_body(stream, &head.leftover, length)?;
     let parts = multipart::parse(head.header("content-type"), &body)?;
     let request = JobRequest::parse(parts.job)?;
-    request.validate(context.fake_backend)?;
+    request.validate(context.fill_offered)?;
     let [width, height] = request.image_size;
     let frame = image::decode_image(parts.image, width, height, usize::from(request.channels), request.bit_depth)?;
     let mask = image::decode_mask(parts.mask, width, height)?;

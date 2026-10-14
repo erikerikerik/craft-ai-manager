@@ -7,9 +7,10 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crate::backend::{self, FAKE_DEVICE, FAKE_MODEL, FAKE_PROVIDER};
+use crate::backend::{self, Filled};
 use crate::error::{Fail, Result};
 use crate::image::{self, Frame};
+use crate::lama;
 
 /// Amendment 11: at most eight jobs queued or running at once; the ninth is a 503.
 pub const MAX_QUEUE: usize = 8;
@@ -54,6 +55,34 @@ impl State {
     #[must_use]
     pub const fn is_finished(self) -> bool {
         matches!(self, Self::Done | Self::Failed | Self::Cancelled)
+    }
+}
+
+/// What the worker runs a job on (MG-04 item 2). `caim serve` chooses one at start:
+///
+/// * `Lama` when MG-02 says the model is installed and acknowledged;
+/// * `Fake` under `--fake-backend`, exactly as MG-01 had it;
+/// * `NoModel` otherwise, which keeps MG-01's answer and sentence.
+#[derive(Clone, Debug, Default)]
+pub enum Backend {
+    /// Nothing is installed, so a job is refused with amendment 11's sentence.
+    #[default]
+    NoModel,
+    /// The built-in fake backend, its ten steps spaced by `step_delay`.
+    Fake { step_delay: Duration },
+    /// The real LaMa runner; its session is loaded on the first job and kept after that.
+    Lama(Arc<lama::Pipeline>),
+}
+
+impl Backend {
+    /// One line for the terminal: which backend this start is running.
+    #[must_use]
+    pub fn note(&self) -> &'static str {
+        match self {
+            Backend::NoModel => "none: no model is installed yet",
+            Backend::Fake { .. } => "fake-fill (the built-in mean-colour fill)",
+            Backend::Lama(_) => "lama (LaMa on the local CPU, loaded on the first job)",
+        }
     }
 }
 
@@ -117,17 +146,18 @@ pub struct Runner {
 }
 
 impl Runner {
-    /// Start the worker. `step_delay` spaces the fake backend's ten progress steps, which is what
-    /// lets the tests have eight jobs in flight at once.
-    pub fn new(fake_backend: bool, max_queue: usize, step_delay: Duration) -> Result<Runner> {
+    /// Start the worker. The fake backend's `step_delay` spaces its ten progress steps, which is
+    /// what lets the tests have eight jobs in flight at once.
+    pub fn new(backend: Backend, max_queue: usize) -> Result<Runner> {
         let (queue_tx, queue_rx) = std::sync::mpsc::channel::<String>();
         let shared = Arc::new(Mutex::new(Shared { jobs: Vec::new(), next_id: 0 }));
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let worker_shared = Arc::clone(&shared);
         let worker_stop = Arc::clone(&stop);
+        let backend = Arc::new(backend);
         let handle = std::thread::Builder::new()
             .name("caim-jobs".to_string())
-            .spawn(move || worker(worker_shared, queue_rx, worker_stop, fake_backend, step_delay))
+            .spawn(move || worker(worker_shared, queue_rx, worker_stop, backend))
             .map_err(|error| Fail::internal(format!("Craft AI Manager could not start its job worker: {error}")))?;
         Ok(Runner { shared, queue_tx, worker: Mutex::new(Some(handle)), stop, max_queue })
     }
@@ -231,11 +261,11 @@ impl Drop for Runner {
 }
 
 /// The worker loop: take the next job, run it, then sweep finished results.
-fn worker(shared: Arc<Mutex<Shared>>, queue_rx: Receiver<String>, stop: Arc<std::sync::atomic::AtomicBool>, fake_backend: bool, step_delay: Duration) {
+fn worker(shared: Arc<Mutex<Shared>>, queue_rx: Receiver<String>, stop: Arc<std::sync::atomic::AtomicBool>, backend: Arc<Backend>) {
     use std::sync::atomic::Ordering;
     while !stop.load(Ordering::Relaxed) {
         match queue_rx.recv_timeout(WORKER_POLL) {
-            Ok(id) => run_one(&shared, &id, fake_backend, step_delay),
+            Ok(id) => run_one(&shared, &id, &backend),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
@@ -244,7 +274,7 @@ fn worker(shared: Arc<Mutex<Shared>>, queue_rx: Receiver<String>, stop: Arc<std:
 }
 
 /// Run one job from the queue. A job cancelled while it waited never starts.
-fn run_one(shared: &Arc<Mutex<Shared>>, id: &str, fake_backend: bool, step_delay: Duration) {
+fn run_one(shared: &Arc<Mutex<Shared>>, id: &str, backend: &Backend) {
     let taken = {
         let mut shared = lock(shared);
         match find_mut(&mut shared.jobs, id) {
@@ -261,34 +291,37 @@ fn run_one(shared: &Arc<Mutex<Shared>>, id: &str, fake_backend: bool, step_delay
         Some(entry) => Arc::clone(&entry.cancel),
         None => return,
     };
-    // The progress callback takes the lock only for the assignment, never across the fill.
+    // The progress callback takes the lock only for the assignment, never across the fill. Each
+    // report names the stage it belongs to, which is what tells PhotoCraft how far a job has got
+    // (MG-05).
     let progress_shared = Arc::clone(shared);
     let progress_id = id.to_string();
-    let mut progress = move |value: f64| {
+    let mut progress = move |value: f64, message: &str| {
         if let Some(entry) = find_mut(&mut lock(&progress_shared).jobs, &progress_id) {
             entry.progress = value;
+            entry.message = message.to_string();
         }
     };
-    let outcome = if fake_backend {
-        backend::run_fill(&image, &mask, &cancel, step_delay, &mut progress).map(|filled| (filled.frame, filled.elapsed_ms))
-    } else {
-        Err(Fail::bad_request("No model is installed for fill_masked_area yet"))
+    let outcome = match backend {
+        Backend::NoModel => Err(Fail::bad_request("No model is installed for fill_masked_area yet")),
+        Backend::Fake { step_delay } => backend::run_fill(&image, &mask, &cancel, *step_delay, &mut progress),
+        Backend::Lama(pipeline) => pipeline.run_fill(&image, &mask, &cancel, &mut progress),
     };
     finish(shared, id, &cancel, outcome);
 }
 
 /// Record how the job ended. A job the client already cancelled stays cancelled.
-fn finish(shared: &Arc<Mutex<Shared>>, id: &str, cancel: &std::sync::atomic::AtomicBool, outcome: Result<(Frame, u64)>) {
+fn finish(shared: &Arc<Mutex<Shared>>, id: &str, cancel: &std::sync::atomic::AtomicBool, outcome: Result<Filled>) {
     let ready = match outcome {
-        Ok((frame, elapsed_ms)) => match image::encode(&frame) {
+        Ok(filled) => match image::encode(&filled.frame) {
             Ok(png) => Ok((
                 png,
                 Provenance {
-                    model: FAKE_MODEL.to_string(),
-                    device: FAKE_DEVICE.to_string(),
-                    provider: FAKE_PROVIDER.to_string(),
-                    elapsed_ms,
-                    image_size: [frame.width, frame.height],
+                    model: filled.model.to_string(),
+                    device: filled.device.to_string(),
+                    provider: filled.provider.to_string(),
+                    elapsed_ms: filled.elapsed_ms,
+                    image_size: [filled.frame.width, filled.frame.height],
                 },
             )),
             Err(fail) => Err(fail),
@@ -336,8 +369,12 @@ fn sweep_locked(shared: &mut Shared) {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_QUEUE, Provenance, Runner, State};
+    use super::{Backend, MAX_QUEUE, Provenance, Runner, State};
+    use crate::backend;
     use crate::image::Frame;
+    use crate::lama;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     fn frame() -> Frame {
@@ -374,7 +411,7 @@ mod tests {
 
     #[test]
     fn a_job_goes_from_queued_to_done_with_a_result() {
-        let runner = Runner::new(true, MAX_QUEUE, Duration::ZERO).expect("the worker starts");
+        let runner = Runner::new(Backend::Fake { step_delay: Duration::ZERO }, MAX_QUEUE).expect("the worker starts");
         let id = runner.submit(frame(), mask()).expect("the job is accepted");
         assert_eq!(id, "job-1");
         assert_eq!(finish(&runner, &id), State::Done);
@@ -397,7 +434,7 @@ mod tests {
 
     #[test]
     fn cancelling_a_queued_job_stops_it_before_it_starts() {
-        let runner = Runner::new(true, 1, Duration::from_millis(20)).expect("the worker starts");
+        let runner = Runner::new(Backend::Fake { step_delay: Duration::from_millis(20) }, 1).expect("the worker starts");
         let first = runner.submit(frame(), mask()).expect("the first job is accepted");
         let second = runner.submit(frame(), mask()).expect_err("the queue holds one");
         assert_eq!(second.status.code(), 503);
@@ -409,7 +446,7 @@ mod tests {
 
     #[test]
     fn the_queue_cap_answers_busy_and_clears_when_a_job_finishes() {
-        let runner = Runner::new(true, 2, Duration::from_millis(10)).expect("the worker starts");
+        let runner = Runner::new(Backend::Fake { step_delay: Duration::from_millis(10) }, 2).expect("the worker starts");
         let first = runner.submit(frame(), mask()).expect("the first job is accepted");
         let second = runner.submit(frame(), mask()).expect("the second job is accepted");
         assert_eq!(runner.submit(frame(), mask()).expect_err("the queue is full").status.code(), 503);
@@ -423,7 +460,7 @@ mod tests {
 
     #[test]
     fn an_unknown_id_is_not_found_everywhere() {
-        let runner = Runner::new(true, MAX_QUEUE, Duration::ZERO).expect("the worker starts");
+        let runner = Runner::new(Backend::Fake { step_delay: Duration::ZERO }, MAX_QUEUE).expect("the worker starts");
         for error in [
             runner.state("job-9").expect_err("no such job"),
             runner.provenance("job-9").expect_err("no such job"),
@@ -444,5 +481,116 @@ mod tests {
         assert_eq!(State::Cancelled.wire(), "cancelled");
         assert!(State::Done.is_finished() && State::Failed.is_finished() && State::Cancelled.is_finished());
         assert!(!State::Queued.is_finished() && !State::Running.is_finished());
+    }
+
+    // MG-04/MG-05: the same lifecycle on the LaMa backend, with a stand-in for the session so it
+    // runs on any machine (item 6). The fake-backend tests above stay as they are.
+
+    /// A LaMa backend whose session is a stand-in, plus the counters that show how often it was
+    /// loaded and run.
+    fn lama_runner(step: Duration, loads: &Arc<AtomicUsize>, runs: &Arc<AtomicUsize>) -> Runner {
+        let pipeline = lama::stand_in_pipeline(128.0, step, loads, runs);
+        Runner::new(Backend::Lama(pipeline), MAX_QUEUE).expect("the worker starts")
+    }
+
+    #[test]
+    fn a_lama_job_goes_through_its_stages_and_answers_with_the_model() {
+        let (loads, runs) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let runner = lama_runner(Duration::from_millis(4), &loads, &runs);
+        let id = runner.submit(frame(), mask()).expect("the job is accepted");
+        // Read the messages as they arrive, so the order the stages report in is the order a
+        // client would see them in.
+        let mut seen: Vec<String> = Vec::new();
+        let mut progress: Vec<f64> = Vec::new();
+        let mut last = String::new();
+        for _ in 0..400 {
+            let (state, value, message) = runner.state(&id).expect("the job exists");
+            if message != last {
+                seen.push(message.clone());
+                last = message;
+            }
+            progress.push(value);
+            if state.is_finished() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(finish(&runner, &id), State::Done);
+        // The stages a client can see are the MG-05 names, in the order the pipeline reports them,
+        // and never the fake backend's sentence. Which messages come first is decided by how fast
+        // each stage runs, so the order is checked as a subsequence; the full sequence itself is
+        // asserted in `lama`, where nothing is racing with a poll.
+        let order = [lama::MSG_PREPARE, lama::MSG_LOAD, lama::MSG_RUN, lama::MSG_FINISH];
+        let stages: Vec<&str> = seen.iter().map(String::as_str).filter(|message| order.contains(message)).collect();
+        let mut expected = order.iter();
+        for stage in &stages {
+            let Some(found) = expected.clone().position(|name| *name == *stage) else {
+                panic!("{stage} came out of order: {stages:?}");
+            };
+            for _ in 0..=found {
+                expected.next();
+            }
+        }
+        assert!(stages.contains(&lama::MSG_RUN), "the run stage is the long one, so it is always visible: {stages:?}");
+        assert!(!seen.iter().any(|message| message == backend::FAKE_MESSAGE), "a LaMa job never reports the fake backend: {seen:?}");
+        assert!(progress.windows(2).all(|pair| pair[0] <= pair[1]), "progress only moves forward: {progress:?}");
+        let provenance = runner.provenance(&id).expect("a done job has provenance");
+        assert_eq!(provenance.model, "lama");
+        assert_eq!(provenance.device, "cpu");
+        assert_eq!(provenance.provider, "local");
+        assert_eq!(provenance.image_size, [2, 2]);
+        assert!(runner.take_png(&id).is_ok_and(|png| png.starts_with(b"\x89PNG\r\n\x1a\n")), "the result image is there");
+        assert_eq!((loads.load(Ordering::SeqCst), runs.load(Ordering::SeqCst)), (1, 1), "loaded once, run once");
+        runner.stop();
+    }
+
+    #[test]
+    fn a_lama_job_cancelled_while_queued_never_loads_the_model() {
+        let (loads, runs) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let runner = lama_runner(Duration::from_millis(20), &loads, &runs);
+        let first = runner.submit(frame(), mask()).expect("the first job is accepted");
+        assert_eq!(settle(&runner, &first), State::Running, "the first job is holding the worker");
+        let second = runner.submit(frame(), mask()).expect("the second job joins the queue");
+        runner.cancel(&second).expect("cancelling works");
+        assert_eq!(finish(&runner, &second), State::Cancelled, "the queued job is cancelled before it starts");
+        assert_eq!(loads.load(Ordering::SeqCst), 0, "it never got as far as loading the model");
+        assert_eq!(finish(&runner, &first), State::Done, "the job that was running is unaffected");
+        runner.stop();
+    }
+
+    #[test]
+    fn a_lama_job_cancelled_while_running_stops_the_run() {
+        let (loads, runs) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let runner = lama_runner(Duration::from_millis(20), &loads, &runs);
+        let id = runner.submit(frame(), mask()).expect("the job is accepted");
+        assert_eq!(settle(&runner, &id), State::Running);
+        runner.cancel(&id).expect("a running job can be cancelled");
+        assert_eq!(finish(&runner, &id), State::Cancelled, "the run notices and stops");
+        assert_eq!(runs.load(Ordering::SeqCst), 0, "the run never completed");
+        assert_eq!(runner.provenance(&id).expect_err("a cancelled job has no result").status.code(), 409);
+        runner.stop();
+    }
+
+    #[test]
+    fn two_lama_jobs_finish_in_the_order_they_arrived() {
+        let (loads, runs) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let runner = lama_runner(Duration::from_millis(10), &loads, &runs);
+        let first = runner.submit(frame(), mask()).expect("the first job is accepted");
+        let second = runner.submit(frame(), mask()).expect("the second job is accepted");
+        let mut order: Vec<&str> = Vec::new();
+        for _ in 0..400 {
+            for id in [&first, &second] {
+                if runner.state(id).expect("the job exists").0.is_finished() && !order.contains(&id.as_str()) {
+                    order.push(id);
+                }
+            }
+            if order.len() == 2 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(order, [first.as_str(), second.as_str()], "one at a time, in arrival order");
+        assert_eq!((loads.load(Ordering::SeqCst), runs.load(Ordering::SeqCst)), (1, 2), "the session is loaded once and kept");
+        runner.stop();
     }
 }

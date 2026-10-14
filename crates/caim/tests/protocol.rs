@@ -4,7 +4,9 @@
 
 mod support;
 
+use craft_ai_manager::{catalog, protocol, store};
 use serde_json::{Value, json};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use support::{BOUNDARY, decode_png, fill_job, job_json, job_parts, multipart, png_gray, png_rgb, sample_image, sample_mask};
 
@@ -315,11 +317,49 @@ fn a_broken_request_gets_a_400_and_the_server_keeps_serving() {
 
 #[test]
 fn without_the_fake_backend_there_is_nothing_to_run() {
-    let server = support::TestServer::with("no-backend", false, Duration::ZERO);
+    let server = support::TestServer::no_model("no-backend");
     let tasks = server.get("/v1/tasks").json();
     assert_eq!(tasks.get("tasks"), Some(&json!([])), "no tasks, so PhotoCraft greys the menu out");
     let reply = server.submit(&fill_job(4, 2, 8, 3), &sample_image(), &sample_mask());
     assert_eq!(reply.status, 400, "a job has nowhere to go: {}", reply.text());
     assert_eq!(reply.sentence(), "No model is installed for fill_masked_area yet", "the sentence amendment 11 spells out");
     assert_eq!(server.get("/v1/health").status, 200, "health does not need a model");
+}
+
+/// Put the LaMa entry of the real catalog into `root` with the size the catalog promises but
+/// none of the bytes: a sparse file is instant, and MG-02's "installed" check only looks at the
+/// size and the record, so this is enough to decide what the task list answers (MG-04 item 2).
+fn install_lama(root: &Path, acknowledge: bool) {
+    let model = catalog::load().expect("the catalog is part of the binary").into_iter().find(|model| model.id == "lama").expect("lama is in the catalog");
+    std::fs::create_dir_all(store::model_folder(root, &model)).expect("the model folder");
+    let file = std::fs::File::create(store::model_file(root, &model)).expect("the model file");
+    file.set_len(model.size).expect("a file the size the catalog promises");
+    store::write_verified(root, &model, &model.sha256, model.size).expect("verified.json");
+    if acknowledge {
+        store::write_acknowledgement(root, &model).expect("acknowledged.json");
+    }
+}
+
+#[test]
+fn a_model_that_is_installed_and_acknowledged_is_offered_without_loading_it() {
+    let root: PathBuf = support::empty_store("lama-offered");
+    install_lama(&root, true);
+    let server = support::TestServer::lama_store("lama-offered", &root);
+    let tasks = server.get("/v1/tasks").json();
+    assert_eq!(
+        tasks.get("tasks"),
+        Some(&json!([{ "id": TASK, "needs_prompt": false, "max_pixels": protocol::MAX_PIXELS }])),
+        "LaMa is installed, so the task is on the menu"
+    );
+    assert_eq!(server.get("/v1/health").status, 200, "the session is still lazy, so the start stayed fast");
+}
+
+#[test]
+fn a_model_that_is_installed_but_not_acknowledged_is_not_offered() {
+    let root: PathBuf = support::empty_store("lama-unacked");
+    install_lama(&root, false);
+    let server = support::TestServer::lama_store("lama-unacked", &root);
+    assert_eq!(server.get("/v1/tasks").json().get("tasks"), Some(&json!([])), "the override note has to be accepted first");
+    let reply = server.submit(&fill_job(4, 2, 8, 3), &sample_image(), &sample_mask());
+    assert_eq!(reply.status, 400, "and a job is still refused: {}", reply.text());
 }
