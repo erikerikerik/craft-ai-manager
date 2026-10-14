@@ -21,14 +21,17 @@ pub const MODELS_TOML: &str = include_str!("../catalog/models.toml");
 const ALLOWED_ENDINGS: [&str; 2] = ["onnx", "safetensors"];
 
 /// Licence words that mean "not commercial-safe" (amendment 13), matched as whole words so `GPL`
-/// catches `GPL-3.0` and `NC` catches `CC-BY-NC-4.0` without catching `Apache-2.0`.
-const DENYLIST_WORDS: [&str; 4] = ["gpl", "lgpl", "agpl", "nc"];
+/// catches `GPL-3.0` and `NC` catches `CC-BY-NC-4.0` without catching `Apache-2.0`. `research` is
+/// a word of its own because a licence may say it in prose rather than as `research-only`: "for
+/// research purposes only" is denied as well (MG-02 review).
+const DENYLIST_WORDS: [&str; 5] = ["gpl", "lgpl", "agpl", "nc", "research"];
 
 /// The same words when a licence spells them out with a version glued on (`GPLv3`, `OpenRAIL-M`).
 const DENYLIST_PREFIXES: [&str; 4] = ["gpl", "lgpl", "agpl", "openrail"];
 
-/// Phrases that say it in prose (`research-only`, `non-commercial`).
-const DENYLIST_PHRASES: [&str; 4] = ["openrail", "research only", "non commercial", "noncommercial"];
+/// Phrases that say it in prose (`non-commercial`). `research only` is not listed here: the word
+/// `research` above catches it, and catches it wherever it turns up.
+const DENYLIST_PHRASES: [&str; 3] = ["openrail", "non commercial", "noncommercial"];
 
 /// The fields every entry must fill in. The override is checked separately: it is what lets a
 /// denylisted licence through, and a half-written one does not count.
@@ -536,6 +539,30 @@ provenance = 'Built by hand for a test.'
         for licence in ["Apache-2.0", "MIT", "BSD-3-Clause", "CC0-1.0", "CC-BY-4.0", "ISC", "Zlib"] {
             assert!(problems(&swap(TRAINING_LINE, &format!("licence_training_data = '{licence}'"))).is_empty(), "{licence} is commercial-safe");
         }
+    }
+
+    #[test]
+    fn the_word_research_is_denied_wherever_it_appears() {
+        // MG-02 review: the phrase rule only matched `research only` side by side, so a licence
+        // that spells it out as "for research purposes only" walked straight through the gate.
+        for licence in ["for research purposes only", "Research use only", "non-commercial research", "research", "Academic Research Licence"] {
+            let flagged = swap(TRAINING_LINE, &format!("licence_training_data = '{licence}'"));
+            let found = problems(&flagged);
+            assert_eq!(found.len(), 1, "{licence} belongs on the deny list: {found:?}");
+            assert!(found[0].contains("deny list (research)"), "{licence}: {found:?}");
+            assert!(problems(&format!("{flagged}{OVERRIDE}")).is_empty(), "{licence} is allowed with a complete override");
+        }
+    }
+
+    #[test]
+    fn lama_is_in_the_catalog_only_because_erik_overrode_it() {
+        // The shipped entry says `research-only`, which the word rule catches too, so the override
+        // is load-bearing: switch it off and the gate has to stop the release.
+        let without = MODELS_TOML.replace("[model.override]", "[model.override_disabled]");
+        assert_ne!(MODELS_TOML, without, "the shipped catalog has an override block to find");
+        let found = problems(&without);
+        assert!(found.iter().any(|problem| problem.contains("deny list (research)")), "LaMa needs its override: {found:?}");
+        assert!(problems(MODELS_TOML).is_empty(), "with the override the shipped catalog is clean");
     }
 
     #[test]
