@@ -1,0 +1,17 @@
+[package]
+name = "craft-ai-manager"
+description = "Craft AI Manager (CAIM): the local model runner behind PhotoCraft's AI tools"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+
+[[bin]]
+name = "caim"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+# No dependencies yet: MG-01 adds the loopback server.
+[dependencies]

@@ -1,0 +1,6 @@
+BASE | craft-ai-manager | cargo test
+# Regression guards. Before any PR merges, every command below must pass.
+# Format: <feature ID> | <repo> | <command>
+# Add your feature's tests here in the same PR that completes it. Never delete a line to make a
+# PR pass; fix the code or get Erik's OK in the PR.
+# Run from the repo root with CARGO_TARGET_DIR=target/agent-<name>.

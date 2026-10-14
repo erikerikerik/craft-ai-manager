@@ -1,0 +1,11 @@
+target/
+
+# Model weights never go in a repo (photocraft agents/SPEC.md): ONNX and safetensors only, and
+# no pickle formats at all (.ckpt / .pt / .bin).
+*.onnx
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.bin
+models/
