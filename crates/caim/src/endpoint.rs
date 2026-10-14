@@ -3,7 +3,9 @@
 //!
 //! On Windows the file lives under %LOCALAPPDATA%\CraftAI\, which already carries per-user
 //! permissions, so the token inside it is readable only by this user. CRAFT_AI_ENDPOINT names a
-//! different file, which is how the tests keep out of each other's way.
+//! different file, which is how the tests keep out of each other's way. On Linux and macOS that
+//! folder has no such guarantee, so the file - and the temp file before it - are created with mode
+//! 0600 (the MG-01 review follow-up).
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -92,9 +94,25 @@ pub fn write(path: &Path, port: u16, token: &str) -> Result<()> {
 
 /// Create, write and flush one file before it is renamed into place.
 fn write_whole(temp: &Path, body: &[u8]) -> std::io::Result<()> {
-    let mut file = std::fs::File::create(temp)?;
+    let mut file = create_private(temp)?;
     file.write_all(body)?;
     file.flush()
+}
+
+/// Make a file that only this user can read. On Linux and macOS the mode is fixed when the file
+/// is created, so the token is never world-readable, not even in the moment between writing the
+/// temp file and renaming it; a umask can only clear bits, so 0600 is what we get. Windows needs
+/// nothing: %LOCALAPPDATA% already carries a per-user ACL that a plain create inherits.
+#[cfg(unix)]
+fn create_private(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path)
+}
+
+/// The non-Unix half of [create_private](write_whole), where the folder's permissions are enough.
+#[cfg(not(unix))]
+fn create_private(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::File::create(path)
 }
 
 /// A temp name in the same folder as the target, so the rename stays inside one folder.
@@ -197,5 +215,32 @@ mod tests {
         if let Some(path) = endpoint_file_from_env() {
             assert_eq!(path.file_name().unwrap_or_default(), "endpoint.json");
         }
+    }
+
+    /// The MG-01 review follow-up: on Linux and macOS another local user must not be able to read
+    /// the token. Windows is covered by the %LOCALAPPDATA% ACL rather than by a mode.
+    #[cfg(unix)]
+    #[test]
+    fn the_endpoint_file_is_readable_only_by_its_owner() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = temp_endpoint("mode");
+        let _guard = TempFile(path.clone());
+        write(&path, 4004, "mode-token").expect("the file is written");
+        let mode = std::fs::metadata(&path).expect("the file is there").permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "the endpoint file is owner-read-write only, got {mode:o}");
+    }
+
+    /// The temp file is private too, so there is no moment when the token is exposed.
+    #[cfg(unix)]
+    #[test]
+    fn the_temp_file_before_the_rename_is_private_too() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = temp_endpoint("mode-temp");
+        let _guard = TempFile(path.clone());
+        let mut file = super::create_private(&path).expect("the temp file is created");
+        std::io::Write::write_all(&mut file, b"token").expect("the temp file is written");
+        drop(file);
+        let mode = std::fs::metadata(&path).expect("the file is there").permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "the temp file is owner-read-write only, got {mode:o}");
     }
 }
