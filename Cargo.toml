@@ -1,0 +1,19 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+default-members = ["crates/caim"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license-file = "LICENSE.md"
+
+# CAIM adopts PhotoCraft's never-crash rules (photocraft AGENTS.md §3): no unsafe anywhere, and
+# each crate carries the no-panic clippy deny list at the top of its lib.rs / main.rs.
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
