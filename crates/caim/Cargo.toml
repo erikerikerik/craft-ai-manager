@@ -5,6 +5,8 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license-file.workspace = true
+repository.workspace = true
+homepage.workspace = true
 
 [[bin]]
 name = "caim"
@@ -13,5 +15,13 @@ path = "src/main.rs"
 [lints]
 workspace = true
 
-# No dependencies yet: MG-01 adds the loopback server.
+# MG-01 keeps this list short on purpose (SPEC amendment 11, "no new HTTP dependency" on the client
+# side and the same rule here): no async runtime, no web framework, no multipart crate. The HTTP
+# framing, the multipart parser and the job queue are ours, and every one of them is bounded.
 [dependencies]
+getrandom = "0.4"
+httparse = "1.10"
+png = "0.18"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"

@@ -8,6 +8,8 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.95"
 license-file = "LICENSE.md"
+repository = "https://github.com/erikerikerik/craft-ai-manager"
+homepage = "https://github.com/erikerikerik/craft-ai-manager"
 
 # CAIM adopts PhotoCraft's never-crash rules (photocraft AGENTS.md §3): no unsafe anywhere, and
 # each crate carries the no-panic clippy deny list at the top of its lib.rs / main.rs.
