@@ -415,6 +415,14 @@ fn longest_line(head: &[u8]) -> usize {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn leftover_bytes_beyond_content_length_are_a_400() {
+        let mut reader = std::io::Cursor::new(b"must not be read");
+        let clock = super::Clock::starting_now(std::time::Duration::from_secs(1), std::time::Duration::from_secs(1));
+        let error = super::read_body(&mut reader, b"oversized", 2, clock).expect_err("leftovers exceed declared length");
+        assert_eq!(error.status.code(), 400);
+        assert_eq!(reader.position(), 0);
+    }
+    #[test]
     fn partial_writes_cannot_renew_the_response_deadline() {
         use std::{
             io::Write,

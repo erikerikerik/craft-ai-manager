@@ -1,5 +1,21 @@
 # HANDOFF: Craft AI Manager
 
+## 2026-10-15: Codex - BF-03 blocking-review follow-up
+
+- Same branch and PR #2; new commit follows `ae04452`. Review only this follow-up delta.
+- Allocation-order guards cap the actual resize/mask intermediates at 512 elements. Both were
+  mutation-tested: forcing across-first trips a 102,400,000-element guard before allocation.
+- Corrected the initial 128 B/pixel budget policy to 32 B/pixel + 32 MiB and atomically replaced
+  each upload's body charge with its peak charge. Oversized standalone requests return 413;
+  contention alone returns 503. A real 8000×8000 RGBA16 HTTP upload returned 202 idle, then 503 for
+  the same request while the first job held the budget. No `max_pixels` or SPEC change.
+- Growing-axis weights are computed on demand so the realistic estimate also covers panoramas.
+- RFC multipart boundary padding, 1,024 retained-record cap, leftovers > Content-Length, and
+  test-only private `take_png` all covered. Receipt below records final checks.
+- Central PhotoCraft task/review notes are on docs-only PR #14; no PhotoCraft product edits.
+- Keep PR #2 draft until the local reviewer approves this commit and its CI is green, then the
+  user authorized marking it ready and merging through GitHub. Earlier receipt policy is historical.
+
 ## 2026-10-14: Codex - BF-03 resource limits and recovery (handoff to Claude)
 
 - Branch: `ai/bf-03-caim-resource-recovery`, directly based on Claude's BF-01 tip

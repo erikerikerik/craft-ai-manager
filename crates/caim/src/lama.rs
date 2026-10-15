@@ -205,6 +205,14 @@ fn weight_pair(before: usize, after: usize, fraction: f64) -> Vec<(usize, f64)> 
     vec![(before, 1.0 - fraction), (after, fraction)]
 }
 
+/// Compute a growing axis on demand: a panorama must not allocate a weight Vec per pixel.
+fn bilinear_pair(source: usize, target: usize, index: usize) -> (usize, usize, f64) {
+    let scale = source as f64 / target as f64;
+    let centre = ((index as f64 + 0.5) * scale - 0.5).clamp(0.0, (source - 1) as f64);
+    let before = centre.floor() as usize;
+    (before, before.saturating_add(1).min(source - 1), centre - before as f64)
+}
+
 /// Resize one channel plane, row-major, area for a shrink and bilinear for a growth.
 #[must_use]
 pub fn resize_plane(plane: &[f32], width: usize, height: usize, target_width: usize, target_height: usize) -> Vec<f32> {
@@ -214,9 +222,13 @@ pub fn resize_plane(plane: &[f32], width: usize, height: usize, target_width: us
     // Shrink first when the axes move in opposite directions. Always going across first made
     // a 512-square output grow to 512 x a million before shrinking it to a million x 1.
     if height.saturating_mul(target_width) <= target_height.saturating_mul(width) {
+        #[cfg(test)]
+        tests::record_intermediate(height.saturating_mul(target_width));
         let across = resample_across(plane, height, width, target_width);
         resample_down(&across, height, target_width, target_height)
     } else {
+        #[cfg(test)]
+        tests::record_intermediate(target_height.saturating_mul(width));
         let down = resample_down(plane, height, width, target_height);
         resample_across(&down, target_height, width, target_width)
     }
@@ -224,6 +236,21 @@ pub fn resize_plane(plane: &[f32], width: usize, height: usize, target_width: us
 
 /// Resample every row of a plane from `width` to `target_width` samples.
 fn resample_across(plane: &[f32], rows: usize, width: usize, target_width: usize) -> Vec<f32> {
+    if target_width >= width && width > 0 {
+        let mut out = vec![0.0; rows.saturating_mul(target_width)];
+        for row in 0..rows {
+            for column in 0..target_width {
+                let (before, after, weight) = bilinear_pair(width, target_width, column);
+                let at = row.saturating_mul(width);
+                let first = plane.get(at.saturating_add(before)).copied().unwrap_or(0.0);
+                let last = plane.get(at.saturating_add(after)).copied().unwrap_or(0.0);
+                if let Some(slot) = out.get_mut(row.saturating_mul(target_width).saturating_add(column)) {
+                    *slot = (f64::from(first) * (1.0 - weight) + f64::from(last) * weight) as f32;
+                }
+            }
+        }
+        return out;
+    }
     let weights = axis_weights(width, target_width);
     let mut out = vec![0.0f32; rows.saturating_mul(target_width)];
     for row in 0..rows {
@@ -245,6 +272,22 @@ fn resample_across(plane: &[f32], rows: usize, width: usize, target_width: usize
 
 /// Resample a plane from `rows` rows to `target_rows`; the plane already has `target_width` samples a row.
 fn resample_down(plane: &[f32], rows: usize, target_width: usize, target_rows: usize) -> Vec<f32> {
+    if target_rows >= rows && rows > 0 {
+        let mut out = vec![0.0; target_rows.saturating_mul(target_width)];
+        for row in 0..target_rows {
+            let (before, after, weight) = bilinear_pair(rows, target_rows, row);
+            for column in 0..target_width {
+                let first = plane.get(before.saturating_mul(target_width).saturating_add(column)).copied().unwrap_or(0.0);
+                let last = plane.get(after.saturating_mul(target_width).saturating_add(column)).copied().unwrap_or(0.0);
+                if let Some(slot) = out.get_mut(row.saturating_mul(target_width).saturating_add(column)) {
+                    // Match the existing two f32 accumulation steps used by the area path.
+                    let first = (f64::from(first) * (1.0 - weight)) as f32;
+                    *slot = (f64::from(first) + f64::from(last) * weight) as f32;
+                }
+            }
+        }
+        return out;
+    }
     let weights = axis_weights(rows, target_rows);
     let mut out = vec![0.0f32; target_rows.saturating_mul(target_width)];
     for (target_index, list) in weights.iter().enumerate() {
@@ -271,6 +314,8 @@ fn resample_down(plane: &[f32], rows: usize, target_width: usize, target_rows: u
 #[must_use]
 pub fn mask_plane(mask: &[u8], window: Window, image_width: usize, size: usize) -> Vec<f32> {
     if window.height > window.width {
+        #[cfg(test)]
+        tests::record_intermediate(size.saturating_mul(window.width));
         // Pool vertically first for tall narrow images; height * model_size can otherwise
         // dwarf both the image and the model (the same aspect-ratio trap as RGB resizing).
         let mut down = vec![false; size.saturating_mul(window.width)];
@@ -295,6 +340,8 @@ pub fn mask_plane(mask: &[u8], window: Window, image_width: usize, size: usize) 
         }
         return out;
     }
+    #[cfg(test)]
+    tests::record_intermediate(window.height.saturating_mul(size));
     let columns: Vec<(usize, usize)> = (0..size).map(|column| source_span(column, window.width, size)).collect();
     // Across first: for every source row of the window, which model columns it covers.
     let mut across = vec![false; window.height.saturating_mul(size)];
@@ -747,6 +794,51 @@ pub(crate) fn stand_in_pipeline(
 }
 #[cfg(test)]
 mod tests {
+    thread_local! {
+        static INTERMEDIATE_CAP: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
+        static INTERMEDIATE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    pub(super) fn record_intermediate(elements: usize) {
+        INTERMEDIATE_COUNT.set(INTERMEDIATE_COUNT.get() + 1);
+        assert!(elements <= INTERMEDIATE_CAP.get(), "intermediate would allocate {elements} elements; cap is {}", INTERMEDIATE_CAP.get());
+    }
+
+    struct IntermediateGuard(usize, usize);
+    impl IntermediateGuard {
+        fn new(cap: usize) -> Self {
+            Self(INTERMEDIATE_CAP.replace(cap), INTERMEDIATE_COUNT.replace(0))
+        }
+    }
+    impl Drop for IntermediateGuard {
+        fn drop(&mut self) {
+            INTERMEDIATE_CAP.set(self.0);
+            INTERMEDIATE_COUNT.set(self.1);
+        }
+    }
+
+    #[test]
+    fn resize_order_bounds_the_actual_intermediate_allocation() {
+        let _guard = IntermediateGuard::new(512);
+        let source = vec![0.4; 512 * 512];
+        assert_eq!(super::resize_plane(&source, 512, 512, 200_000, 1).len(), 200_000);
+        assert_eq!(INTERMEDIATE_COUNT.get(), 1, "the executed order must report its actual intermediate");
+        INTERMEDIATE_COUNT.set(0);
+        assert_eq!(super::resize_plane(&source, 512, 512, 1, 200_000).len(), 200_000);
+        assert_eq!(INTERMEDIATE_COUNT.get(), 1);
+    }
+
+    #[test]
+    fn mask_pooling_order_bounds_the_actual_intermediate_allocation() {
+        let _guard = IntermediateGuard::new(512);
+        let mask = vec![255; 200_000];
+        let _ = super::mask_plane(&mask, super::Window { x: 0, y: 0, width: 1, height: 200_000 }, 1, 512);
+        assert_eq!(INTERMEDIATE_COUNT.get(), 1);
+        INTERMEDIATE_COUNT.set(0);
+        let _ = super::mask_plane(&mask, super::Window { x: 0, y: 0, width: 200_000, height: 1 }, 200_000, 512);
+        assert_eq!(INTERMEDIATE_COUNT.get(), 1);
+    }
+
     use super::{
         DILATE_PX, Filter, MODEL_SIZE, MSG_FINISH, MSG_LOAD, MSG_PREPARE, MSG_RUN, Window, blend, crop_window, dilate, fill_back, filter_for,
         installed_pipeline, mask_box, mask_plane, model_input, pad_for, resize_plane, stand_in_pipeline,

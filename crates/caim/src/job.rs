@@ -133,7 +133,6 @@ struct Shared {
 /// A queue slot is reserved before HTTP buffers a body; all failure paths release it.
 pub(crate) struct Admission {
     shared: Arc<Mutex<Shared>>,
-    budget: Budget,
     body: Option<Reservation>,
     work: Option<Reservation>,
     pending: bool,
@@ -141,7 +140,12 @@ pub(crate) struct Admission {
 
 impl Admission {
     pub(crate) fn reserve_work(&mut self, width: u32, height: u32) -> Result<()> {
-        self.work = Some(self.budget.reserve(memory::work_bytes(width, height)?)?);
+        let body = self.body.as_mut().ok_or_else(|| Fail::internal("This upload has already reserved its working space."))?;
+        let bytes = memory::upload_work_bytes(width, height, body.bytes())?;
+        // Atomically replace this request's body charge with its peak charge. Adding a second
+        // reservation double-counted the PNG bytes and rejected otherwise legal 64 MP jobs.
+        body.resize(bytes)?;
+        self.work = self.body.take();
         Ok(())
     }
 }
@@ -236,7 +240,7 @@ impl Runner {
         }
         let body = self.budget.reserve(body_bytes)?;
         shared.pending += 1;
-        Ok(Admission { shared: Arc::clone(&self.shared), budget: self.budget.clone(), body: Some(body), work: None, pending: true })
+        Ok(Admission { shared: Arc::clone(&self.shared), body: Some(body), work: None, pending: true })
     }
 
     /// Accept a job and put it at the back of the queue. The id is opaque to the client, and safe
@@ -333,7 +337,8 @@ impl Runner {
     /// `GET /v1/jobs/{id}/result.png`. The encoded image is freed once it has been read, which is
     /// the "or until read" half of the ten-minute rule; the job record stays so polling keeps
     /// working until the record itself expires.
-    pub fn take_png(&self, id: &str) -> Result<Vec<u8>> {
+    #[cfg(test)]
+    fn take_png(&self, id: &str) -> Result<Vec<u8>> {
         let mut delivery = self.begin_delivery(id)?;
         delivery.memory = None;
         delivery.png.take().ok_or_else(|| Fail::not_found("That result has already been read."))
@@ -529,6 +534,52 @@ fn sweep_locked(shared: &mut Shared) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_64mp_rgba16_upload_fits_idle_admission_and_is_busy_only_during_contention() {
+        let runner = super::Runner::new(super::Backend::Fake { step_delay: std::time::Duration::ZERO }, 8).expect("worker");
+        let request =
+            crate::protocol::JobRequest::parse(br#"{"task":"fill_masked_area","image_size":[8000,8000],"region":[0,0,8000,8000],"channels":4,"bit_depth":16}"#)
+                .expect("RGBA16 request");
+        request.validate(true).expect("64 MP ceiling unchanged");
+        // Reserve the admission path used by the server without allocating a 512 MB test PNG.
+        // Includes worst-case raw RGBA16 + grayscale mask and multipart/JSON overhead.
+        let body_bytes = 8000 * 8000 * 9 + 65536;
+        let mut held = runner.admit(body_bytes).expect("idle body reservation");
+        held.reserve_work(8000, 8000).expect("idle 64 MP RGBA16 work accepted");
+        assert_eq!(runner.admit(body_bytes).err().expect("contention").status.code(), 503);
+        drop(held);
+        let mut retry = runner.admit(body_bytes).expect("no permanent busy response");
+        retry.reserve_work(8000, 8000).expect("the same 64 MP request fits again");
+    }
+
+    #[test]
+    fn the_1024_record_cap_refuses_new_jobs_until_records_expire() {
+        let runner = super::Runner::new(super::Backend::Fake { step_delay: std::time::Duration::ZERO }, 8).expect("worker");
+        for n in 0..super::MAX_RECORDS {
+            let mut shared = super::lock(&runner.shared);
+            shared.jobs.push(super::Entry {
+                id: format!("finished-{n}"),
+                state: super::State::Cancelled,
+                progress: 0.0,
+                message: "Cancelled.".into(),
+                cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                input: None,
+                png: None,
+                delivering: false,
+                memory: None,
+                provenance: None,
+                finished_at: Some(std::time::Instant::now()),
+            });
+        }
+        assert_eq!(runner.admit(0).err().expect("record cap").status.code(), 503);
+        {
+            let mut shared = super::lock(&runner.shared);
+            for entry in &mut shared.jobs {
+                entry.finished_at = Some(std::time::Instant::now() - super::RESULT_TTL);
+            }
+        }
+        runner.admit(0).expect("expired records free admission");
+    }
     use super::{Backend, MAX_QUEUE, Provenance, Runner, State, find, lock};
     use crate::backend;
     use crate::image::Frame;

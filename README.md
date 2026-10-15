@@ -82,11 +82,14 @@ answers a job with "No model is installed for fill_masked_area yet", which is ho
 
 **Resource limits and recovery (BF-03).** Uploads reserve a queue slot and their body bytes before the body is read;
 decoded images reserve conservative working space before PNG decoding. A shared 2 GiB image-data budget covers
-uploads, queued/running image work, and retained PNGs. Working space is charged at 128 bytes per pixel plus 32 MiB;
+uploads, queued/running image work, and retained PNGs. Working space is charged at 32 bytes per pixel plus 32 MiB;
 on completion that shrinks to the PNG buffer's capacity. This is accounting, not a process-RAM limit: ONNX Runtime's
 session allocations, allocator overhead, and kernel socket buffers are outside it. `ServeOptions::memory_limit` can
-adjust the budget. The advertised 64 MP limit remains a per-image ceiling; memory pressure can reject a smaller
-image with 503. Job records and pending worker IDs are each capped at 1,024, so finished/cancelled jobs cannot grow
+adjust the budget. Normal encoded PNG bytes are included in that peak estimate, not charged twice; unusually large
+encoded parts also get a decode-phase estimate. An idle 8000×8000 RGBA16 image fits the default budget, preserving
+the advertised 64 MP ceiling. A request whose own peak exceeds the whole budget receives 413; 503 means other
+requests/results are holding capacity (or the queue/record cap is full). Growing RGB axes compute their weights
+on demand, avoiding a large per-output-pixel weight table. Job records and pending worker IDs are each capped at 1,024, so finished/cancelled jobs cannot grow
 without bound during their ten-minute retention period.
 
 Responses have one 30 s write deadline and are written without copying the complete PNG into another response
