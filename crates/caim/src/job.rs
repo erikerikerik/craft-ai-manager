@@ -377,6 +377,10 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
+    /// How long a test waits for the worker. Generous on purpose: tests build unoptimised, and a
+    /// slow CI runner can take most of a second just to prepare a 512x512 LaMa input.
+    const PATIENCE: Duration = Duration::from_secs(30);
+
     fn frame() -> Frame {
         Frame { width: 2, height: 2, channels: 3, bit_depth: 8, samples: vec![10, 20, 30, 200, 100, 50, 40, 60, 80, 90, 20, 10] }
     }
@@ -387,7 +391,8 @@ mod tests {
 
     /// Wait for a job to reach a final state, without spinning forever if it never does.
     fn finish(runner: &Runner, id: &str) -> State {
-        for _ in 0..400 {
+        let deadline = std::time::Instant::now() + PATIENCE;
+        while std::time::Instant::now() < deadline {
             let (state, _, _) = runner.state(id).expect("the job exists");
             if state.is_finished() {
                 return state;
@@ -399,7 +404,8 @@ mod tests {
 
     /// Wait for a job to leave the queue, without spinning forever if it never does.
     fn settle(runner: &Runner, id: &str) -> State {
-        for _ in 0..400 {
+        let deadline = std::time::Instant::now() + PATIENCE;
+        while std::time::Instant::now() < deadline {
             let (state, _, _) = runner.state(id).expect("the job exists");
             if state.is_finished() || state == State::Running {
                 return state;
@@ -503,7 +509,8 @@ mod tests {
         let mut seen: Vec<String> = Vec::new();
         let mut progress: Vec<f64> = Vec::new();
         let mut last = String::new();
-        for _ in 0..400 {
+        let deadline = std::time::Instant::now() + PATIENCE;
+        while std::time::Instant::now() < deadline {
             let (state, value, message) = runner.state(&id).expect("the job exists");
             if message != last {
                 seen.push(message.clone());
@@ -578,7 +585,8 @@ mod tests {
         let first = runner.submit(frame(), mask()).expect("the first job is accepted");
         let second = runner.submit(frame(), mask()).expect("the second job is accepted");
         let mut order: Vec<&str> = Vec::new();
-        for _ in 0..400 {
+        let deadline = std::time::Instant::now() + PATIENCE;
+        while std::time::Instant::now() < deadline {
             for id in [&first, &second] {
                 if runner.state(id).expect("the job exists").0.is_finished() && !order.contains(&id.as_str()) {
                     order.push(id);
