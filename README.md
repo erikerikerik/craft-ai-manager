@@ -15,11 +15,12 @@ patterns). The work list is that repo's `agents/TASKS.md`, the `MG-*` rows.
 commercial use needs a licence from Erik Kristianson. See `LICENSE.md`.
 
 
-**Status: pre-alpha, no real inference yet.** MG-01 built the server: `caim serve` binds `127.0.0.1` on a free port,
+**Status: pre-alpha, one real model.** MG-01 built the server: `caim serve` binds `127.0.0.1` on a free port,
 publishes the endpoint file, and speaks the whole job protocol of SPEC amendment 11. MG-02 built the model store: a
 catalog compiled into the binary (`crates/caim/catalog/models.toml`), the licence gate that decides what CAIM may offer,
-SHA-256-checked downloads, and the `caim models ...` commands. Nothing runs a model yet - the only backend is a built-in
-fake one that fills a masked area with the mean colour of the pixels around it - and the ONNX runner is MG-04.
+SHA-256-checked downloads, and the `caim models ...` commands. MG-04 runs the first model for real: `fill_masked_area`
+puts `lama_fp32.onnx` through ONNX Runtime on the CPU (`crates/caim/src/lama.rs`). The built-in fake backend - a mean
+colour fill - is still there behind `--fake-backend`, and it behaves exactly as MG-01 shipped it.
 
 ## Running it
 
@@ -59,8 +60,45 @@ it. One request per connection, at most 16 connections at once, a 30 s read time
 `Content-Length` on every reply. A request body is at most 1 GiB, an image at most 64 megapixels, and eight jobs run
 at a time; a finished result is kept for ten minutes, or until it has been read, whichever comes first.
 
-Without `--fake-backend` the manager lists no tasks and answers a job with "No model is installed for
-fill_masked_area yet", which is how PhotoCraft knows to grey the menu out.
+With no backend at all - no `--fake-backend`, and no installed and acknowledged LaMa - the manager lists no tasks and
+answers a job with "No model is installed for fill_masked_area yet", which is how PhotoCraft knows to grey the menu out.
+
+
+### Running it with a real model
+
+```text
+caim models install lama --accept-note   # once: 200 MB, hashed while it arrives
+caim serve                               # jobs now run on LaMa, on the CPU
+```
+
+`caim serve` without `--fake-backend` offers `fill_masked_area` in `/v1/tasks` only when LaMa is **installed** - the
+file is there, its size is what the catalog says, and a `verified.json` names the catalog's SHA-256 - **and**
+acknowledged, because LaMa carries the Places365 note. Starting the server never re-hashes the 200 MB file; it reads
+the record. Anything else keeps the no-backend answer above.
+
+The ONNX session is loaded lazily, on the first job that needs one, and kept for every job after it. The first job pays the
+model load - 7.5 s of a 9.0 s debug-build job, against 1.2 s for the next one - so only the first job is slow.
+
+Progress comes in stages, and `message` names the stage the manager is in:
+
+| stage | `progress` | what is happening |
+|---|---|---|
+| prepare | 0 to 0.2 | crop, pad, resize to 512x512 |
+| load model | 0.25 | the first job only |
+| run | 0.3 to 0.9 | the graph: about a second on a desktop CPU |
+| finish | 0.9 to 1.0 | resize back and blend |
+
+A `DELETE /v1/jobs/<id>` stops a job wherever it is. A queued job never starts, and the model is not even loaded for
+it. A job inside the run is cancelled through ONNX Runtime's own run termination, so the inference stops in flight
+instead of running to its end; anywhere else the cancel lands at the next stage boundary. A cancelled job has no
+result: its state is `cancelled`, and the result endpoints say so.
+
+**The 512 px limit.** LaMa takes one fixed 512x512 window, so the runner crops the mask's bounding box plus padding,
+resizes that to 512x512, runs, and resizes the answer back. A hole much wider than 512 px is downscaled to fit and
+comes back softer than the rest of the image. That is accepted for M1; tiling windows across a large hole is CAIM-13.
+
+The result of a job reports the real provenance: `model` `lama`, `device` `cpu`, `provider` `local`, and the
+milliseconds the run took.
 
 ### Stopping it
 

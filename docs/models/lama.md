@@ -44,3 +44,39 @@ Tagged Apache-2.0; port of big-lama (advimman/lama, Apache-2.0); trained on Plac
 ## Not done
 
 The agent started an extra probe of non-512 input sizes; it was cancelled. The graph declares 512×512 inputs, so treat the size as fixed.
+
+## How CAIM runs it (MG-04)
+
+The runner is `crates/caim/src/lama.rs`. The maths is in plain functions so it can be tested without the 200 MB graph;
+`ort` 2.0.0-rc.14 with the CPU execution provider runs the graph itself.
+
+1. **Mask box.** The bounding box of every pixel with `mask > 0`. An empty mask returns the input unchanged and the
+   model never loads or runs.
+2. **Crop.** The box plus padding of `max(32 px, 25% of the box's longer side)`, grown to a square where the image
+   allows it, then clamped to the image. A square crop keeps the 512x512 resize from squashing the subject.
+3. **Resize to 512x512.** Area averaging for a shrink, bilinear for a growth, one plane at a time.
+4. **Normalise.** 8-bit input divides by 255, 16-bit by 65535, so `image` is 0-1 as the tensor table above asks.
+   Only 3- and 4-channel images are in the contract; anything else is refused with a 400 before the model is loaded.
+   Alpha never reaches the graph - it is blended separately.
+5. **Model mask.** `mask > 0` becomes 1.0, then dilated by 4 px at 512 scale, so LaMa repaints the edge of the
+   selection as well as the hole inside it. The mask is resampled nearest-neighbour first: a smoothed mask would lose
+   a thin selection before the dilation gets it back.
+6. **Run.** One call at 512x512. A `DELETE` during the run reaches ONNX Runtime's run termination, so the inference
+   stops in flight.
+7. **Back.** The output is clipped to 0-255 and divided by 255, then resized back to the crop's size.
+8. **Blend by the original mask value only:** `out = in x (1 - m) + fill x m`, with `m = mask / 255` - never the
+   dilated mask the model was shown. Where `mask == 0` the pixel is skipped, so it comes back bit for bit, which is
+   what SPEC amendment 11 promises. In a 16-bit image the untouched pixels keep their 16-bit precision; the fill
+   itself is 8-bit precision scaled up, which MG-04 accepts. Alpha inside the mask blends towards fully opaque by
+   `m`; outside it is untouched.
+
+A hole much wider than 512 px is downscaled into the window and comes back softer than the rest of the image. Accepted
+for M1; tiling is CAIM-13.
+
+The session is loaded on the first job that needs one and kept, so the load is paid once per process. `/result`
+reports `model: "lama"`, `device: "cpu"`, `provider: "local"` and the real elapsed time.
+
+`crates/caim/tests/golden.rs` is the evaluation gate amendment 14 asks for: same size, depth and channels; every
+pixel outside the mask identical to the input; inside the mask, a mean absolute difference of at most 2/255 against
+the committed `expected.png`; and inside the mask, closer to the colour of the background around it than the object
+was. It needs the model, so it is `#[ignore]`d - run it with `cargo test -- --ignored`.

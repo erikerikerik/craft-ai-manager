@@ -116,3 +116,45 @@
 - For the review: the `webpki-roots` licence question, and whether `acknowledged.json` should be one record per model folder
   (today) or shared so a re-download does not re-ask.
 - Still open from MG-01: no Ctrl+C handler, jobs in memory only, MSRV declared but untested in CI.
+
+## 2026-10-14: local agent (Codex, GPT-6, `--profile strata`) - MG-04
+
+**State**
+- Branch `ai/mg-04-lama`, from `origin/main` at `4e1b02e` (MG-02 review). Receipt: `agents/receipts/MG-04.md`. MG-05 is folded in, as its prompt says.
+- Step 0 first, its own commit `bc99e43`: `research` is a denied word of its own in the licence gate, so "for research purposes only" is caught; the `research only` phrase it made redundant is gone.
+  LaMa still passes only because of Erik's D2 override, and a test says so.
+- `ort 2.0.0-rc.14` (MIT OR Apache-2.0) with default features, CPU execution provider only, `api-31` = ONNX Runtime 1.31. No `image` crate: the resize is hand-written in `lama.rs`. 48 new lock entries,
+  licences in the receipt; `byteorder` (Unlicense OR MIT, MIT leg taken) and `webpki-root-certs` (CDLA-Permissive-2.0) are flagged.
+- `src/lama.rs`: the runner. Pure functions for the maths - `mask_box`, `crop_window` (box + `max(32 px, 25% of the longer side)`, grown to a square, clamped), `axis_weights`/`resize_plane` (area down,
+  bilinear up), `mask_plane` + `dilate` (4 px at 512 scale, nearest-neighbour first), `model_input` (0-1 from 255 or 65535), `fill_back`, `blend` (`out = in x (1 - m) + fill x m` with `m = mask / 255`,
+  never the dilated mask, so `mask == 0` comes back bit for bit). `trait Session` + `Pipeline` (session in a `Mutex<Option<..>>`, loaded on the first job and kept) + `OrtSession`, whose `run` spawns a
+  scoped watcher thread that calls `RunOptions::terminate()` when a `DELETE` arrives, so a running inference stops in flight. `ready_pipeline_in` builds a pipeline only when MG-02 says the model is
+  installed (file + size + `verified.json`, no re-hash) and acknowledged.
+- Backend selection: `ServeOptions` gained `models_root` (the test seam), and `caim serve` without `--fake-backend` now picks `Backend::Lama` / `Fake` / `NoModel` at start; `/v1/tasks`, the job refusal sentence
+  and `caim serve`'s own "backend:" line all follow that choice. `--fake-backend` is byte-identical to MG-01.
+- Stages (the MG-05 part): progress 0.0/0.2 prepare, 0.25 load model (first job only), 0.3/0.9 run, 0.9/1.0 finish, each with a `message` naming the stage; `cancel` is checked between every stage. Provenance
+  is `lama` / `cpu` / `local` with real `elapsed_ms`; no new JSON fields.
+- Tests: 138 lib (18 new in `lama.rs`, 4 in `job.rs`) + 4 `endpoint_file` + 17 `protocol` (2 new) = 159, plus `tests/golden.rs` which is `#[ignore]`d. `tests/support` gained `no_model` and `lama_store`.
+- Golden test: `crates/caim/tests/fixtures/{input.png,mask.png,expected.png,SOURCE.md}`. **The three images are synthetic** - this agent had no network, so the Wikimedia photo could not be fetched.
+  `SOURCE.md` says so loudly, gives the generation recipe, and lists the five steps to swap in a real CC0 photo. The gate itself passes: 59,175 pixels outside the mask identical, 0.000 levels a channel
+  inside against `expected.png`, and the masked area moved from 73.0 to 4.9 levels from the surrounding background colour.
+- Manual round trip, recorded in the receipt: `caim serve` (no `--fake-backend`) plus `photocraft-cli run before.png --cmd select.rect ... --cmd edit.generativeFill` from PhotoCraft `main` at `7321d059`.
+  A "Generative Fill" layer with `ai.model = lama`; job 1 9,059 ms (8,701 ms with the model load), job 2 1,593 ms (1,239 ms); every sample outside the selection identical between before and after.
+  Files in `E:\CraftML\work\mg04-roundtrip\`.
+- ONNX Runtime linking: offline, `ort-sys` cannot download the prebuilt runtime, so this machine linked against a local ONNX Runtime 1.31 through `ORT_LIB_PATH` plus DLLs next to the executables
+  (Windows ships a 1.17 `onnxruntime.dll` in `System32`, which otherwise wins the search order). None of that is committed; `Cargo.toml` is plain `ort = "2.0.0-rc.14"`. A clean networked `cargo build`
+  still needs confirming.
+- Docs: README gained "Running it with a real model" (install, the installed-and-acknowledged rule, the lazy session, the stage table, cancel, the 512 px limit, provenance); `docs/models/lama.md` gained
+  "How CAIM runs it (MG-04)" with the eight rules.
+- Guards: `MG-04 | craft-ai-manager | cargo test` added; all 4 lines pass. fmt, clippy `-D warnings`, `cargo test` and `cargo test --test golden -- --ignored` are clean.
+- PhotoCraft fork: MG-04 and MG-05 set to `review` on branch `ai/mg-04-status` (only `agents/TASKS.md`).
+- **Neither branch was pushed: this agent had no network.** `git status` is clean in both repos; Erik pushes and opens the two compare links in the receipt.
+
+**Next**
+- Erik: push `ai/mg-04-lama` and `ai/mg-04-status`, open both PRs, and confirm one clean `cargo build` with network so the `ort` prebuilt-runtime download is proven. Then the review.
+- Replace the synthetic golden fixture with a real CC0 Wikimedia photo (steps in `crates/caim/tests/fixtures/SOURCE.md`). Until then the evaluation gate proves the plumbing, not LaMa on a photograph.
+- MG-04 review follow-ups likely: tiling for holes wider than 512 px (CAIM-13), pinning model id + version + SHA-256 into the result and the layer (B16, needs a SPEC amendment 11 change, U04), and
+  whether one worker thread is enough (CAIM-12).
+- PC-06 (end-to-end on the 4090 against the real manager) is now unblocked: it needs MG-05, which this is.
+- Still open from MG-01: no Ctrl+C handler, jobs in memory only, MSRV declared but untested in CI.
+

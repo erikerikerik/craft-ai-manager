@@ -7,7 +7,7 @@
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use craft_ai_manager::server::{ServeOptions, Server};
@@ -86,6 +86,15 @@ fn header_lines(head: &[u8]) -> Vec<String> {
     String::from_utf8_lossy(head).split("\r\n").skip(1).filter(|line| !line.is_empty()).map(|line| line.to_ascii_lowercase()).collect()
 }
 
+/// An empty model store of the test's own, so a test decides what is installed instead of
+/// inheriting the model folder of the machine it runs on.
+pub fn empty_store(who: &str) -> PathBuf {
+    let path = std::env::temp_dir().join(format!("caim-it-{}-{who}-models", std::process::id()));
+    let _ = std::fs::remove_dir_all(&path);
+    std::fs::create_dir_all(&path).expect("an empty model store folder");
+    path
+}
+
 /// A server on its own temp endpoint file, plus the framing every test needs.
 pub struct TestServer {
     server: Server,
@@ -100,10 +109,25 @@ impl TestServer {
 
     /// A server with the fake backend on or off, and the fake backend's step delay.
     pub fn with(who: &str, fake_backend: bool, step_delay: Duration) -> TestServer {
+        TestServer::options(who, ServeOptions { fake_backend, step_delay, ..ServeOptions::default() })
+    }
+
+    /// A server that sees no installed model, whatever the machine itself happens to have (MG-04
+    /// item 2). The model store is an empty folder of its own.
+    pub fn no_model(who: &str) -> TestServer {
+        TestServer::options(who, ServeOptions { models_root: Some(empty_store(who)), ..ServeOptions::default() })
+    }
+
+    /// A server that looks for LaMa in `root` instead of the machine's model folder.
+    pub fn lama_store(who: &str, root: &Path) -> TestServer {
+        TestServer::options(who, ServeOptions { models_root: Some(root.to_path_buf()), ..ServeOptions::default() })
+    }
+
+    /// Any options at all, with the endpoint file taken care of.
+    fn options(who: &str, options: ServeOptions) -> TestServer {
         let endpoint = std::env::temp_dir().join(format!("caim-it-{}-{who}.json", std::process::id()));
         let _ = std::fs::remove_file(&endpoint);
-        let server = Server::start(ServeOptions { fake_backend, endpoint_file: Some(endpoint.clone()), step_delay, ..ServeOptions::default() })
-            .expect("the server starts");
+        let server = Server::start(ServeOptions { endpoint_file: Some(endpoint.clone()), ..options }).expect("the server starts");
         TestServer { server, endpoint }
     }
 

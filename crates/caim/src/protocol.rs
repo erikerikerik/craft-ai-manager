@@ -55,13 +55,14 @@ impl JobRequest {
 
     /// Check the job against the protocol, and against what this manager can actually run.
     ///
-    /// Without `--fake-backend` there is no model at all, which is the one case amendment 11
-    /// spells out in words: "No model is installed for fill_masked_area yet".
-    pub fn validate(&self, fake_backend: bool) -> Result<()> {
+    /// `fill_offered` says whether this manager has a backend to run on - the fake one, or an
+    /// installed LaMa. When it has neither, the answer is the one case amendment 11 spells out in
+    /// words: "No model is installed for fill_masked_area yet".
+    pub fn validate(&self, fill_offered: bool) -> Result<()> {
         if self.task != TASK_FILL {
             return Err(Fail::bad_request(format!("Craft AI Manager does not know the task {} yet.", quoted(&self.task))));
         }
-        if !fake_backend {
+        if !fill_offered {
             return Err(Fail::bad_request(format!("No model is installed for {TASK_FILL} yet")));
         }
         let [width, height] = self.image_size;
@@ -136,8 +137,8 @@ pub fn health(app: &str) -> Vec<u8> {
 /// `GET /v1/tasks`: with no backend there is nothing to offer, which is what tells PhotoCraft to
 /// grey the menu out.
 #[must_use]
-pub fn tasks(fake_backend: bool) -> Vec<u8> {
-    if fake_backend {
+pub fn tasks(fill_offered: bool) -> Vec<u8> {
+    if fill_offered {
         return json_body(json!({ "tasks": [{ "id": TASK_FILL, "needs_prompt": false, "max_pixels": MAX_PIXELS }] }));
     }
     json_body(json!({ "tasks": [] }))
@@ -193,7 +194,7 @@ mod tests {
     }
 
     #[test]
-    fn without_the_fake_backend_the_answer_is_the_sentence_amendment_11_spells_out() {
+    fn without_a_backend_the_answer_is_the_sentence_amendment_11_spells_out() {
         let fail = job().validate(false).expect_err("no model is installed");
         assert_eq!(fail.status, Status::BadRequest);
         assert_eq!(fail.sentence, "No model is installed for fill_masked_area yet");
