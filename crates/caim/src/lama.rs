@@ -211,10 +211,15 @@ pub fn resize_plane(plane: &[f32], width: usize, height: usize, target_width: us
     if target_width == 0 || target_height == 0 {
         return Vec::new();
     }
-    // Across first, then down: the widest intermediate plane is height x target_width, which keeps
-    // the memory near the size of the model input rather than the size of the crop.
-    let across = resample_across(plane, height, width, target_width);
-    resample_down(&across, height, target_width, target_height)
+    // Shrink first when the axes move in opposite directions. Always going across first made
+    // a 512-square output grow to 512 x a million before shrinking it to a million x 1.
+    if height.saturating_mul(target_width) <= target_height.saturating_mul(width) {
+        let across = resample_across(plane, height, width, target_width);
+        resample_down(&across, height, target_width, target_height)
+    } else {
+        let down = resample_down(plane, height, width, target_height);
+        resample_across(&down, target_height, width, target_width)
+    }
 }
 
 /// Resample every row of a plane from `width` to `target_width` samples.
@@ -265,6 +270,31 @@ fn resample_down(plane: &[f32], rows: usize, target_width: usize, target_rows: u
 /// pixel under its centre. Done one axis at a time, so a shrink reads each source pixel about once.
 #[must_use]
 pub fn mask_plane(mask: &[u8], window: Window, image_width: usize, size: usize) -> Vec<f32> {
+    if window.height > window.width {
+        // Pool vertically first for tall narrow images; height * model_size can otherwise
+        // dwarf both the image and the model (the same aspect-ratio trap as RGB resizing).
+        let mut down = vec![false; size.saturating_mul(window.width)];
+        for row in 0..size {
+            let (first, last) = source_span(row, window.height, size);
+            for column in 0..window.width {
+                let covered = (first..last).any(|source_row| window.pixel(source_row, column, image_width).and_then(|at| mask.get(at)).is_some_and(|v| *v > 0));
+                if let Some(slot) = down.get_mut(row.saturating_mul(window.width).saturating_add(column)) {
+                    *slot = covered;
+                }
+            }
+        }
+        let mut out = vec![0.0; size.saturating_mul(size)];
+        for row in 0..size {
+            for column in 0..size {
+                let (first, last) = source_span(column, window.width, size);
+                let covered = (first..last).any(|x| down.get(row.saturating_mul(window.width).saturating_add(x)).copied().unwrap_or(false));
+                if covered && let Some(slot) = out.get_mut(row.saturating_mul(size).saturating_add(column)) {
+                    *slot = 1.0;
+                }
+            }
+        }
+        return out;
+    }
     let columns: Vec<(usize, usize)> = (0..size).map(|column| source_span(column, window.width, size)).collect();
     // Across first: for every source row of the window, which model columns it covers.
     let mut across = vec![false; window.height.saturating_mul(size)];
@@ -749,6 +779,33 @@ mod tests {
     /// The whole 4x4 image, as a crop.
     fn whole() -> Window {
         Window { x: 0, y: 0, width: 4, height: 4 }
+    }
+
+    #[test]
+    fn mixed_axis_resizes_preserve_values_and_transpose_symmetry() {
+        let source: Vec<f32> = (0..64).map(|i| (i % 8) as f32 / 8.0).collect();
+        let wide = resize_plane(&source, 8, 8, 100_000, 1);
+        let transposed: Vec<f32> = (0..64).map(|i| source[(i % 8) * 8 + i / 8]).collect();
+        let tall = resize_plane(&transposed, 8, 8, 1, 100_000);
+        assert_eq!(wide.len(), 100_000);
+        assert!(wide.iter().zip(&tall).all(|(a, b)| (a - b).abs() < 0.00001));
+        assert!((wide[0] - source[0]).abs() < 0.00001);
+        assert!((wide[99_999] - source[7]).abs() < 0.00001);
+    }
+
+    #[test]
+    fn tall_and_wide_mask_pooling_preserve_the_same_thin_features() {
+        let mut line = vec![0; 100_000];
+        line[0] = 255;
+        line[99_999] = 255;
+        let wide = mask_plane(&line, Window { x: 0, y: 0, width: line.len(), height: 1 }, line.len(), MODEL_SIZE);
+        let tall = mask_plane(&line, Window { x: 0, y: 0, width: 1, height: line.len() }, 1, MODEL_SIZE);
+        for y in 0..MODEL_SIZE {
+            for x in 0..MODEL_SIZE {
+                assert_eq!(wide[y * MODEL_SIZE + x], tall[x * MODEL_SIZE + y]);
+            }
+        }
+        assert!(wide.iter().any(|v| *v > 0.0));
     }
 
     #[test]

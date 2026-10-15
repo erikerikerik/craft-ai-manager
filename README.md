@@ -80,6 +80,23 @@ answers a job with "No model is installed for fill_masked_area yet", which is ho
 
 ### Running it with a real model
 
+**Resource limits and recovery (BF-03).** Uploads reserve a queue slot and their body bytes before the body is read;
+decoded images reserve conservative working space before PNG decoding. A shared 2 GiB image-data budget covers
+uploads, queued/running image work, and retained PNGs. Working space is charged at 128 bytes per pixel plus 32 MiB;
+on completion that shrinks to the PNG buffer's capacity. This is accounting, not a process-RAM limit: ONNX Runtime's
+session allocations, allocator overhead, and kernel socket buffers are outside it. `ServeOptions::memory_limit` can
+adjust the budget. The advertised 64 MP limit remains a per-image ceiling; memory pressure can reject a smaller
+image with 503. Job records and pending worker IDs are each capped at 1,024, so finished/cancelled jobs cannot grow
+without bound during their ten-minute retention period.
+
+Responses have one 30 s write deadline and are written without copying the complete PNG into another response
+buffer. If the server detects a failed result write, the PNG remains available for retry until expiry; a successful
+write still consumes it. This cannot detect a client disconnect after the operating system accepted every byte;
+guaranteed receipt would require a protocol acknowledgement. Shutdown cancels jobs, frees queued inputs, and
+interrupts socket operations through cancellation polling, including on Windows. Active CPU preparation/model
+loading still stops at its next cancellation boundary. Extreme aspect ratios use the smaller intermediate when
+resizing RGB data and pooling masks.
+
 ```text
 caim models install lama --accept-note   # once: 200 MB, hashed while it arrives
 caim serve                               # jobs now run on LaMa, on the CPU

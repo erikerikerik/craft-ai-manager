@@ -1,5 +1,26 @@
 # HANDOFF: Craft AI Manager
 
+## 2026-10-14: Codex - BF-03 resource limits and recovery (handoff to Claude)
+
+- Branch: `ai/bf-03-caim-resource-recovery`, directly based on Claude's BF-01 tip
+  `e7204675b0e7719743038c947062a166d91d0bae`. Not merged. Independent review pending.
+- Owns Codex report findings 2/3/4/7/8/9: smaller resize/mask intermediates; aggregate image-memory
+  admission and bounded record/ID queues; deadline/cancellable socket writes; shutdown cancellation;
+  PNG restoration on a detected failed transfer; multipart boundary-prefix handling.
+- Receipt: `agents/receipts/BF-03.md` lists exact policy choices, changed files, tests, and integration
+  instructions. **Claude should review/integrate these fixes rather than reimplementing them.**
+- Claude retains ownership of PhotoCraft BF-02 and its pending `/v1/tasks` fallback follow-up.
+  No PhotoCraft or SPEC/task-status edits; BF-01 downloader, lock, backend, and receipt untouched.
+- Windows: fmt/clippy clean; full suite 199 passed, one ignored; explicit real-model golden run
+  passed too (0.000 levels/channel difference, 59,175 untouched pixels identical). No fixture edits.
+- Important Windows detail: socket shutdown on a clone alone did not wake reads in the regression
+  test; reads/writes now poll the shutdown signal with 100 ms socket waits.
+- Default image-data reservation budget 2 GiB, working estimate 128 bytes/pixel + 32 MiB; excludes
+  ORT internals. Review this policy. Successful writes still consume results; detected failures
+  restore them. No new protocol acknowledgement, new dependencies, or automatic merges.
+- Integrate BF-01 first, then BF-03. Review Linux CI and new lifetimes before merging. See receipt
+  for the limitations of the existing square/hard-mask synthetic golden fixture.
+
 ## 2026-10-14: local agent (Codex, GPT-6, `--profile strata`) - MG-00
 
 **State**

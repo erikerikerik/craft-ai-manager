@@ -8,6 +8,7 @@
 
 use std::io::{ErrorKind, Read, Write};
 use std::net::TcpStream;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::error::{Fail, Result, Status};
@@ -28,6 +29,75 @@ pub const BODY_PER_STEP: Duration = Duration::from_secs(1);
 pub const BODY_STEP_BYTES: u64 = 8 * 1024 * 1024;
 /// ...and the whole body budget never goes past this, whatever the length says.
 pub const BODY_TIMEOUT_CAP: Duration = Duration::from_secs(180);
+
+/// Windows does not reliably interrupt a blocking read on another socket clone with shutdown.
+/// Poll cancellation while preserving the caller's full per-operation timeout.
+pub(crate) struct Cancellable<'a> {
+    socket: &'a mut TcpStream,
+    stop: &'a AtomicBool,
+    read_wait: Duration,
+    write_wait: Duration,
+}
+
+impl<'a> Cancellable<'a> {
+    pub(crate) fn new(socket: &'a mut TcpStream, stop: &'a AtomicBool) -> Self {
+        Self { socket, stop, read_wait: BODY_TIMEOUT_CAP, write_wait: BODY_TIMEOUT_CAP }
+    }
+
+    fn remaining(&self, until: Instant) -> std::io::Result<Duration> {
+        if self.stop.load(Ordering::Relaxed) {
+            return Err(std::io::Error::new(ErrorKind::ConnectionAborted, "Craft AI Manager is stopping."));
+        }
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(std::io::Error::new(ErrorKind::TimedOut, "The socket operation timed out."));
+        }
+        Ok(left.min(Duration::from_millis(100)))
+    }
+}
+
+impl Read for Cancellable<'_> {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        let until = Instant::now().checked_add(self.read_wait).unwrap_or_else(Instant::now);
+        loop {
+            self.socket.set_read_timeout(Some(self.remaining(until)?))?;
+            match self.socket.read(bytes) {
+                Err(error) if timed_out(&error) || error.kind() == ErrorKind::Interrupted => continue,
+                result => return result,
+            }
+        }
+    }
+}
+
+impl Write for Cancellable<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let until = Instant::now().checked_add(self.write_wait).unwrap_or_else(Instant::now);
+        loop {
+            self.socket.set_write_timeout(Some(self.remaining(until)?))?;
+            match self.socket.write(bytes.get(..bytes.len().min(64 * 1024)).unwrap_or_default()) {
+                Err(error) if timed_out(&error) || error.kind() == ErrorKind::Interrupted => continue,
+                result => return result,
+            }
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.socket.flush()
+    }
+}
+
+impl Timed for Cancellable<'_> {
+    fn wait_at_most(&mut self, limit: Duration) -> std::io::Result<()> {
+        self.read_wait = limit;
+        Ok(())
+    }
+}
+
+impl TimedWrite for Cancellable<'_> {
+    fn write_wait_at_most(&mut self, limit: Duration) -> std::io::Result<()> {
+        self.write_wait = limit;
+        Ok(())
+    }
+}
 
 /// A reader whose next read can be told how long it may wait: the socket in the server, a byte
 /// slice in the tests.
@@ -226,7 +296,11 @@ pub fn read_body<R: Timed>(reader: &mut R, leftover: &[u8], length: u64, clock: 
     let Ok(want) = usize::try_from(length) else {
         return Err(Fail::too_large("The request body is larger than the 1 GiB the protocol allows."));
     };
-    let mut body: Vec<u8> = Vec::with_capacity(want.min(64 * 1024));
+    if leftover.len() > want {
+        return Err(Fail::bad_request("The request body is longer than its Content-Length says."));
+    }
+    let mut body: Vec<u8> = Vec::new();
+    body.try_reserve_exact(want).map_err(|_| Fail::busy("Craft AI Manager cannot allocate this request body right now."))?;
     body.extend_from_slice(leftover);
     let mut chunk = vec![0u8; 64 * 1024];
     while body.len() < want {
@@ -234,7 +308,8 @@ pub fn read_body<R: Timed>(reader: &mut R, leftover: &[u8], length: u64, clock: 
             return Err(Fail::bad_request(BODY_TOO_SLOW));
         };
         reader.wait_at_most(wait)?;
-        match reader.read(&mut chunk) {
+        let remaining = want.saturating_sub(body.len()).min(chunk.len());
+        match reader.read(chunk.get_mut(..remaining).unwrap_or(&mut [])) {
             Ok(0) => return Err(Fail::bad_request("The request stopped before its body was complete.")),
             Ok(read) => body.extend_from_slice(chunk.get(..read).unwrap_or(&[])),
             Err(error) if error.kind() == ErrorKind::Interrupted => {}
@@ -250,15 +325,51 @@ pub fn read_body<R: Timed>(reader: &mut R, leftover: &[u8], length: u64, clock: 
 
 /// Write one reply: the status line, the two headers the protocol promises, and the body.
 pub fn write_response<W: Write>(writer: &mut W, response: &Response<'_>) -> Result<()> {
-    let mut out = Vec::with_capacity(response.body.len().saturating_add(128));
+    let mut out = Vec::with_capacity(128);
     out.extend_from_slice(format!("HTTP/1.1 {} {}\r\n", response.status.code(), response.status.reason()).as_bytes());
     if let Some(content_type) = response.content_type {
         out.extend_from_slice(format!("Content-Type: {content_type}\r\n").as_bytes());
     }
     out.extend_from_slice(format!("Content-Length: {}\r\nConnection: close\r\n\r\n", response.body.len()).as_bytes());
-    out.extend_from_slice(response.body);
     writer.write_all(&out)?;
+    writer.write_all(response.body)?;
     writer.flush().map_err(Fail::from)
+}
+
+/// Every write shares one deadline, so a slow reader cannot renew its timeout forever.
+pub(crate) fn write_socket_response(stream: &mut TcpStream, response: &Response<'_>, budget: Duration, stop: &AtomicBool) -> Result<()> {
+    write_deadlined_response(&mut Cancellable::new(stream, stop), response, budget)
+}
+
+trait TimedWrite: Write {
+    fn write_wait_at_most(&mut self, limit: Duration) -> std::io::Result<()>;
+}
+
+impl TimedWrite for TcpStream {
+    fn write_wait_at_most(&mut self, limit: Duration) -> std::io::Result<()> {
+        self.set_write_timeout(Some(limit))
+    }
+}
+
+fn write_deadlined_response<W: TimedWrite>(stream: &mut W, response: &Response<'_>, budget: Duration) -> Result<()> {
+    struct DeadlineWriter<'a, W> {
+        stream: &'a mut W,
+        clock: Clock,
+    }
+    impl<W: TimedWrite> Write for DeadlineWriter<'_, W> {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let wait = self.clock.next_wait().ok_or_else(|| std::io::Error::new(ErrorKind::TimedOut, "The response write deadline expired."))?;
+            self.stream.write_wait_at_most(wait)?;
+            self.stream.write(bytes)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            if self.clock.expired() {
+                return Err(std::io::Error::new(ErrorKind::TimedOut, "The response write deadline expired."));
+            }
+            self.stream.flush()
+        }
+    }
+    write_response(&mut DeadlineWriter { stream, clock: Clock::starting_now(budget, budget) }, response)
 }
 
 /// The `{"error": "<plain sentence>"}` body amendment 11 defines.
@@ -303,6 +414,56 @@ fn longest_line(head: &[u8]) -> usize {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn partial_writes_cannot_renew_the_response_deadline() {
+        use std::{
+            io::Write,
+            time::{Duration, Instant},
+        };
+        #[derive(Default)]
+        struct SlowWriter {
+            waits: Vec<Duration>,
+            bytes: usize,
+        }
+        impl Write for SlowWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                std::thread::sleep(Duration::from_millis(25));
+                let n = bytes.len().min(1);
+                self.bytes += n;
+                Ok(n)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl super::TimedWrite for SlowWriter {
+            fn write_wait_at_most(&mut self, wait: Duration) -> std::io::Result<()> {
+                self.waits.push(wait);
+                Ok(())
+            }
+        }
+        let mut writer = SlowWriter::default();
+        let response = super::Response { status: super::Status::Ok, content_type: None, body: &[7; 1024] };
+        let start = Instant::now();
+        assert!(super::write_deadlined_response(&mut writer, &response, Duration::from_millis(100)).is_err());
+        assert!(start.elapsed() < Duration::from_secs(3));
+        assert!(writer.bytes < 1024);
+        assert!(writer.waits.windows(2).all(|w| w[1] < w[0]), "one shared deadline, not a fresh timeout per write");
+    }
+
+    #[test]
+    fn an_expired_response_deadline_stops_even_a_writable_socket() {
+        use std::{
+            net::{TcpListener, TcpStream},
+            time::Duration,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let _client = TcpStream::connect(listener.local_addr().expect("address")).expect("client");
+        let (mut socket, _) = listener.accept().expect("socket");
+        let response = super::Response { status: super::Status::Ok, content_type: None, body: b"result" };
+        assert!(super::write_socket_response(&mut socket, &response, Duration::ZERO, &std::sync::atomic::AtomicBool::new(false)).is_err());
+    }
+
     use super::{
         BODY_STEP_BYTES, BODY_TIMEOUT_CAP, Clock, Head, Header, MAX_HEADER_LINE_BYTES, Response, Status, body_budget, error_body, find, read_body, read_head,
         write_response,
