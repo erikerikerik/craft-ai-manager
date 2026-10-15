@@ -7,6 +7,8 @@
 //! sentence, never a panic.
 
 use std::io::{ErrorKind, Read, Write};
+use std::net::TcpStream;
+use std::time::{Duration, Instant};
 
 use crate::error::{Fail, Result, Status};
 
@@ -20,6 +22,77 @@ pub const MAX_HEADERS: usize = 64;
 pub const MAX_BODY_BYTES: u64 = 1024 * 1024 * 1024;
 /// A path longer than this is not one of our endpoints.
 const MAX_PATH_BYTES: usize = 4 * 1024;
+/// C1: a body earns this much extra time for every [BODY_STEP_BYTES] it is long...
+pub const BODY_PER_STEP: Duration = Duration::from_secs(1);
+/// ...which is a slow disk's worth of loopback bytes.
+pub const BODY_STEP_BYTES: u64 = 8 * 1024 * 1024;
+/// ...and the whole body budget never goes past this, whatever the length says.
+pub const BODY_TIMEOUT_CAP: Duration = Duration::from_secs(180);
+
+/// A reader whose next read can be told how long it may wait: the socket in the server, a byte
+/// slice in the tests.
+pub trait Timed: Read {
+    /// Let the next read wait at most `limit`.
+    fn wait_at_most(&mut self, limit: Duration) -> std::io::Result<()>;
+}
+
+impl Timed for TcpStream {
+    fn wait_at_most(&mut self, limit: Duration) -> std::io::Result<()> {
+        // A zero timeout means "wait for ever" to the socket, so the smallest wait is 1 ms.
+        self.set_read_timeout(Some(limit.max(Duration::from_millis(1))))
+    }
+}
+
+impl<T: AsRef<[u8]>> Timed for std::io::Cursor<T> {
+    fn wait_at_most(&mut self, _limit: Duration) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// One deadline across many reads (C1): the per-read timeout alone let a client that sends a byte
+/// every 20 s hold a connection for ever.
+#[derive(Clone, Copy, Debug)]
+pub struct Clock {
+    /// When the whole head, or the whole body, must have arrived.
+    pub until: Instant,
+    /// The longest any single read may wait (amendment 11: 30 s).
+    pub per_read: Duration,
+}
+
+impl Clock {
+    /// A deadline `budget` from now.
+    #[must_use]
+    pub fn starting_now(budget: Duration, per_read: Duration) -> Clock {
+        let now = Instant::now();
+        Clock { until: now.checked_add(budget).unwrap_or(now), per_read }
+    }
+
+    /// How long the next read may wait, or `None` once the deadline has passed.
+    #[must_use]
+    pub fn next_wait(&self) -> Option<Duration> {
+        let left = self.until.saturating_duration_since(Instant::now());
+        if left.is_zero() { None } else { Some(left.min(self.per_read)) }
+    }
+
+    /// Has the deadline passed?
+    #[must_use]
+    pub fn expired(&self) -> bool {
+        self.next_wait().is_none()
+    }
+}
+
+/// The time a body of `length` bytes gets: `base`, plus [BODY_PER_STEP] for every whole
+/// [BODY_STEP_BYTES], never more than [BODY_TIMEOUT_CAP] (or `base`, if that is bigger).
+#[must_use]
+pub fn body_budget(base: Duration, length: u64) -> Duration {
+    let steps = u32::try_from(length / BODY_STEP_BYTES).unwrap_or(u32::MAX);
+    base.saturating_add(BODY_PER_STEP.saturating_mul(steps)).min(BODY_TIMEOUT_CAP.max(base))
+}
+
+/// Was this read error the socket giving up waiting? Linux says `WouldBlock`, Windows `TimedOut`.
+fn timed_out(error: &std::io::Error) -> bool {
+    matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
+}
 
 /// One request header, with the name lowercased so lookups are case-insensitive.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -76,8 +149,9 @@ pub struct Response<'a> {
     pub body: &'a [u8],
 }
 
-/// Read the request line and headers. The caller reads the body once it knows the length.
-pub fn read_head<R: Read>(reader: &mut R) -> Result<Head> {
+/// Read the request line and headers, all of them before `clock` runs out. The caller reads the
+/// body once it knows the length.
+pub fn read_head<R: Timed>(reader: &mut R, clock: Clock) -> Result<Head> {
     let mut buffer: Vec<u8> = Vec::with_capacity(8 * 1024);
     let mut chunk = [0u8; 8 * 1024];
     let head_end = loop {
@@ -90,11 +164,15 @@ pub fn read_head<R: Read>(reader: &mut R) -> Result<Head> {
         if open_line_len(&buffer) > MAX_HEADER_LINE_BYTES + 2 {
             return Err(Fail::bad_request("One request header line is longer than the 8 KiB the protocol allows."));
         }
+        let Some(wait) = clock.next_wait() else {
+            return Err(Fail::bad_request(HEAD_TOO_SLOW));
+        };
+        reader.wait_at_most(wait)?;
         match reader.read(&mut chunk) {
             Ok(0) => return Err(Fail::bad_request("The connection closed before the request headers were complete.")),
             Ok(read) => buffer.extend_from_slice(chunk.get(..read).unwrap_or(&[])),
             Err(error) if error.kind() == ErrorKind::Interrupted => {}
-            Err(error) if error.kind() == ErrorKind::WouldBlock => return Err(Fail::bad_request("The request headers took too long to arrive.")),
+            Err(error) if timed_out(&error) => return Err(Fail::bad_request(HEAD_TOO_SLOW)),
             Err(error) => return Err(error.into()),
         }
     };
@@ -131,11 +209,17 @@ pub fn read_head<R: Read>(reader: &mut R) -> Result<Head> {
     Ok(Head { method: method.to_string(), path: path.to_string(), headers, leftover: buffer.get(head_end.saturating_add(4)..).unwrap_or(&[]).to_vec() })
 }
 
-/// Read exactly `length` body bytes, with the bytes that came with the headers already counted.
+/// The sentence for a head that did not arrive in time.
+const HEAD_TOO_SLOW: &str = "The request headers took too long to arrive.";
+/// The sentence for a body that did not arrive in time.
+const BODY_TOO_SLOW: &str = "The request body took too long to arrive.";
+
+/// Read exactly `length` body bytes, with the bytes that came with the headers already counted, all
+/// of them before `clock` runs out.
 ///
 /// The cap is checked before anything is read, so an honest `Content-Length` over the limit is a
 /// 413 without waiting for a gigabyte that never arrives.
-pub fn read_body<R: Read>(reader: &mut R, leftover: &[u8], length: u64) -> Result<Vec<u8>> {
+pub fn read_body<R: Timed>(reader: &mut R, leftover: &[u8], length: u64, clock: Clock) -> Result<Vec<u8>> {
     if length > MAX_BODY_BYTES {
         return Err(Fail::too_large("The request body is larger than the 1 GiB the protocol allows."));
     }
@@ -146,11 +230,15 @@ pub fn read_body<R: Read>(reader: &mut R, leftover: &[u8], length: u64) -> Resul
     body.extend_from_slice(leftover);
     let mut chunk = vec![0u8; 64 * 1024];
     while body.len() < want {
+        let Some(wait) = clock.next_wait() else {
+            return Err(Fail::bad_request(BODY_TOO_SLOW));
+        };
+        reader.wait_at_most(wait)?;
         match reader.read(&mut chunk) {
             Ok(0) => return Err(Fail::bad_request("The request stopped before its body was complete.")),
             Ok(read) => body.extend_from_slice(chunk.get(..read).unwrap_or(&[])),
             Err(error) if error.kind() == ErrorKind::Interrupted => {}
-            Err(error) if error.kind() == ErrorKind::WouldBlock => return Err(Fail::bad_request("The request body took too long to arrive.")),
+            Err(error) if timed_out(&error) => return Err(Fail::bad_request(BODY_TOO_SLOW)),
             Err(error) => return Err(error.into()),
         }
     }
@@ -215,8 +303,17 @@ fn longest_line(head: &[u8]) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{Head, Header, MAX_HEADER_LINE_BYTES, Response, Status, error_body, find, read_body, read_head, write_response};
+    use super::{
+        BODY_STEP_BYTES, BODY_TIMEOUT_CAP, Clock, Head, Header, MAX_HEADER_LINE_BYTES, Response, Status, body_budget, error_body, find, read_body, read_head,
+        write_response,
+    };
     use std::io::Cursor;
+    use std::time::{Duration, Instant};
+
+    /// A clock that will not run out during a test.
+    fn later() -> Clock {
+        Clock::starting_now(Duration::from_secs(60), Duration::from_secs(30))
+    }
 
     fn head(pairs: &[(&str, &str)]) -> Head {
         Head {
@@ -230,7 +327,7 @@ mod tests {
     #[test]
     fn a_request_head_is_parsed_with_its_headers_lowercased() {
         let raw = b"GET /v1/health HTTP/1.1\r\nHost: 127.0.0.1:9\r\nAuthorization: Bearer abc\r\nContent-Length: 0\r\n\r\n";
-        let parsed = read_head(&mut Cursor::new(raw)).expect("a well formed head parses");
+        let parsed = read_head(&mut Cursor::new(raw), later()).expect("a well formed head parses");
         assert_eq!(parsed.method, "GET");
         assert_eq!(parsed.path, "/v1/health");
         assert_eq!(parsed.header("authorization"), Some("Bearer abc"));
@@ -240,9 +337,9 @@ mod tests {
 
     #[test]
     fn a_garbage_request_line_is_a_bad_request() {
-        assert!(read_head(&mut Cursor::new(b"not a request\r\n\r\n")).is_err());
-        assert!(read_head(&mut Cursor::new(b"GET /v1/health HTTP/2.0\r\n\r\n")).is_err());
-        assert!(read_head(&mut Cursor::new(b"")).is_err());
+        assert!(read_head(&mut Cursor::new(b"not a request\r\n\r\n"), later()).is_err());
+        assert!(read_head(&mut Cursor::new(b"GET /v1/health HTTP/2.0\r\n\r\n"), later()).is_err());
+        assert!(read_head(&mut Cursor::new(b""), later()).is_err());
     }
 
     #[test]
@@ -250,7 +347,7 @@ mod tests {
         let mut raw = b"GET /v1/health HTTP/1.1\r\nX-Long: ".to_vec();
         raw.extend_from_slice(&vec![b'a'; MAX_HEADER_LINE_BYTES.saturating_add(16)]);
         raw.extend_from_slice(b"\r\n\r\n");
-        let fail = read_head(&mut Cursor::new(raw)).expect_err("an over-long header line is refused");
+        let fail = read_head(&mut Cursor::new(raw), later()).expect_err("an over-long header line is refused");
         assert!(fail.sentence.contains("8 KiB"), "the sentence says why: {fail}");
     }
 
@@ -265,16 +362,16 @@ mod tests {
     #[test]
     fn a_body_is_read_to_its_length_and_no_further() {
         let mut stream = Cursor::new(b"remoter junk");
-        let body = read_body(&mut stream, b"lo", 2).expect("the body arrives");
+        let body = read_body(&mut stream, b"lo", 2, later()).expect("the body arrives");
         assert_eq!(body, b"lo");
         assert_eq!(stream.position(), 0, "bytes past the body are left in the socket");
-        let short = read_body(&mut Cursor::new(b"ab"), b"", 8).expect_err("a short body is bad input");
+        let short = read_body(&mut Cursor::new(b"ab"), b"", 8, later()).expect_err("a short body is bad input");
         assert!(short.sentence.contains("stopped before"), "{short}");
     }
 
     #[test]
     fn a_honest_length_over_the_cap_is_413_before_anything_is_read() {
-        let fail = read_body(&mut Cursor::new(b""), b"", 1024 * 1024 * 1024 + 1).expect_err("over the cap is refused");
+        let fail = read_body(&mut Cursor::new(b""), b"", 1024 * 1024 * 1024 + 1, later()).expect_err("over the cap is refused");
         assert_eq!(fail.status, Status::TooLarge);
     }
 
@@ -293,6 +390,27 @@ mod tests {
     fn the_error_body_is_the_shape_the_protocol_asks_for() {
         let value: serde_json::Value = serde_json::from_slice(&error_body("Nothing here.")).expect("the body is JSON");
         assert_eq!(value.get("error").and_then(serde_json::Value::as_str), Some("Nothing here."));
+    }
+
+    #[test]
+    fn a_clock_that_has_run_out_stops_the_read() {
+        let gone = Clock { until: Instant::now(), per_read: Duration::from_secs(30) };
+        let fail = read_head(&mut Cursor::new(b"GET /v1/health HTTP/1.1\r\n\r\n"), gone).expect_err("no time is left");
+        assert!(fail.sentence.contains("too long"), "{fail}");
+        let fail = read_body(&mut Cursor::new(b"abcd"), b"", 4, gone).expect_err("no time is left");
+        assert!(fail.sentence.contains("too long"), "{fail}");
+        assert!(gone.expired());
+        assert_eq!(later().next_wait(), Some(Duration::from_secs(30)), "a single read still waits at most the per-read timeout");
+    }
+
+    #[test]
+    fn a_body_gets_a_second_more_for_every_8_mib_up_to_the_cap() {
+        let base = Duration::from_secs(30);
+        assert_eq!(body_budget(base, 0), base);
+        assert_eq!(body_budget(base, BODY_STEP_BYTES - 1), base, "less than 8 MiB earns nothing extra");
+        assert_eq!(body_budget(base, 4 * BODY_STEP_BYTES), base + Duration::from_secs(4));
+        assert_eq!(body_budget(base, 1024 * 1024 * 1024), Duration::from_secs(158), "a whole GiB gets 30 s plus 128 s");
+        assert_eq!(body_budget(base, u64::MAX), BODY_TIMEOUT_CAP, "and a lie about the length cannot buy more than the cap");
     }
 
     #[test]

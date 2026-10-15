@@ -132,11 +132,14 @@ fn a_sixteen_bit_rgba_image_comes_back_in_the_same_shape() {
     assert_eq!((out.width, out.height, out.channels, out.bit_depth), (4, 1, 4, 16), "size, channels and depth survive");
     assert_eq!(out.sample(0, 0), samples[0], "the unmasked pixel is untouched");
     assert_eq!(out.sample(3, 0), samples[12], "the other unmasked pixel is untouched");
-    assert_eq!(out.sample(1, 3), samples[7], "alpha is left alone");
-    // The mean of the two unmasked pixels is 24576, so pixel 1 takes it and pixel 2 moves halfway.
+    assert_eq!(out.sample(0, 3), samples[3], "the alpha of an unmasked pixel is untouched");
+    assert_eq!(out.sample(1, 3), 65535, "a filled pixel is opaque");
+    // The mean of the two unmasked pixels is 24576. Amendment 16: CAIM does not blend by coverage
+    // (PhotoCraft does), so the fully masked pixel and the half-covered one both take it whole.
     let mean = (u32::from(samples[0]) + u32::from(samples[12])) / 2;
     assert_eq!(u16::try_from(mean).expect("a 16-bit mean"), out.sample(1, 0), "a fully masked pixel takes the mean");
-    assert!(out.sample(2, 0) < samples[8] && u32::from(out.sample(2, 0)) > mean, "a half-covered pixel moves part of the way");
+    assert_eq!(u16::try_from(mean).expect("a 16-bit mean"), out.sample(2, 0), "and so does a half-covered one, at full strength");
+    assert_eq!(out.sample(2, 3), 65535, "and it is opaque too");
 }
 
 #[test]

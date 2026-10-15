@@ -20,7 +20,7 @@ publishes the endpoint file, and speaks the whole job protocol of SPEC amendment
 catalog compiled into the binary (`crates/caim/catalog/models.toml`), the licence gate that decides what CAIM may offer,
 SHA-256-checked downloads, and the `caim models ...` commands. MG-04 runs the first model for real: `fill_masked_area`
 puts `lama_fp32.onnx` through ONNX Runtime on the CPU (`crates/caim/src/lama.rs`). The built-in fake backend - a mean
-colour fill - is still there behind `--fake-backend`, and it behaves exactly as MG-01 shipped it.
+colour fill - is still there behind `--fake-backend`; since BF-01 it follows the same full-strength rule as LaMa (below).
 
 ## Running it
 
@@ -60,6 +60,18 @@ it. One request per connection, at most 16 connections at once, a 30 s read time
 `Content-Length` on every reply. A request body is at most 1 GiB, an image at most 64 megapixels, and eight jobs run
 at a time; a finished result is kept for ten minutes, or until it has been read, whichever comes first.
 
+Each request also has one overall deadline, however its bytes are split into reads: the whole head within 5 s, and
+the body within 30 s plus 1 s for every 8 MiB of its `Content-Length` (three minutes at most). So a client that sends a
+byte every few seconds cannot hold a connection slot. When the manager answers before it has read the body - a wrong
+token (401), a wrong `Host` (400), a body over the cap (413), or too many connections (503) - it closes its side for
+writing and reads the rest of the body, up to its `Content-Length` and a few seconds, before closing. A client that
+writes its whole request before reading still gets that answer instead of a reset connection.
+
+**Who blends a soft selection (SPEC amendment 16).** `result.png` is the input, bit for bit, wherever the mask is 0,
+and the fill **at full strength** wherever the mask is above 0, with alpha there set fully opaque. CAIM never blends by
+coverage: PhotoCraft does, when it uses the mask's coverage as the alpha of the "Generative Fill" layer. If both sides
+blended, a 50% feathered pixel would get 25% of the fill. The fake backend follows the same rule.
+
 With no backend at all - no `--fake-backend`, and no installed and acknowledged LaMa - the manager lists no tasks and
 answers a job with "No model is installed for fill_masked_area yet", which is how PhotoCraft knows to grey the menu out.
 
@@ -86,12 +98,13 @@ Progress comes in stages, and `message` names the stage the manager is in:
 | prepare | 0 to 0.2 | crop, pad, resize to 512x512 |
 | load model | 0.25 | the first job only |
 | run | 0.3 to 0.9 | the graph: about a second on a desktop CPU |
-| finish | 0.9 to 1.0 | resize back and blend |
+| finish | 0.9 to 1.0 | resize back and put the fill in |
 
 A `DELETE /v1/jobs/<id>` stops a job wherever it is. A queued job never starts, and the model is not even loaded for
 it. A job inside the run is cancelled through ONNX Runtime's own run termination, so the inference stops in flight
 instead of running to its end; anywhere else the cancel lands at the next stage boundary. A cancelled job has no
-result: its state is `cancelled`, and the result endpoints say so.
+result: its state is `cancelled`, its `message` is "Cancelled." with no further progress, and the result endpoints say
+so. A queued job's image and mask are freed the moment it is cancelled.
 
 **The 512 px limit.** LaMa takes one fixed 512x512 window, so the runner crops the mask's bounding box plus padding,
 resizes that to 512x512, runs, and resizes the answer back. A hole much wider than 512 px is downscaled to fit and
@@ -143,6 +156,11 @@ whose bytes read, go past the catalog's `size` is refused; a hash or size mismat
 the expected and the actual value. Redirects are followed - Hugging Face hands the download to a CDN - but never down
 to plain HTTP. A model that is already installed makes no request at all. There is no resume yet (CAIM-03 puts resume
 in S2) and cancellation waits for MG-05; while a download runs the CLI prints a percentage.
+
+Only one install of a model writes at a time: it holds `<file>.lock` (created exclusively, touched every few seconds
+while the download runs), and creates `<file>.part` exclusively too, so two installs at once never share a file. A
+second install is told another one is running. A `.part` or a lock left by an install that died - a lock nobody has
+touched for two minutes - is cleared by the next install. The file is synced to disk before it is renamed into place.
 
 **The licence gate.** An entry is not offered - and the test over the embedded catalog fails in CI - when a field is
 missing or empty, when anything says `UNCLEAR`, when the URL is not HTTPS, when `sha256` is not 64 lowercase hex, when

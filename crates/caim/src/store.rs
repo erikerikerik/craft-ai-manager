@@ -30,6 +30,8 @@ const VERIFIED_NAME: &str = "verified.json";
 const ACKNOWLEDGED_NAME: &str = "acknowledged.json";
 /// A download in progress, in the same folder as the file it will become.
 const PART_SUFFIX: &str = ".part";
+/// Held by the one install that may write the `.part` file.
+const LOCK_SUFFIX: &str = ".lock";
 /// How much is hashed at a time, so a 200 MB file never sits in memory.
 const HASH_CHUNK: usize = 64 * 1024;
 
@@ -66,6 +68,13 @@ pub fn model_file(root: &Path, model: &Model) -> PathBuf {
 #[must_use]
 pub fn part_file(root: &Path, model: &Model) -> PathBuf {
     let name = format!("{}{PART_SUFFIX}", model.file);
+    model_folder(root, model).join(name)
+}
+
+/// The lock an install holds while it owns the `.part` file, so two installs never share one.
+#[must_use]
+pub fn lock_file(root: &Path, model: &Model) -> PathBuf {
+    let name = format!("{}{LOCK_SUFFIX}", model.file);
     model_folder(root, model).join(name)
 }
 

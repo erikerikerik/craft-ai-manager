@@ -124,7 +124,7 @@ impl TestServer {
     }
 
     /// Any options at all, with the endpoint file taken care of.
-    fn options(who: &str, options: ServeOptions) -> TestServer {
+    pub fn options(who: &str, options: ServeOptions) -> TestServer {
         let endpoint = std::env::temp_dir().join(format!("caim-it-{}-{who}.json", std::process::id()));
         let _ = std::fs::remove_file(&endpoint);
         let server = Server::start(ServeOptions { endpoint_file: Some(endpoint.clone()), ..options }).expect("the server starts");

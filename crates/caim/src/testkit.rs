@@ -83,3 +83,36 @@ impl Fetch for FakeFetch {
         Ok(Stream { claimed_len: self.claimed, reader: Box::new(std::io::Cursor::new(self.bytes.clone())) })
     }
 }
+
+/// A [Fetch](Fetch) that can be shared between threads and hands its bytes over slowly, a chunk at
+/// a time, so two installs at once really do overlap.
+pub(crate) struct SlowFetch {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) chunk: usize,
+    pub(crate) delay: std::time::Duration,
+}
+
+impl Fetch for SlowFetch {
+    fn open(&self, _url: &str) -> Result<Stream> {
+        Ok(Stream { claimed_len: None, reader: Box::new(SlowReader { bytes: self.bytes.clone(), at: 0, chunk: self.chunk, delay: self.delay }) })
+    }
+}
+
+/// The reader behind [SlowFetch].
+struct SlowReader {
+    bytes: Vec<u8>,
+    at: usize,
+    chunk: usize,
+    delay: std::time::Duration,
+}
+
+impl std::io::Read for SlowReader {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        std::thread::sleep(self.delay);
+        let end = self.at.saturating_add(self.chunk.min(buffer.len())).min(self.bytes.len());
+        let piece = &self.bytes[self.at..end];
+        buffer[..piece.len()].copy_from_slice(piece);
+        self.at = end;
+        Ok(piece.len())
+    }
+}

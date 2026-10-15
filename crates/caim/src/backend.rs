@@ -1,9 +1,11 @@
 //! The built-in fake backend MG-01 runs jobs on, so the protocol can be tested end to end before
 //! any model exists (MG-02 and MG-04 bring the real ones).
 //!
-//! For `fill_masked_area`: outside the mask the output is the input, byte for byte; inside it the
-//! colour moves towards the mean colour of the unmasked pixels, by how much of the mask covers
-//! that pixel. That is not inpainting, and `model: "fake-fill"` says so in every result.
+//! For `fill_masked_area`: outside the mask the output is the input, byte for byte; wherever the
+//! mask is above 0 the pixel is the mean colour of the unmasked pixels at full strength, and fully
+//! opaque. SPEC amendment 16 says PhotoCraft does the blending by coverage, and this fake follows
+//! the same rule as LaMa so the tests see what a real job returns. That is not inpainting, and
+//! `model: "fake-fill"` says so in every result.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -77,7 +79,7 @@ fn clamp_row(row: u64, rows: usize) -> usize {
     usize::try_from(row).unwrap_or(rows).min(rows)
 }
 
-/// Move the covered pixels of these rows towards the mean colour.
+/// Give the covered pixels of these rows the mean colour at full strength, and make them opaque.
 fn blend_rows(out: &mut Frame, mask: &[u8], mean: &[u32], max: f64, rows: std::ops::Range<usize>, width: usize, channels: usize) {
     if rows.is_empty() {
         return;
@@ -85,20 +87,14 @@ fn blend_rows(out: &mut Frame, mask: &[u8], mean: &[u32], max: f64, rows: std::o
     let first_pixel = rows.start.saturating_mul(width);
     let last_pixel = rows.end.saturating_mul(width);
     for pixel in first_pixel..last_pixel {
-        let coverage = mask.get(pixel).copied().unwrap_or(0);
-        if coverage == 0 {
+        if mask.get(pixel).copied().unwrap_or(0) == 0 {
             continue;
         }
         let Some(base) = pixel.checked_mul(channels) else { continue };
-        let weight = f64::from(coverage) / 255.0;
-        for (channel, target) in mean.iter().enumerate().take(channels) {
-            if channel == ALPHA_CHANNEL {
-                continue;
-            }
+        for channel in 0..channels {
             let Some(slot) = out.samples.get_mut(base.saturating_add(channel)) else { continue };
-            let source = f64::from(*slot);
-            let blended = (source + (f64::from(*target) - source) * weight).round().clamp(0.0, max);
-            *slot = u16::try_from(blended as i64).unwrap_or(0);
+            let target = if channel >= ALPHA_CHANNEL { max } else { mean.get(channel).map_or(f64::from(*slot), |value| f64::from(*value)) };
+            *slot = u16::try_from(target.round().clamp(0.0, max) as i64).unwrap_or(0);
         }
     }
 }
@@ -179,19 +175,23 @@ mod tests {
     }
 
     #[test]
-    fn a_soft_mask_blends_between() {
+    fn a_soft_mask_takes_the_fill_at_full_strength() {
+        // Amendment 16: PhotoCraft blends by coverage, so the fake must not blend as well.
         let image = frame(3, 8, &[0, 0, 0, 100, 100, 100, 100, 100, 100, 100, 100, 100]);
         let out = fill(&image, &[128, 0, 0, 0], &mut Vec::new());
-        assert_eq!(out.samples.first(), Some(&50), "a half-covered pixel sits halfway to the mean");
+        assert_eq!(out.samples.first(), Some(&100), "a half-covered pixel takes the whole mean");
+        let faint = fill(&image, &[1, 0, 0, 0], &mut Vec::new());
+        assert_eq!(faint.samples.first(), Some(&100), "and so does the faintest coverage");
         assert_eq!(out.samples.get(3), Some(&100), "and an unmasked pixel stays as it was");
     }
 
     #[test]
-    fn alpha_is_left_alone() {
+    fn alpha_inside_the_mask_becomes_opaque() {
         let image = Frame { width: 2, height: 2, channels: 4, bit_depth: 8, samples: vec![10, 20, 30, 200, 60, 70, 80, 20, 60, 70, 80, 20, 60, 70, 80, 20] };
-        let out = fill(&image, &[255, 0, 0, 0], &mut Vec::new());
-        assert_eq!(out.samples.first(), Some(&60), "the colour moves to the unmasked pixels' colour");
-        assert_eq!(out.samples.get(3), Some(&200), "the alpha of a filled pixel is untouched");
+        let out = fill(&image, &[128, 0, 0, 0], &mut Vec::new());
+        assert_eq!(out.samples.first(), Some(&60), "the colour is the unmasked pixels' colour");
+        assert_eq!(out.samples.get(3), Some(&255), "a filled pixel becomes opaque, as LaMa's do");
+        assert_eq!(out.samples.get(7), Some(&20), "an unmasked pixel keeps its alpha");
     }
 
     #[test]
@@ -208,7 +208,7 @@ mod tests {
         assert_eq!(out.bit_depth, 16);
         assert_eq!(out.samples.first(), Some(&65535), "a fully masked pixel takes the mean exactly");
         let soft = fill(&image, &[128, 0, 0, 0], &mut Vec::new());
-        assert_eq!(soft.samples.first(), Some(&32896), "a half-covered pixel lands half way up the 16-bit range");
+        assert_eq!(soft.samples.first(), Some(&65535), "a half-covered pixel takes the whole mean too");
     }
 
     #[test]

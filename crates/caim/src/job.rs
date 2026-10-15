@@ -22,6 +22,10 @@ const WORKER_POLL: Duration = Duration::from_millis(50);
 const NOT_READY: &str = "The result is not ready yet.";
 /// The sentence for an id this manager has never heard of.
 const NO_SUCH_JOB: &str = "Craft AI Manager has no job with that id.";
+/// The sentence for a job the worker could not be handed, which only happens once it has stopped.
+const NO_WORKER: &str = "Craft AI Manager's job worker has stopped, so it cannot take this job. Restart Craft AI Manager and try again.";
+/// What a cancelled job's poll says, whatever stage it was in.
+const CANCELLED_MESSAGE: &str = "Cancelled.";
 
 /// Where a job is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -187,7 +191,12 @@ impl Runner {
             });
             id
         };
-        self.queue_tx.send(id.clone()).map_err(|_| Fail::internal(NO_SUCH_JOB))?;
+        if self.queue_tx.send(id.clone()).is_err() {
+            // C8: the worker is gone, so the job would sit in the queue for ever and count against
+            // the cap. Forget it and say what actually went wrong.
+            lock(&self.shared).jobs.retain(|entry| entry.id != id);
+            return Err(Fail::internal(NO_WORKER));
+        }
         Ok(id)
     }
 
@@ -198,8 +207,14 @@ impl Runner {
             return Err(Fail::not_found(NO_SUCH_JOB));
         };
         if !entry.state.is_finished() {
+            // C3: a queued job never reaches `finish`, because the worker skips it, so its input is
+            // dropped and its ten-minute clock started here. A running job's worker does both.
+            if entry.state == State::Queued {
+                entry.input = None;
+                entry.finished_at = Some(Instant::now());
+            }
             entry.state = State::Cancelled;
-            entry.message = "Cancelled.".to_string();
+            entry.message = CANCELLED_MESSAGE.to_string();
             entry.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
         }
         Ok(())
@@ -297,7 +312,10 @@ fn run_one(shared: &Arc<Mutex<Shared>>, id: &str, backend: &Backend) {
     let progress_shared = Arc::clone(shared);
     let progress_id = id.to_string();
     let mut progress = move |value: f64, message: &str| {
-        if let Some(entry) = find_mut(&mut lock(&progress_shared).jobs, &progress_id) {
+        // C4: a stage that finishes after a `DELETE` must not overwrite "Cancelled.".
+        if let Some(entry) = find_mut(&mut lock(&progress_shared).jobs, &progress_id)
+            && !entry.state.is_finished()
+        {
             entry.progress = value;
             entry.message = message.to_string();
         }
@@ -332,6 +350,7 @@ fn finish(shared: &Arc<Mutex<Shared>>, id: &str, cancel: &std::sync::atomic::Ato
     let Some(entry) = find_mut(&mut shared.jobs, id) else { return };
     entry.finished_at = Some(Instant::now());
     if entry.state == State::Cancelled {
+        entry.message = CANCELLED_MESSAGE.to_string();
         return;
     }
     match ready {
@@ -345,7 +364,7 @@ fn finish(shared: &Arc<Mutex<Shared>>, id: &str, cancel: &std::sync::atomic::Ato
         Err(fail) => {
             if cancel.load(std::sync::atomic::Ordering::Relaxed) {
                 entry.state = State::Cancelled;
-                entry.message = "Cancelled.".to_string();
+                entry.message = CANCELLED_MESSAGE.to_string();
             } else {
                 entry.state = State::Failed;
                 entry.message = fail.sentence;
@@ -369,7 +388,7 @@ fn sweep_locked(shared: &mut Shared) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Backend, MAX_QUEUE, Provenance, Runner, State};
+    use super::{Backend, MAX_QUEUE, Provenance, Runner, State, find, lock};
     use crate::backend;
     use crate::image::Frame;
     use crate::lama;
@@ -600,5 +619,75 @@ mod tests {
         assert_eq!(order, [first.as_str(), second.as_str()], "one at a time, in arrival order");
         assert_eq!((loads.load(Ordering::SeqCst), runs.load(Ordering::SeqCst)), (1, 2), "the session is loaded once and kept");
         runner.stop();
+    }
+
+    #[test]
+    fn cancelling_a_queued_job_frees_its_input_and_starts_its_clock() {
+        // C3: the worker skips a cancelled job, so cancel() itself has to let the sweep have it.
+        let runner = Runner::new(Backend::Fake { step_delay: Duration::from_millis(50) }, MAX_QUEUE).expect("the worker starts");
+        let first = runner.submit(frame(), mask()).expect("the first job is accepted");
+        let second = runner.submit(frame(), mask()).expect("the second job joins the queue");
+        runner.cancel(&second).expect("cancelling works");
+        {
+            let shared = lock(&runner.shared);
+            let entry = find(&shared.jobs, &second).expect("the cancelled job is still known");
+            assert!(entry.input.is_none(), "the image and mask are dropped at once");
+            assert!(entry.finished_at.is_some(), "and the ten-minute clock has started, so the sweep frees the record");
+        }
+        assert_eq!(finish(&runner, &first), State::Done, "the job ahead of it is unaffected");
+        assert_eq!(runner.state(&second).expect("the record is still there").0, State::Cancelled);
+        runner.stop();
+    }
+
+    #[test]
+    fn a_job_cancelled_mid_stage_says_cancelled_and_stops_reporting() {
+        // C4: the stage that was running when the DELETE arrived used to overwrite "Cancelled.".
+        let (loads, runs) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let runner = Runner::new(Backend::Lama(lama::stand_in_pipeline(128.0, Duration::from_millis(1), &loads, &runs)), MAX_QUEUE).expect("the worker starts");
+        // Big enough that preparing the crop takes a while, so the cancel lands inside that stage.
+        let (width, height) = (3000u32, 3000u32);
+        let image = Frame { width, height, channels: 3, bit_depth: 8, samples: vec![9; (width * height * 3) as usize] };
+        let mut big_mask = vec![0u8; (width * height) as usize];
+        for row in 0..2000 {
+            for column in 0..2000 {
+                big_mask[row * 3000 + column] = 255;
+            }
+        }
+        let id = runner.submit(image, big_mask).expect("the job is accepted");
+        let deadline = std::time::Instant::now() + PATIENCE;
+        loop {
+            let (state, _, message) = runner.state(&id).expect("the job exists");
+            if state == State::Running && message == lama::MSG_PREPARE {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "the job never reached the prepare stage");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        runner.cancel(&id).expect("a running job can be cancelled");
+        let (_, at_cancel, _) = runner.state(&id).expect("the job exists");
+        let deadline = std::time::Instant::now() + PATIENCE;
+        while lock(&runner.shared).jobs.iter().any(|entry| entry.id == id && entry.finished_at.is_none()) {
+            assert!(std::time::Instant::now() < deadline, "the cancelled job never finished");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let (state, progress, message) = runner.state(&id).expect("the job exists");
+        assert_eq!(state, State::Cancelled);
+        assert_eq!(message, "Cancelled.", "the poll says what happened, not the stage it was in");
+        assert_eq!(progress, at_cancel, "and no progress is reported after the cancel");
+        runner.stop();
+    }
+
+    #[test]
+    fn a_job_the_worker_cannot_take_is_forgotten_with_the_right_sentence() {
+        // C8: after the worker stopped, the job stayed queued for ever and the 500 said "no job with that id".
+        let runner = Runner::new(Backend::Fake { step_delay: Duration::ZERO }, MAX_QUEUE).expect("the worker starts");
+        runner.stop();
+        let fail = runner.submit(frame(), mask()).expect_err("there is no worker to take the job");
+        assert_eq!(fail.status.code(), 500, "{fail}");
+        assert!(!fail.sentence.contains("no job with that id"), "the sentence says what went wrong: {fail}");
+        assert!(lock(&runner.shared).jobs.is_empty(), "the job is not left behind in the queue");
+        for _ in 0..MAX_QUEUE + 1 {
+            assert_eq!(runner.submit(frame(), mask()).expect_err("still no worker").status.code(), 500, "never a 503 from leftovers");
+        }
     }
 }

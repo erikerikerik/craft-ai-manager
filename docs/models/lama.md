@@ -52,23 +52,29 @@ The runner is `crates/caim/src/lama.rs`. The maths is in plain functions so it c
 
 1. **Mask box.** The bounding box of every pixel with `mask > 0`. An empty mask returns the input unchanged and the
    model never loads or runs.
-2. **Crop.** The box plus padding of `max(32 px, 25% of the box's longer side)`, grown to a square where the image
-   allows it, then clamped to the image. A square crop keeps the 512x512 resize from squashing the subject.
+2. **Crop.** The box plus padding of `max(32 px, 25% of the box's longer side)`, grown towards a square, then
+   clamped to the image one side at a time and centred on the box. A square crop keeps the 512x512 resize from
+   squashing the subject; where the image is too short (or too narrow) for the square, that side is the image's whole
+   height (or width), so a 400x20 box in a 2000x300 image gets a 600x300 crop rather than 600x160.
 3. **Resize to 512x512.** Area averaging for a shrink, bilinear for a growth, one plane at a time.
 4. **Normalise.** 8-bit input divides by 255, 16-bit by 65535, so `image` is 0-1 as the tensor table above asks.
    Only 3- and 4-channel images are in the contract; anything else is refused with a 400 before the model is loaded.
-   Alpha never reaches the graph - it is blended separately.
+   Alpha never reaches the graph - it is handled when the fill is put back.
 5. **Model mask.** `mask > 0` becomes 1.0, then dilated by 4 px at 512 scale, so LaMa repaints the edge of the
-   selection as well as the hole inside it. The mask is resampled nearest-neighbour first: a smoothed mask would lose
-   a thin selection before the dilation gets it back.
+   selection as well as the hole inside it. When the crop is bigger than 512 on a side, a model pixel is covered if
+   **any** source pixel in its area is (a max-pool), so a 1-2 px stroke such as a wire is still a hole at 512; when it
+   is smaller, each model pixel samples the source pixel under its centre. A smoothed mask would lose a thin selection
+   before the dilation gets it back.
 6. **Run.** One call at 512x512. A `DELETE` during the run reaches ONNX Runtime's run termination, so the inference
    stops in flight.
 7. **Back.** The output is clipped to 0-255 and divided by 255, then resized back to the crop's size.
-8. **Blend by the original mask value only:** `out = in x (1 - m) + fill x m`, with `m = mask / 255` - never the
-   dilated mask the model was shown. Where `mask == 0` the pixel is skipped, so it comes back bit for bit, which is
-   what SPEC amendment 11 promises. In a 16-bit image the untouched pixels keep their 16-bit precision; the fill
-   itself is 8-bit precision scaled up, which MG-04 accepts. Alpha inside the mask blends towards fully opaque by
-   `m`; outside it is untouched.
+8. **Put the fill in at full strength, by the original mask only** - never the dilated mask the model was shown.
+   Where `mask > 0` the pixel is the fill, whatever the coverage; where `mask == 0` the pixel is skipped, so it comes
+   back bit for bit, which is what SPEC amendment 11 promises. **CAIM does not blend by coverage: the client does**
+   (SPEC amendment 16). PhotoCraft composites the "Generative Fill" layer with the mask's coverage as its alpha, so a
+   feathered edge fades exactly once; if CAIM blended too, a 50% pixel would get 25% of the fill. In a 16-bit image the
+   untouched pixels keep their 16-bit precision; the fill itself is 8-bit precision scaled up, which MG-04 accepts.
+   Alpha inside the mask is set fully opaque; outside it is untouched.
 
 A hole much wider than 512 px is downscaled into the window and comes back softer than the rest of the image. Accepted
 for M1; tiling is CAIM-13.

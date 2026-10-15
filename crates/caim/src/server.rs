@@ -4,19 +4,26 @@
 //!
 //! Order on every request: the token first (401), then the `Host` header (400, which is what stops
 //! a browser on another machine from reaching us through a DNS rebinding), then the endpoint.
+//!
+//! BF-01 added two things around that. One deadline per request (C1): the whole head within 5 s
+//! and the body within a budget that grows with its length, however the bytes are split, so a
+//! client trickling a byte at a time cannot hold a slot for ever. And a reply sent before the body
+//! was read (X2: 401, 400, 413, 503) is followed by closing our side for writing and reading the
+//! rest of the body - up to its `Content-Length` and a few seconds - before the socket closes, so a
+//! client that writes its whole request before it reads still gets the reply instead of a reset.
 
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Read};
 use std::net::{Ipv4Addr, Shutdown, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::VERSION;
 use crate::endpoint::{self, ENDPOINT_ENV};
 use crate::error::{Fail, Result, Status, quoted};
-use crate::http::{self, Head, Response, read_head, write_error, write_response};
+use crate::http::{self, Clock, Head, Response, read_head, write_error, write_response};
 use crate::image;
 use crate::job::{self, Backend, Runner, State};
 use crate::lama;
@@ -30,8 +37,18 @@ pub const LOCAL_HOST: Ipv4Addr = Ipv4Addr::LOCALHOST;
 pub const MAX_CONNECTIONS: usize = 16;
 /// Amendment 11: 30 s per read.
 pub const READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// C1: the whole request head within 5 s, however slowly the bytes come.
+pub const HEAD_TIMEOUT: Duration = Duration::from_secs(5);
+/// C1: the body gets 30 s, plus a second for every 8 MiB, up to three minutes (`http::body_budget`).
+pub const BODY_TIMEOUT: Duration = Duration::from_secs(30);
+/// X2: how long an early error reply waits for the rest of a body before it closes.
+pub const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long the accept loop sleeps when there is nothing to accept.
 const ACCEPT_POLL: Duration = Duration::from_millis(2);
+/// How long the accept loop waits after an accept that failed, before it tries again (C7).
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(20);
+/// What an early reply reads at most when the request never said how long its body is.
+const DRAIN_UNKNOWN_BYTES: u64 = http::MAX_BODY_BYTES + http::MAX_HEAD_BYTES as u64;
 /// The endpoints of amendment 11, and nothing else.
 const PATH_HEALTH: &str = "/v1/health";
 const PATH_TASKS: &str = "/v1/tasks";
@@ -41,7 +58,7 @@ const PATH_JOB_PREFIX: &str = "/v1/jobs/";
 const JSON: &str = "application/json";
 const PNG: &str = "image/png";
 
-/// How to start a server. The defaults are what `caim serve` uses; the tests change the last three.
+/// How to start a server. The defaults are what `caim serve` uses; the tests shorten the timeouts and limits.
 #[derive(Clone, Debug)]
 pub struct ServeOptions {
     /// Run jobs on the built-in fake backend.
@@ -58,6 +75,12 @@ pub struct ServeOptions {
     pub max_queue: usize,
     /// The fake backend's delay between its ten progress steps.
     pub step_delay: Duration,
+    /// The whole request head has to arrive within this, however it is split into reads (C1).
+    pub head_timeout: Duration,
+    /// The body's budget before the per-size allowance is added (C1).
+    pub body_timeout: Duration,
+    /// How long an early error reply waits for the rest of the request body before closing (X2).
+    pub drain_timeout: Duration,
 }
 
 impl Default for ServeOptions {
@@ -70,17 +93,23 @@ impl Default for ServeOptions {
             max_connections: MAX_CONNECTIONS,
             max_queue: job::MAX_QUEUE,
             step_delay: Duration::ZERO,
+            head_timeout: HEAD_TIMEOUT,
+            body_timeout: BODY_TIMEOUT,
+            drain_timeout: DRAIN_TIMEOUT,
         }
     }
 }
 
-/// What a connection thread needs: the port we are on, the token, and the job queue.
+/// What a connection thread needs: the port we are on, the token, the deadlines, and the job queue.
 struct Context {
     port: u16,
     token: String,
     /// Whether a backend is running, which is what `/v1/tasks` and `POST /v1/jobs` answer with.
     fill_offered: bool,
     read_timeout: Duration,
+    head_timeout: Duration,
+    body_timeout: Duration,
+    drain_timeout: Duration,
     runner: Arc<Runner>,
 }
 
@@ -123,7 +152,16 @@ impl Server {
             return Err(error);
         }
         let stop = Arc::new(AtomicBool::new(false));
-        let context = Arc::new(Context { port, token: token.clone(), fill_offered, read_timeout: options.read_timeout, runner: Arc::clone(&runner) });
+        let context = Arc::new(Context {
+            port,
+            token: token.clone(),
+            fill_offered,
+            read_timeout: options.read_timeout,
+            head_timeout: options.head_timeout,
+            body_timeout: options.body_timeout,
+            drain_timeout: options.drain_timeout,
+            runner: Arc::clone(&runner),
+        });
         let accept_stop = Arc::clone(&stop);
         let handle = std::thread::Builder::new()
             .name("caim-accept".to_string())
@@ -200,19 +238,33 @@ impl Drop for Server {
     }
 }
 
+/// Where the accept loop gets its connections from: the listener, or a stand-in in a test.
+trait Accept: Send + 'static {
+    fn accept_one(&self) -> std::io::Result<TcpStream>;
+}
+
+impl Accept for TcpListener {
+    fn accept_one(&self) -> std::io::Result<TcpStream> {
+        self.accept().map(|(stream, _peer)| stream)
+    }
+}
+
 /// Accept until asked to stop, one thread per connection.
-fn accept_loop(listener: TcpListener, context: Arc<Context>, stop: Arc<AtomicBool>, max_connections: usize) {
+///
+/// An accept that fails is about that one connection (it was reset or aborted before we took it,
+/// or the process is briefly out of file handles), so the loop waits a moment and carries on; it
+/// never stops serving because of one (C7).
+fn accept_loop<L: Accept>(listener: L, context: Arc<Context>, stop: Arc<AtomicBool>, max_connections: usize) {
     let mut children: Vec<JoinHandle<()>> = Vec::new();
+    // Threads that are answering a 503 and reading the rest of that request (X2), counted so they
+    // are bounded too.
+    let refusing = Arc::new(AtomicUsize::new(0));
     while !stop.load(Ordering::Relaxed) {
         children.retain(|child| !child.is_finished());
-        match listener.accept() {
-            Ok((mut stream, _peer)) => {
+        match listener.accept_one() {
+            Ok(stream) => {
                 if children.len() >= max_connections {
-                    refuse(
-                        &mut stream,
-                        Status::Busy,
-                        &format!("Craft AI Manager already has {} requests open, so it cannot take another one yet.", max_connections),
-                    );
+                    refuse_busy(stream, max_connections, &refusing, context.drain_timeout);
                     continue;
                 }
                 // The thread owns its own socket, so a thread that cannot start can still answer.
@@ -221,14 +273,15 @@ fn accept_loop(listener: TcpListener, context: Arc<Context>, stop: Arc<AtomicBoo
                         let connection_context = Arc::clone(&context);
                         match std::thread::Builder::new().name("caim-connection".to_string()).spawn(move || handle_connection(owned, &connection_context)) {
                             Ok(handle) => children.push(handle),
-                            Err(_) => refuse(&mut stream, Status::Internal, "Craft AI Manager could not take another connection."),
+                            Err(_) => refuse(stream, Status::Internal, "Craft AI Manager could not take another connection."),
                         }
                     }
-                    Err(_) => refuse(&mut stream, Status::Internal, "Craft AI Manager could not take another connection."),
+                    Err(_) => refuse(stream, Status::Internal, "Craft AI Manager could not take another connection."),
                 }
             }
-            Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => std::thread::sleep(ACCEPT_POLL),
-            Err(_) => break,
+            Err(error) if error.kind() == ErrorKind::WouldBlock => std::thread::sleep(ACCEPT_POLL),
+            Err(error) if error.kind() == ErrorKind::Interrupted => {}
+            Err(_) => std::thread::sleep(ACCEPT_BACKOFF),
         }
     }
     for child in children {
@@ -236,10 +289,48 @@ fn accept_loop(listener: TcpListener, context: Arc<Context>, stop: Arc<AtomicBoo
     }
 }
 
-/// Answer a connection that arrived while every worker slot was taken.
-fn refuse(stream: &mut TcpStream, status: Status, sentence: &str) {
-    let _ = write_error(stream, status, sentence);
+/// Answer a connection that could not be served at all, and close it.
+fn refuse(mut stream: TcpStream, status: Status, sentence: &str) {
+    let _ = write_error(&mut stream, status, sentence);
     let _ = stream.shutdown(Shutdown::Both);
+}
+
+/// Answer a connection that arrived while every worker slot was taken. The 503 goes out at once;
+/// then, on a short-lived thread of its own, the rest of the request is read and thrown away, so a
+/// client still writing its body can read the 503 (X2). Those threads are capped at the
+/// connection limit as well; past that the 503 is sent and the socket simply closed.
+fn refuse_busy(mut stream: TcpStream, max_connections: usize, refusing: &Arc<AtomicUsize>, drain_timeout: Duration) {
+    let sentence = format!("Craft AI Manager already has {max_connections} requests open, so it cannot take another one yet.");
+    let _ = write_error(&mut stream, Status::Busy, &sentence);
+    if refusing.fetch_add(1, Ordering::SeqCst) >= max_connections {
+        refusing.fetch_sub(1, Ordering::SeqCst);
+        let _ = stream.shutdown(Shutdown::Both);
+        return;
+    }
+    let counter = Arc::clone(refusing);
+    let spawned = std::thread::Builder::new().name("caim-refuse".to_string()).spawn(move || {
+        if stream.set_nonblocking(false).is_ok() {
+            close_after_reply(&mut stream, Unread::Unknown, drain_timeout);
+        } else {
+            let _ = stream.shutdown(Shutdown::Both);
+        }
+        counter.fetch_sub(1, Ordering::SeqCst);
+    });
+    if spawned.is_err() {
+        // The socket went with the closure, after its 503; only the count is left to undo.
+        refusing.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// How much of the request is still on the socket once the reply has gone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Unread {
+    /// Nothing worth waiting for: the body was read, there was none, or the client was too slow.
+    Nothing,
+    /// The rest of a body whose length the request gave.
+    Bytes(u64),
+    /// A body of a length we do not know.
+    Unknown,
 }
 
 /// One connection, one request, then the socket is closed.
@@ -248,15 +339,64 @@ fn handle_connection(mut stream: TcpStream, context: &Context) {
         let _ = stream.shutdown(Shutdown::Both);
         return;
     }
-    if let Err(fail) = serve_request(&mut stream, context) {
+    let mut unread = Unread::Unknown;
+    if let Err(fail) = serve_request(&mut stream, context, &mut unread) {
         let _ = write_error(&mut stream, fail.status, &fail.sentence);
+    }
+    close_after_reply(&mut stream, unread, context.drain_timeout);
+}
+
+/// Close a connection whose reply has been written. When part of the request is still unread, our
+/// side is closed for writing first - the client sees the end of the reply - and the rest is read
+/// and dropped, up to its length and `drain_timeout`, so closing does not reset a client that is
+/// still writing and make it lose the reply (X2).
+fn close_after_reply(stream: &mut TcpStream, unread: Unread, drain_timeout: Duration) {
+    let limit = match unread {
+        Unread::Nothing | Unread::Bytes(0) => {
+            let _ = stream.shutdown(Shutdown::Both);
+            return;
+        }
+        Unread::Bytes(left) => left,
+        Unread::Unknown => DRAIN_UNKNOWN_BYTES,
+    };
+    let _ = stream.shutdown(Shutdown::Write);
+    let until = Instant::now().checked_add(drain_timeout).unwrap_or_else(Instant::now);
+    let mut chunk = vec![0u8; 64 * 1024];
+    let mut drained: u64 = 0;
+    while drained < limit {
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() || stream.set_read_timeout(Some(left.max(Duration::from_millis(1)))).is_err() {
+            break;
+        }
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(read) => drained = drained.saturating_add(read as u64),
+            Err(error) if error.kind() == ErrorKind::Interrupted => {}
+            Err(_) => break,
+        }
     }
     let _ = stream.shutdown(Shutdown::Both);
 }
 
-/// The order amendment 11 implies: token, then `Host`, then the endpoint.
-fn serve_request(stream: &mut TcpStream, context: &Context) -> Result<()> {
-    let head = read_head(stream)?;
+/// The order amendment 11 implies: token, then `Host`, then the endpoint. `unread` is kept up to
+/// date with how much of the request is still on the socket, for [close_after_reply].
+fn serve_request(stream: &mut TcpStream, context: &Context, unread: &mut Unread) -> Result<()> {
+    let clock = Clock::starting_now(context.head_timeout, context.read_timeout);
+    let head = match read_head(stream, clock) {
+        Ok(head) => head,
+        Err(fail) => {
+            // A head that never finished in time is a slow client: answer and close, no waiting.
+            if clock.expired() {
+                *unread = Unread::Nothing;
+            }
+            return Err(fail);
+        }
+    };
+    *unread = match head.content_length() {
+        Ok(Some(length)) => Unread::Bytes(length.saturating_sub(u64::try_from(head.leftover.len()).unwrap_or(u64::MAX))),
+        Ok(None) => Unread::Nothing,
+        Err(_) => Unread::Unknown,
+    };
     if !bearer_matches(&context.token, head.header("authorization").unwrap_or_default()) {
         return write_error(stream, Status::Unauthorized, "Craft AI Manager needs its token in the Authorization header.");
     }
@@ -268,7 +408,7 @@ fn serve_request(stream: &mut TcpStream, context: &Context) -> Result<()> {
             &format!("Craft AI Manager only answers requests addressed to {} (this one says {}).", expected, quoted(head.header("host").unwrap_or_default())),
         );
     }
-    route(stream, context, &head)
+    route(stream, context, &head, unread)
 }
 
 /// Send one reply and close.
@@ -281,7 +421,7 @@ fn unknown_path(stream: &mut TcpStream, path: &str) -> Result<()> {
     write_error(stream, Status::NotFound, &format!("Craft AI Manager has no endpoint at {}.", quoted(path)))
 }
 
-fn route(stream: &mut TcpStream, context: &Context, head: &Head) -> Result<()> {
+fn route(stream: &mut TcpStream, context: &Context, head: &Head, unread: &mut Unread) -> Result<()> {
     let (method, path) = (head.method.as_str(), head.path.as_str());
     if path == PATH_HEALTH {
         return if method == "GET" { send(stream, Status::Ok, Some(JSON), &protocol::health(&format!("caim/{VERSION}"))) } else { unknown_path(stream, path) };
@@ -290,7 +430,7 @@ fn route(stream: &mut TcpStream, context: &Context, head: &Head) -> Result<()> {
         return if method == "GET" { send(stream, Status::Ok, Some(JSON), &protocol::tasks(context.fill_offered)) } else { unknown_path(stream, path) };
     }
     if path == PATH_JOBS {
-        return if method == "POST" { submit(stream, context, head) } else { unknown_path(stream, path) };
+        return if method == "POST" { submit(stream, context, head, unread) } else { unknown_path(stream, path) };
     }
     let Some(rest) = path.strip_prefix(PATH_JOB_PREFIX) else {
         return unknown_path(stream, path);
@@ -324,10 +464,22 @@ fn route(stream: &mut TcpStream, context: &Context, head: &Head) -> Result<()> {
 }
 
 /// `POST /v1/jobs`: read the body, split the three parts, check them against each other, queue.
-fn submit(stream: &mut TcpStream, context: &Context, head: &Head) -> Result<()> {
+fn submit(stream: &mut TcpStream, context: &Context, head: &Head, unread: &mut Unread) -> Result<()> {
     let length =
         head.content_length()?.ok_or_else(|| Fail::bad_request("The job request has no Content-Length, so Craft AI Manager cannot read its parts."))?;
-    let body = http::read_body(stream, &head.leftover, length)?;
+    let clock = Clock::starting_now(http::body_budget(context.body_timeout, length), context.read_timeout);
+    let body = match http::read_body(stream, &head.leftover, length, clock) {
+        Ok(body) => body,
+        Err(fail) => {
+            // A body over the cap is refused before it is read, so the rest of it is still there;
+            // anything else (too slow, cut short) has nothing left worth waiting for.
+            if fail.status != Status::TooLarge {
+                *unread = Unread::Nothing;
+            }
+            return Err(fail);
+        }
+    };
+    *unread = Unread::Nothing;
     let parts = multipart::parse(head.header("content-type"), &body)?;
     let request = JobRequest::parse(parts.job)?;
     request.validate(context.fill_offered)?;
@@ -349,10 +501,70 @@ pub const ENDPOINT_VARIABLE: &str = ENDPOINT_ENV;
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_CONNECTIONS, READ_TIMEOUT, ServeOptions, Server, state_name};
-    use crate::job::State;
+    use super::{Accept, Context, MAX_CONNECTIONS, READ_TIMEOUT, ServeOptions, Server, accept_loop, state_name};
+    use crate::job::{Backend, MAX_QUEUE, Runner, State};
+    use std::io::{ErrorKind, Read, Write};
+    use std::net::{TcpListener, TcpStream};
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
+
+    /// A listener whose next few accepts fail the way a reset or aborted connection does, or the way
+    /// running out of file handles does, before it hands over real connections.
+    struct Flaky {
+        listener: TcpListener,
+        failures: Mutex<Vec<std::io::Error>>,
+    }
+
+    impl Accept for Flaky {
+        fn accept_one(&self) -> std::io::Result<TcpStream> {
+            if let Some(error) = self.failures.lock().expect("the failure list").pop() {
+                return Err(error);
+            }
+            self.listener.accept_one()
+        }
+    }
+
+    #[test]
+    fn an_accept_that_fails_does_not_stop_the_server() {
+        // C7: any accept error other than WouldBlock or Interrupted used to end the accept loop.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a listener");
+        listener.set_nonblocking(true).expect("non-blocking");
+        let port = listener.local_addr().expect("its address").port();
+        let failures = vec![
+            std::io::Error::from(ErrorKind::ConnectionAborted),
+            std::io::Error::from(ErrorKind::ConnectionReset),
+            std::io::Error::other("Too many open files"),
+        ];
+        let flaky = Flaky { listener, failures: Mutex::new(failures) };
+        let runner = Arc::new(Runner::new(Backend::Fake { step_delay: Duration::ZERO }, MAX_QUEUE).expect("the worker starts"));
+        let options = ServeOptions::default();
+        let context = Arc::new(Context {
+            port,
+            token: "t".repeat(64),
+            fill_offered: true,
+            read_timeout: options.read_timeout,
+            head_timeout: options.head_timeout,
+            body_timeout: options.body_timeout,
+            drain_timeout: options.drain_timeout,
+            runner: Arc::clone(&runner),
+        });
+        let stop = Arc::new(AtomicBool::new(false));
+        let loop_stop = Arc::clone(&stop);
+        let handle = std::thread::spawn(move || accept_loop(flaky, context, loop_stop, MAX_CONNECTIONS));
+        std::thread::sleep(Duration::from_millis(200));
+        let mut client = TcpStream::connect(("127.0.0.1", port)).expect("the server still takes connections");
+        client.set_read_timeout(Some(Duration::from_secs(5))).expect("a read timeout");
+        let request = format!("GET /v1/health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n", "t".repeat(64));
+        client.write_all(request.as_bytes()).expect("the request goes out");
+        let mut reply = String::new();
+        let _ = client.read_to_string(&mut reply);
+        assert!(reply.starts_with("HTTP/1.1 200"), "the request after three failed accepts is answered: {reply:?}");
+        stop.store(true, Ordering::Relaxed);
+        handle.join().expect("the accept loop stops when asked");
+        runner.stop();
+    }
 
     fn temp_endpoint(who: &str) -> PathBuf {
         std::env::temp_dir().join(format!("caim-server-{}-{who}.json", std::process::id()))
