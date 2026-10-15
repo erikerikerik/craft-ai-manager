@@ -20,7 +20,7 @@ publishes the endpoint file, and speaks the whole job protocol of SPEC amendment
 catalog compiled into the binary (`crates/caim/catalog/models.toml`), the licence gate that decides what CAIM may offer,
 SHA-256-checked downloads, and the `caim models ...` commands. MG-04 runs the first model for real: `fill_masked_area`
 puts `lama_fp32.onnx` through ONNX Runtime on the CPU (`crates/caim/src/lama.rs`). The built-in fake backend - a mean
-colour fill - is still there behind `--fake-backend`, and it behaves exactly as MG-01 shipped it.
+colour fill - is still there behind `--fake-backend`; since BF-01 it follows the same full-strength rule as LaMa (below).
 
 ## Running it
 
@@ -60,11 +60,45 @@ it. One request per connection, at most 16 connections at once, a 30 s read time
 `Content-Length` on every reply. A request body is at most 1 GiB, an image at most 64 megapixels, and eight jobs run
 at a time; a finished result is kept for ten minutes, or until it has been read, whichever comes first.
 
+Each request also has one overall deadline, however its bytes are split into reads: the whole head within 5 s, and
+the body within 30 s plus 1 s for every 8 MiB of its `Content-Length` (three minutes at most). So a client that sends a
+byte every few seconds cannot hold a connection slot for more than 5 s of head. A local process that keeps
+reconnecting 16 sockets can still make the manager answer 503 to others; on loopback that is accepted, because such a
+process could do worse to the machine anyway. When the manager answers before it has read the body - a wrong
+token (401), a wrong `Host` (400), a body over the cap (413), or too many connections (503) - it closes its side for
+writing and reads the rest of the body, up to its `Content-Length` and a few seconds, before closing. A client that
+writes its whole request before reading still gets that answer instead of a reset connection.
+
+**Who blends a soft selection (SPEC amendment 16).** `result.png` is the input, bit for bit, wherever the mask is 0,
+and the fill **at full strength** wherever the mask is above 0, with alpha there set fully opaque. CAIM never blends by
+coverage: PhotoCraft does, when it uses the mask's coverage as the alpha of the "Generative Fill" layer. If both sides
+blended, a 50% feathered pixel would get 25% of the fill. The fake backend follows the same rule.
+
 With no backend at all - no `--fake-backend`, and no installed and acknowledged LaMa - the manager lists no tasks and
 answers a job with "No model is installed for fill_masked_area yet", which is how PhotoCraft knows to grey the menu out.
 
 
 ### Running it with a real model
+
+**Resource limits and recovery (BF-03).** Uploads reserve a queue slot and their body bytes before the body is read;
+decoded images reserve conservative working space before PNG decoding. A shared 2 GiB image-data budget covers
+uploads, queued/running image work, and retained PNGs. Working space is charged at 32 bytes per pixel plus 32 MiB;
+on completion that shrinks to the PNG buffer's capacity. This is accounting, not a process-RAM limit: ONNX Runtime's
+session allocations, allocator overhead, and kernel socket buffers are outside it. `ServeOptions::memory_limit` can
+adjust the budget. Normal encoded PNG bytes are included in that peak estimate, not charged twice; unusually large
+encoded parts also get a decode-phase estimate. An idle 8000×8000 RGBA16 image fits the default budget, preserving
+the advertised 64 MP ceiling. A request whose own peak exceeds the whole budget receives 413; 503 means other
+requests/results are holding capacity (or the queue/record cap is full). Growing RGB axes compute their weights
+on demand, avoiding a large per-output-pixel weight table. Job records and pending worker IDs are each capped at 1,024, so finished/cancelled jobs cannot grow
+without bound during their ten-minute retention period.
+
+Responses have one 30 s write deadline and are written without copying the complete PNG into another response
+buffer. If the server detects a failed result write, the PNG remains available for retry until expiry; a successful
+write still consumes it. This cannot detect a client disconnect after the operating system accepted every byte;
+guaranteed receipt would require a protocol acknowledgement. Shutdown cancels jobs, frees queued inputs, and
+interrupts socket operations through cancellation polling, including on Windows. Active CPU preparation/model
+loading still stops at its next cancellation boundary. Extreme aspect ratios use the smaller intermediate when
+resizing RGB data and pooling masks.
 
 ```text
 caim models install lama --accept-note   # once: 200 MB, hashed while it arrives
@@ -86,12 +120,13 @@ Progress comes in stages, and `message` names the stage the manager is in:
 | prepare | 0 to 0.2 | crop, pad, resize to 512x512 |
 | load model | 0.25 | the first job only |
 | run | 0.3 to 0.9 | the graph: about a second on a desktop CPU |
-| finish | 0.9 to 1.0 | resize back and blend |
+| finish | 0.9 to 1.0 | resize back and put the fill in |
 
 A `DELETE /v1/jobs/<id>` stops a job wherever it is. A queued job never starts, and the model is not even loaded for
 it. A job inside the run is cancelled through ONNX Runtime's own run termination, so the inference stops in flight
 instead of running to its end; anywhere else the cancel lands at the next stage boundary. A cancelled job has no
-result: its state is `cancelled`, and the result endpoints say so.
+result: its state is `cancelled`, its `message` is "Cancelled." with no further progress, and the result endpoints say
+so. A queued job's image and mask are freed the moment it is cancelled.
 
 **The 512 px limit.** LaMa takes one fixed 512x512 window, so the runner crops the mask's bounding box plus padding,
 resizes that to 512x512, runs, and resizes the answer back. A hole much wider than 512 px is downscaled to fit and
@@ -143,6 +178,14 @@ whose bytes read, go past the catalog's `size` is refused; a hash or size mismat
 the expected and the actual value. Redirects are followed - Hugging Face hands the download to a CDN - but never down
 to plain HTTP. A model that is already installed makes no request at all. There is no resume yet (CAIM-03 puts resume
 in S2) and cancellation waits for MG-05; while a download runs the CLI prints a percentage.
+
+Each install writes its own `<file>.<random>.part`, created exclusively, and renames into place only the bytes it
+hashed itself, so two installs at once can never put a wrong file under the verified name. On top of that, one install
+of a model downloads at a time: it holds `<file>.lock` (created exclusively, touched every few seconds while the
+download runs), and a second install is told another one is running. A lock nobody has touched for two minutes was
+left by an install that died; the next install moves it aside under a name of its own (if several try at once, one
+rename wins) and takes over. `.part` files nobody has written to for two minutes are cleared the same way. The file is
+synced to disk before it is renamed into place.
 
 **The licence gate.** An entry is not offered - and the test over the embedded catalog fails in CI - when a field is
 missing or empty, when anything says `UNCLEAR`, when the URL is not HTTPS, when `sha256` is not 64 lowercase hex, when

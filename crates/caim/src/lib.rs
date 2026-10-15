@@ -31,6 +31,7 @@ pub mod image;
 pub mod job;
 /// The LaMa runner (MG-04): the crop and blend maths, and the ONNX Runtime session itself.
 pub mod lama;
+mod memory;
 /// The `caim models ...` commands.
 pub mod models;
 /// A bounded `multipart/form-data` parser for exactly the three parts the protocol defines.

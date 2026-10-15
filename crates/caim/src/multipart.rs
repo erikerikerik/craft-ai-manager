@@ -90,20 +90,20 @@ pub fn parse<'a>(content_type: Option<&str>, body: &'a [u8]) -> Result<JobParts<
             return Err(Fail::bad_request("The job body has more parts than the three the protocol defines."));
         }
         let rest = body.get(pos..).unwrap_or(&[]);
-        if rest.starts_with(b"--") {
+        let Some((is_closing, suffix_len)) = delimiter_suffix(rest) else {
+            return Err(Fail::bad_request("A multipart boundary is not followed by a line break."));
+        };
+        if is_closing {
             // The closing "--boundary" marker: the body is complete.
             break;
         }
-        if !rest.starts_with(b"\r\n") {
-            return Err(Fail::bad_request("A multipart boundary is not followed by a line break."));
-        }
-        pos = pos.saturating_add(2);
+        pos = pos.saturating_add(suffix_len);
         let Some(header_end) = find(body, pos, b"\r\n\r\n").filter(|at| at.saturating_sub(pos) <= MAX_PART_HEADER_BYTES) else {
             return Err(Fail::bad_request("A multipart part has no headers, or headers longer than the 8 KiB the protocol allows."));
         };
         let headers = part_headers(body.get(pos..header_end).unwrap_or(&[]))?;
         let data_start = header_end.saturating_add(4);
-        let Some(at) = find(body, data_start, &closing) else {
+        let Some(at) = next_boundary(body, data_start, &closing) else {
             return Err(Fail::bad_request("The multipart body is missing the boundary that closes a part."));
         };
         parts.push(Part { name: headers.name, content_type: headers.content_type, data: body.get(data_start..at).unwrap_or(&[]) });
@@ -120,6 +120,34 @@ pub fn parse<'a>(content_type: Option<&str>, body: &'a [u8]) -> Result<JobParts<
         return Err(Fail::bad_request("The job body has the wrong number of parts."));
     };
     Ok(JobParts { job: job.data, image: image.data, mask: mask.data })
+}
+
+/// A prefix inside PNG bytes is not a delimiter unless its line has a valid suffix.
+fn next_boundary(body: &[u8], mut from: usize, marker: &[u8]) -> Option<usize> {
+    while let Some(at) = find(body, from, marker) {
+        let rest = body.get(at.checked_add(marker.len())?..)?;
+        if delimiter_suffix(rest).is_some() {
+            return Some(at);
+        }
+        from = at.checked_add(1)?;
+    }
+    None
+}
+
+/// RFC 2046 transport padding belongs to the delimiter line, never to the part's bytes.
+fn delimiter_suffix(rest: &[u8]) -> Option<(bool, usize)> {
+    let closing = rest.starts_with(b"--");
+    let start = if closing { 2 } else { 0 };
+    let padding = rest.get(start..)?.iter().take_while(|byte| matches!(byte, b' ' | b'\t')).count();
+    let end = start.checked_add(padding)?;
+    let tail = rest.get(end..)?;
+    if tail.starts_with(b"\r\n") {
+        Some((closing, end.checked_add(2)?))
+    } else if closing && tail.is_empty() {
+        Some((true, end))
+    } else {
+        None
+    }
 }
 
 /// The two part headers that matter; the rest are ignored, like the client ignores ours.
@@ -185,6 +213,15 @@ fn disposition_name(value: &str) -> Result<&str> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn delimiter_lines_accept_rfc_transport_padding() {
+        let built = three("padding");
+        let text = String::from_utf8(built).expect("ASCII fixture");
+        let padded = text.replace("--padding\r\n", "--padding \t \r\n").replace("--padding--\r\n", "--padding--\t \r\n");
+        let parts = parse(Some("multipart/form-data; boundary=padding"), padded.as_bytes()).expect("RFC 2046 padding");
+        assert_eq!(parts.image, b"image bytes");
+        assert_eq!(parts.mask, b"mask bytes");
+    }
     use super::{PART_NAMES, boundary, parse};
     use crate::error::Status;
 
@@ -211,6 +248,15 @@ mod tests {
             boundary,
             &[("job", "application/json", br#"{"task": "fill_masked_area"}"#), ("image", "image/png", b"image bytes"), ("mask", "image/png", b"mask bytes")],
         )
+    }
+
+    #[test]
+    fn boundary_prefixes_inside_binary_parts_are_not_delimiters() {
+        let binary = b"PNG\0\r\n--prefixX\r\nmore\r\n--prefix--X\0tail";
+        let built = body("prefix", &[("job", "application/json", b"{}"), ("image", "image/png", binary), ("mask", "image/png", b"m")]);
+        let parts = parse(Some("multipart/form-data; boundary=prefix"), &built).expect("only whole delimiter lines count");
+        assert_eq!(parts.image, binary);
+        assert_eq!(parts.mask, b"m");
     }
 
     #[test]

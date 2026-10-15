@@ -2,13 +2,14 @@
 //!
 //! The tensor facts live in `docs/models/lama.md`: `image` is RGB 0-1, `mask` is 1 = fill, the
 //! output is RGB 0-255, and the size is fixed at 512x512. So a job crops the mask box plus padding,
-//! resizes the crop to 512, runs the model, resizes the answer back, and blends it in. Everything
+//! resizes the crop to 512, runs the model, resizes the answer back, and puts it in. Everything
 //! except [OrtSession] is plain arithmetic on vectors, which is what makes it testable with no model
 //! file at all (MG-04 item 6).
 //!
-//! Amendment 11 is the rule the blend is built around: pixels outside the mask come back bit for
-//! bit. That is why the blend uses the *original* mask value only - never the dilated mask the
-//! model sees, which exists to make LaMa repaint the edge of the selection as well.
+//! Two SPEC rules shape the last step. Amendment 11: pixels outside the mask come back bit for bit,
+//! which is why it uses the *original* mask only - never the dilated mask the model sees, which
+//! exists to make LaMa repaint the edge of the selection as well. Amendment 16: where the mask is
+//! above 0 the fill goes in at full strength, because PhotoCraft does the blending by coverage.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -113,8 +114,11 @@ pub fn pad_for(longer_side: usize) -> usize {
     MIN_PAD.max(longer_side.saturating_mul(PAD_PERCENT) / 100)
 }
 
-/// The crop to send to the model: the box plus its padding, grown to a square where the image
-/// allows, and always clamped to the image. The box is inside the result whatever happens.
+/// The crop to send to the model: the box plus its padding, grown towards a square, and always
+/// clamped to the image. The box is inside the result whatever happens.
+///
+/// Each side is clamped on its own (C5): a wide box in a short image gets the image's full height
+/// rather than falling back to the thin padded box, so the 512x512 resize squashes it less.
 #[must_use]
 pub fn crop_window(mask: Window, image_width: usize, image_height: usize) -> Window {
     let pad = pad_for(mask.width.max(mask.height));
@@ -124,19 +128,17 @@ pub fn crop_window(mask: Window, image_width: usize, image_height: usize) -> Win
     let bottom = mask.y.saturating_add(mask.height).saturating_add(pad).min(image_height);
     let (wide, tall) = (right.saturating_sub(left), bottom.saturating_sub(top));
     let side = wide.max(tall);
-    // A square only when one fits in the image at all; otherwise the padded box, already clamped.
-    if side <= image_width && side <= image_height {
-        let centre_x = left.saturating_add(wide / 2);
-        let centre_y = top.saturating_add(tall / 2);
-        return Window {
-            x: centre_x.saturating_sub(side / 2).min(image_width.saturating_sub(side)),
-            y: centre_y.saturating_sub(side / 2).min(image_height.saturating_sub(side)),
-            width: side,
-            height: side,
-        };
-    }
-    Window { x: left, y: top, width: wide, height: tall }
+    let (width, height) = (side.min(image_width).max(wide), side.min(image_height).max(tall));
+    Window { x: centred(left, wide, width, image_width), y: centred(top, tall, height, image_height), width, height }
 }
+
+/// Where a span of `size` starts when it is centred on `[start, start + span)` and kept inside
+/// `0..limit`. `size` is at least `span`, so the original span stays inside it.
+fn centred(start: usize, span: usize, size: usize, limit: usize) -> usize {
+    let centre = start.saturating_add(span / 2);
+    centre.saturating_sub(size / 2).min(limit.saturating_sub(size))
+}
+
 /// Which filter one axis uses: area when the axis shrinks, bilinear when it grows (MG-04 item 3).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Filter {
@@ -203,20 +205,52 @@ fn weight_pair(before: usize, after: usize, fraction: f64) -> Vec<(usize, f64)> 
     vec![(before, 1.0 - fraction), (after, fraction)]
 }
 
+/// Compute a growing axis on demand: a panorama must not allocate a weight Vec per pixel.
+fn bilinear_pair(source: usize, target: usize, index: usize) -> (usize, usize, f64) {
+    let scale = source as f64 / target as f64;
+    let centre = ((index as f64 + 0.5) * scale - 0.5).clamp(0.0, (source - 1) as f64);
+    let before = centre.floor() as usize;
+    (before, before.saturating_add(1).min(source - 1), centre - before as f64)
+}
+
 /// Resize one channel plane, row-major, area for a shrink and bilinear for a growth.
 #[must_use]
 pub fn resize_plane(plane: &[f32], width: usize, height: usize, target_width: usize, target_height: usize) -> Vec<f32> {
     if target_width == 0 || target_height == 0 {
         return Vec::new();
     }
-    // Across first, then down: the widest intermediate plane is height x target_width, which keeps
-    // the memory near the size of the model input rather than the size of the crop.
-    let across = resample_across(plane, height, width, target_width);
-    resample_down(&across, height, target_width, target_height)
+    // Shrink first when the axes move in opposite directions. Always going across first made
+    // a 512-square output grow to 512 x a million before shrinking it to a million x 1.
+    if height.saturating_mul(target_width) <= target_height.saturating_mul(width) {
+        #[cfg(test)]
+        tests::record_intermediate(height.saturating_mul(target_width));
+        let across = resample_across(plane, height, width, target_width);
+        resample_down(&across, height, target_width, target_height)
+    } else {
+        #[cfg(test)]
+        tests::record_intermediate(target_height.saturating_mul(width));
+        let down = resample_down(plane, height, width, target_height);
+        resample_across(&down, target_height, width, target_width)
+    }
 }
 
 /// Resample every row of a plane from `width` to `target_width` samples.
 fn resample_across(plane: &[f32], rows: usize, width: usize, target_width: usize) -> Vec<f32> {
+    if target_width >= width && width > 0 {
+        let mut out = vec![0.0; rows.saturating_mul(target_width)];
+        for row in 0..rows {
+            for column in 0..target_width {
+                let (before, after, weight) = bilinear_pair(width, target_width, column);
+                let at = row.saturating_mul(width);
+                let first = plane.get(at.saturating_add(before)).copied().unwrap_or(0.0);
+                let last = plane.get(at.saturating_add(after)).copied().unwrap_or(0.0);
+                if let Some(slot) = out.get_mut(row.saturating_mul(target_width).saturating_add(column)) {
+                    *slot = (f64::from(first) * (1.0 - weight) + f64::from(last) * weight) as f32;
+                }
+            }
+        }
+        return out;
+    }
     let weights = axis_weights(width, target_width);
     let mut out = vec![0.0f32; rows.saturating_mul(target_width)];
     for row in 0..rows {
@@ -238,6 +272,22 @@ fn resample_across(plane: &[f32], rows: usize, width: usize, target_width: usize
 
 /// Resample a plane from `rows` rows to `target_rows`; the plane already has `target_width` samples a row.
 fn resample_down(plane: &[f32], rows: usize, target_width: usize, target_rows: usize) -> Vec<f32> {
+    if target_rows >= rows && rows > 0 {
+        let mut out = vec![0.0; target_rows.saturating_mul(target_width)];
+        for row in 0..target_rows {
+            let (before, after, weight) = bilinear_pair(rows, target_rows, row);
+            for column in 0..target_width {
+                let first = plane.get(before.saturating_mul(target_width).saturating_add(column)).copied().unwrap_or(0.0);
+                let last = plane.get(after.saturating_mul(target_width).saturating_add(column)).copied().unwrap_or(0.0);
+                if let Some(slot) = out.get_mut(row.saturating_mul(target_width).saturating_add(column)) {
+                    // Match the existing two f32 accumulation steps used by the area path.
+                    let first = (f64::from(first) * (1.0 - weight)) as f32;
+                    *slot = (f64::from(first) + f64::from(last) * weight) as f32;
+                }
+            }
+        }
+        return out;
+    }
     let weights = axis_weights(rows, target_rows);
     let mut out = vec![0.0f32; target_rows.saturating_mul(target_width)];
     for (target_index, list) in weights.iter().enumerate() {
@@ -255,25 +305,86 @@ fn resample_down(plane: &[f32], rows: usize, target_width: usize, target_rows: u
     out
 }
 
-/// The mask of the crop at model size: `mask > 0` becomes 1.0. Nearest neighbour, because a
-/// resampled mask would lose the thin parts of a selection before the dilation gets them back.
+/// The mask of the crop at model size: `mask > 0` becomes 1.0.
+///
+/// When an axis shrinks, a model pixel is covered if **any** source pixel in its area is (a
+/// max-pool, C2), so a 1-2 px stroke such as a wire or a power line still shows LaMa a hole after a
+/// 3000 px crop is brought down to 512. When an axis grows, each model pixel samples the one source
+/// pixel under its centre. Done one axis at a time, so a shrink reads each source pixel about once.
 #[must_use]
 pub fn mask_plane(mask: &[u8], window: Window, image_width: usize, size: usize) -> Vec<f32> {
+    if window.height > window.width {
+        #[cfg(test)]
+        tests::record_intermediate(size.saturating_mul(window.width));
+        // Pool vertically first for tall narrow images; height * model_size can otherwise
+        // dwarf both the image and the model (the same aspect-ratio trap as RGB resizing).
+        let mut down = vec![false; size.saturating_mul(window.width)];
+        for row in 0..size {
+            let (first, last) = source_span(row, window.height, size);
+            for column in 0..window.width {
+                let covered = (first..last).any(|source_row| window.pixel(source_row, column, image_width).and_then(|at| mask.get(at)).is_some_and(|v| *v > 0));
+                if let Some(slot) = down.get_mut(row.saturating_mul(window.width).saturating_add(column)) {
+                    *slot = covered;
+                }
+            }
+        }
+        let mut out = vec![0.0; size.saturating_mul(size)];
+        for row in 0..size {
+            for column in 0..size {
+                let (first, last) = source_span(column, window.width, size);
+                let covered = (first..last).any(|x| down.get(row.saturating_mul(window.width).saturating_add(x)).copied().unwrap_or(false));
+                if covered && let Some(slot) = out.get_mut(row.saturating_mul(size).saturating_add(column)) {
+                    *slot = 1.0;
+                }
+            }
+        }
+        return out;
+    }
+    #[cfg(test)]
+    tests::record_intermediate(window.height.saturating_mul(size));
+    let columns: Vec<(usize, usize)> = (0..size).map(|column| source_span(column, window.width, size)).collect();
+    // Across first: for every source row of the window, which model columns it covers.
+    let mut across = vec![false; window.height.saturating_mul(size)];
+    for row in 0..window.height {
+        let Some(row_start) = window.y.checked_add(row).and_then(|y| y.checked_mul(image_width)).and_then(|at| at.checked_add(window.x)) else {
+            continue;
+        };
+        for (column, (first, last)) in columns.iter().enumerate() {
+            let covered = (*first..*last).any(|x| mask.get(row_start.saturating_add(x)).copied().unwrap_or(0) > 0);
+            if covered && let Some(slot) = across.get_mut(row.saturating_mul(size).saturating_add(column)) {
+                *slot = true;
+            }
+        }
+    }
+    // Then down: a model pixel is covered if any of its source rows covers its column.
     let mut out = vec![0.0f32; size.saturating_mul(size)];
     for row in 0..size {
+        let (first, last) = source_span(row, window.height, size);
         for column in 0..size {
-            let source_x = window.x.saturating_add(sample_in_window(column, window.width, size));
-            let source_y = window.y.saturating_add(sample_in_window(row, window.height, size));
-            let covered = match source_y.checked_mul(image_width).and_then(|at| at.checked_add(source_x)) {
-                Some(at) => mask.get(at).copied().unwrap_or(0) > 0,
-                None => false,
-            };
-            if let Some(slot) = out.get_mut(row.saturating_mul(size).saturating_add(column)) {
-                *slot = if covered { 1.0 } else { 0.0 };
+            let covered = (first..last).any(|source_row| across.get(source_row.saturating_mul(size).saturating_add(column)).copied().unwrap_or(false));
+            if covered && let Some(slot) = out.get_mut(row.saturating_mul(size).saturating_add(column)) {
+                *slot = 1.0;
             }
         }
     }
     out
+}
+
+/// The source pixels, `first..last` inside the window, that one model pixel stands for on one
+/// axis: every pixel of its area when the axis shrinks, the one under its centre when it grows.
+fn source_span(target: usize, window_size: usize, size: usize) -> (usize, usize) {
+    if window_size == 0 || size == 0 {
+        return (0, 0);
+    }
+    if window_size <= size {
+        let at = sample_in_window(target, window_size, size);
+        return (at, at.saturating_add(1));
+    }
+    let (target, whole, size) = (target as u64, window_size as u64, size as u64);
+    let first = target.saturating_mul(whole) / size;
+    let last = target.saturating_add(1).saturating_mul(whole).saturating_add(size - 1) / size;
+    let last = last.max(first.saturating_add(1)).min(whole);
+    (usize::try_from(first).unwrap_or(window_size), usize::try_from(last).unwrap_or(window_size))
 }
 
 /// Which sample of a window one model pixel stands for.
@@ -396,12 +507,15 @@ pub fn fill_back(output: &[f32], window: Window) -> Vec<Vec<f32>> {
     planes
 }
 
-/// Put the fill back into the image: `out = in x (1 - m) + fill x m`, with `m` the **original** mask
-/// value over 255 - never the dilated mask the model saw.
+/// Put the fill back into the image: wherever the **original** mask is above 0, the pixel is the
+/// fill at full strength - never the dilated mask the model saw, and never blended by coverage.
 ///
-/// Where the mask is 0 the pixel is skipped, so it comes back bit for bit (amendment 11). A 16-bit
-/// image keeps 16-bit precision for the pixels that are not filled; the fill itself is 8-bit
-/// precision scaled up, which MG-04 accepts. Alpha inside the mask moves towards fully opaque.
+/// SPEC amendment 16: exactly one side blends a soft selection, and it is PhotoCraft, which uses the
+/// mask's coverage as the alpha of the "Generative Fill" layer. Blending here as well gave a 50%
+/// pixel 25% of the fill. Where the mask is 0 the pixel is skipped, so it comes back bit for bit
+/// (amendment 11). A 16-bit image keeps 16-bit precision for the pixels that are not filled; the
+/// fill itself is 8-bit precision scaled up, which MG-04 accepts. Alpha inside the mask becomes
+/// fully opaque, because the fill has no transparency of its own.
 #[must_use]
 pub fn blend(image: &Frame, mask: &[u8], window: Window, fill: &[Vec<f32>]) -> Frame {
     let max = f64::from(image.max_sample());
@@ -410,27 +524,22 @@ pub fn blend(image: &Frame, mask: &[u8], window: Window, fill: &[Vec<f32>]) -> F
     for row in 0..window.height {
         for column in 0..window.width {
             let Some(pixel) = window.pixel(row, column, image_width) else { continue };
-            let coverage = mask.get(pixel).copied().unwrap_or(0);
-            if coverage == 0 {
+            if mask.get(pixel).copied().unwrap_or(0) == 0 {
                 continue;
             }
             let Some(base) = pixel.checked_mul(image.channels) else { continue };
-            let weight = f64::from(coverage) / 255.0;
             let offset = row.saturating_mul(window.width).saturating_add(column);
             for channel in 0..image.channels {
                 let Some(slot) = out.samples.get_mut(base.saturating_add(channel)) else { continue };
-                let source = f64::from(*slot);
-                // Alpha has no fill to blend towards, so a covered pixel becomes opaque instead.
                 let target = if channel >= ALPHA_CHANNEL {
                     max
                 } else {
                     match fill.get(channel).and_then(|plane| plane.get(offset)) {
                         Some(sample) => f64::from(*sample) * max,
-                        None => source,
+                        None => f64::from(*slot),
                     }
                 };
-                let blended = (source * (1.0 - weight) + target * weight).round().clamp(0.0, max);
-                *slot = u16::try_from(blended as i64).unwrap_or(0);
+                *slot = u16::try_from(target.round().clamp(0.0, max) as i64).unwrap_or(0);
             }
         }
     }
@@ -685,6 +794,51 @@ pub(crate) fn stand_in_pipeline(
 }
 #[cfg(test)]
 mod tests {
+    thread_local! {
+        static INTERMEDIATE_CAP: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
+        static INTERMEDIATE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    pub(super) fn record_intermediate(elements: usize) {
+        INTERMEDIATE_COUNT.set(INTERMEDIATE_COUNT.get() + 1);
+        assert!(elements <= INTERMEDIATE_CAP.get(), "intermediate would allocate {elements} elements; cap is {}", INTERMEDIATE_CAP.get());
+    }
+
+    struct IntermediateGuard(usize, usize);
+    impl IntermediateGuard {
+        fn new(cap: usize) -> Self {
+            Self(INTERMEDIATE_CAP.replace(cap), INTERMEDIATE_COUNT.replace(0))
+        }
+    }
+    impl Drop for IntermediateGuard {
+        fn drop(&mut self) {
+            INTERMEDIATE_CAP.set(self.0);
+            INTERMEDIATE_COUNT.set(self.1);
+        }
+    }
+
+    #[test]
+    fn resize_order_bounds_the_actual_intermediate_allocation() {
+        let _guard = IntermediateGuard::new(512);
+        let source = vec![0.4; 512 * 512];
+        assert_eq!(super::resize_plane(&source, 512, 512, 200_000, 1).len(), 200_000);
+        assert_eq!(INTERMEDIATE_COUNT.get(), 1, "the executed order must report its actual intermediate");
+        INTERMEDIATE_COUNT.set(0);
+        assert_eq!(super::resize_plane(&source, 512, 512, 1, 200_000).len(), 200_000);
+        assert_eq!(INTERMEDIATE_COUNT.get(), 1);
+    }
+
+    #[test]
+    fn mask_pooling_order_bounds_the_actual_intermediate_allocation() {
+        let _guard = IntermediateGuard::new(512);
+        let mask = vec![255; 200_000];
+        let _ = super::mask_plane(&mask, super::Window { x: 0, y: 0, width: 1, height: 200_000 }, 1, 512);
+        assert_eq!(INTERMEDIATE_COUNT.get(), 1);
+        INTERMEDIATE_COUNT.set(0);
+        let _ = super::mask_plane(&mask, super::Window { x: 0, y: 0, width: 200_000, height: 1 }, 200_000, 512);
+        assert_eq!(INTERMEDIATE_COUNT.get(), 1);
+    }
+
     use super::{
         DILATE_PX, Filter, MODEL_SIZE, MSG_FINISH, MSG_LOAD, MSG_PREPARE, MSG_RUN, Window, blend, crop_window, dilate, fill_back, filter_for,
         installed_pipeline, mask_box, mask_plane, model_input, pad_for, resize_plane, stand_in_pipeline,
@@ -717,6 +871,33 @@ mod tests {
     /// The whole 4x4 image, as a crop.
     fn whole() -> Window {
         Window { x: 0, y: 0, width: 4, height: 4 }
+    }
+
+    #[test]
+    fn mixed_axis_resizes_preserve_values_and_transpose_symmetry() {
+        let source: Vec<f32> = (0..64).map(|i| (i % 8) as f32 / 8.0).collect();
+        let wide = resize_plane(&source, 8, 8, 100_000, 1);
+        let transposed: Vec<f32> = (0..64).map(|i| source[(i % 8) * 8 + i / 8]).collect();
+        let tall = resize_plane(&transposed, 8, 8, 1, 100_000);
+        assert_eq!(wide.len(), 100_000);
+        assert!(wide.iter().zip(&tall).all(|(a, b)| (a - b).abs() < 0.00001));
+        assert!((wide[0] - source[0]).abs() < 0.00001);
+        assert!((wide[99_999] - source[7]).abs() < 0.00001);
+    }
+
+    #[test]
+    fn tall_and_wide_mask_pooling_preserve_the_same_thin_features() {
+        let mut line = vec![0; 100_000];
+        line[0] = 255;
+        line[99_999] = 255;
+        let wide = mask_plane(&line, Window { x: 0, y: 0, width: line.len(), height: 1 }, line.len(), MODEL_SIZE);
+        let tall = mask_plane(&line, Window { x: 0, y: 0, width: 1, height: line.len() }, 1, MODEL_SIZE);
+        for y in 0..MODEL_SIZE {
+            for x in 0..MODEL_SIZE {
+                assert_eq!(wide[y * MODEL_SIZE + x], tall[x * MODEL_SIZE + y]);
+            }
+        }
+        assert!(wide.iter().any(|v| *v > 0.0));
     }
 
     #[test]
@@ -827,13 +1008,16 @@ mod tests {
     }
 
     #[test]
-    fn a_full_mask_takes_the_fill_and_a_soft_one_blends_between() {
+    fn any_coverage_takes_the_fill_at_full_strength() {
+        // Amendment 16: PhotoCraft blends by coverage, so CAIM must not blend as well.
         let frame = image(3, 8);
         let fill = vec![vec![0.5; 16]; 3];
         let hard = blend(&frame, &centre_mask(255), whole(), &fill);
         assert_eq!(hard.sample(5, 0), Some(128), "0.5 x 255 rounds to 128");
         let soft = blend(&frame, &centre_mask(128), whole(), &fill);
-        assert_eq!(soft.sample(5, 0), Some(74), "a half-covered pixel sits half way from its own 21");
+        assert_eq!(soft.sample(5, 0), Some(128), "a half-covered pixel gets the whole fill, not half of it");
+        let faint = blend(&frame, &centre_mask(1), whole(), &fill);
+        assert_eq!(faint.sample(5, 0), Some(128), "even the faintest coverage gets the whole fill");
         let frame16 = image(3, 16);
         let hard16 = blend(&frame16, &centre_mask(255), whole(), &fill);
         assert_eq!(hard16.sample(5, 0), Some(32768), "the fill is 8-bit precision scaled up into the 16-bit range");
@@ -841,11 +1025,13 @@ mod tests {
     }
 
     #[test]
-    fn alpha_inside_the_mask_moves_towards_opaque_and_outside_it_does_not_move() {
+    fn alpha_inside_the_mask_becomes_opaque_and_outside_it_does_not_move() {
         let frame = Frame { width: 4, height: 4, channels: 4, bit_depth: 8, samples: vec![10; 64] };
         let fill = vec![vec![0.0; 16]; 3];
         assert_eq!(blend(&frame, &centre_mask(255), whole(), &fill).sample(5, 3), Some(255), "a fully covered pixel becomes opaque");
-        assert_eq!(blend(&frame, &centre_mask(128), whole(), &fill).sample(5, 3), Some(133), "a half-covered pixel moves half way there");
+        assert_eq!(blend(&frame, &centre_mask(128), whole(), &fill).sample(5, 3), Some(255), "a half-covered pixel becomes opaque too");
+        let frame16 = Frame { width: 4, height: 4, channels: 4, bit_depth: 16, samples: vec![10; 64] };
+        assert_eq!(blend(&frame16, &centre_mask(1), whole(), &fill).sample(5, 3), Some(65535), "and in 16 bits it is 65535");
         assert_eq!(blend(&frame, &centre_mask(255), whole(), &fill).sample(0, 3), Some(10), "an uncovered pixel keeps its alpha");
     }
 
@@ -946,5 +1132,92 @@ mod tests {
         std::fs::write(store::model_file(&scratch.path, &model), bytes).expect("the model file");
         store::write_verified(&scratch.path, &model, &model.sha256, model.size).expect("the verified record");
         assert!(installed_pipeline(&scratch.path, &model).is_none(), "a model for another task is not offered here");
+    }
+
+    /// A session that keeps the model mask it was shown, so a test can look at what LaMa got.
+    struct Spy {
+        seen: Arc<std::sync::Mutex<Vec<f32>>>,
+    }
+
+    impl super::Session for Spy {
+        fn run(&mut self, image: &[f32], mask: &[f32], _cancel: &AtomicBool) -> crate::error::Result<Vec<f32>> {
+            *self.seen.lock().expect("the spy's lock") = mask.to_vec();
+            Ok(image.iter().map(|sample| sample * 255.0).collect())
+        }
+    }
+
+    /// A 3000x3000 mask with one covered column, the shape of a power line or a wire.
+    fn thin_line(width: usize, height: usize, column: usize) -> Vec<u8> {
+        let mut mask = vec![0u8; width * height];
+        for row in 0..height {
+            mask[row * width + column] = 255;
+        }
+        mask
+    }
+
+    #[test]
+    fn a_one_pixel_line_survives_the_shrink_to_512() {
+        // C2: sampling one source pixel per model pixel missed a 1 px line almost everywhere.
+        let (width, height) = (3000usize, 3000usize);
+        let mask = thin_line(width, height, 5);
+        let window = Window { x: 0, y: 0, width, height };
+        let plane = mask_plane(&mask, window, width, MODEL_SIZE);
+        for row in 0..MODEL_SIZE {
+            assert!(plane[row * MODEL_SIZE..(row + 1) * MODEL_SIZE].iter().any(|sample| *sample > 0.0), "model row {row} lost the line");
+        }
+        assert!(plane.iter().all(|sample| *sample == 0.0 || *sample == 1.0), "the model mask is never soft");
+        let covered_columns = (0..MODEL_SIZE).filter(|column| (0..MODEL_SIZE).any(|row| plane[row * MODEL_SIZE + column] > 0.0)).count();
+        assert!((1..=2).contains(&covered_columns), "a 1 px line touches at most two model columns, not a smear: {covered_columns}");
+    }
+
+    #[test]
+    fn the_model_is_shown_a_thin_line_on_every_row() {
+        let (width, height) = (3000u32, 3000u32);
+        let mask = thin_line(width as usize, height as usize, 5);
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let spy = Arc::clone(&seen);
+        let pipeline = super::Pipeline::with_loader(
+            "spy.onnx",
+            Box::new(move |_path: &std::path::Path| Ok(Box::new(Spy { seen: Arc::clone(&spy) }) as Box<dyn super::Session>)),
+        );
+        let frame = Frame { width, height, channels: 3, bit_depth: 8, samples: vec![100; (width * height * 3) as usize] };
+        pipeline.run_fill(&frame, &mask, &AtomicBool::new(false), &mut |_, _| {}).expect("the spy session runs");
+        let model_mask = seen.lock().expect("the spy's lock").clone();
+        assert_eq!(model_mask.len(), MODEL_SIZE * MODEL_SIZE);
+        for row in 0..MODEL_SIZE {
+            assert!(model_mask[row * MODEL_SIZE..(row + 1) * MODEL_SIZE].iter().any(|sample| *sample > 0.0), "model row {row} has no hole");
+        }
+    }
+
+    #[test]
+    fn growing_a_small_crop_still_samples_the_mask() {
+        // Enlarging keeps nearest-neighbour sampling: a 2x2 selection in a 4x4 crop stays a quarter of the plane.
+        let plane = mask_plane(&centre_mask(255), whole(), 4, 8);
+        assert_eq!(plane.iter().filter(|sample| **sample == 1.0).count(), 16, "the middle 4x4 of an 8x8 plane");
+    }
+
+    #[test]
+    fn a_wide_box_in_a_short_image_gets_the_full_height() {
+        // C5: the square did not fit, so the crop used to fall back to the padded box (600x160).
+        let box_ = Window { x: 800, y: 40, width: 400, height: 20 };
+        let crop = crop_window(box_, 2000, 300);
+        assert_eq!(crop, Window { x: 700, y: 0, width: 600, height: 300 }, "each side is clamped on its own, then centred");
+        let tall = crop_window(Window { x: 40, y: 800, width: 20, height: 400 }, 300, 2000);
+        assert_eq!(tall, Window { x: 0, y: 700, width: 300, height: 600 }, "and the same for a tall box in a narrow image");
+    }
+
+    #[test]
+    fn the_crop_always_contains_the_box_and_stays_in_the_image() {
+        for (image_width, image_height) in [(2000usize, 300usize), (300, 2000), (640, 480), (100, 40), (33, 1000), (5000, 64)] {
+            for (x, y, width, height) in
+                [(0usize, 0usize, 1usize, 1usize), (10, 5, 20, 3), (image_width - 1, image_height - 1, 1, 1), (0, 0, image_width, image_height)]
+            {
+                let box_ = Window { x, y, width, height };
+                let crop = crop_window(box_, image_width, image_height);
+                assert!(crop.x + crop.width <= image_width && crop.y + crop.height <= image_height, "{box_:?} in {image_width}x{image_height}: {crop:?}");
+                assert!(crop.x <= box_.x && crop.y <= box_.y, "{box_:?} in {image_width}x{image_height}: {crop:?}");
+                assert!(crop.x + crop.width >= box_.x + box_.width && crop.y + crop.height >= box_.y + box_.height, "{box_:?}: {crop:?}");
+            }
+        }
     }
 }
