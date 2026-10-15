@@ -62,7 +62,9 @@ at a time; a finished result is kept for ten minutes, or until it has been read,
 
 Each request also has one overall deadline, however its bytes are split into reads: the whole head within 5 s, and
 the body within 30 s plus 1 s for every 8 MiB of its `Content-Length` (three minutes at most). So a client that sends a
-byte every few seconds cannot hold a connection slot. When the manager answers before it has read the body - a wrong
+byte every few seconds cannot hold a connection slot for more than 5 s of head. A local process that keeps
+reconnecting 16 sockets can still make the manager answer 503 to others; on loopback that is accepted, because such a
+process could do worse to the machine anyway. When the manager answers before it has read the body - a wrong
 token (401), a wrong `Host` (400), a body over the cap (413), or too many connections (503) - it closes its side for
 writing and reads the rest of the body, up to its `Content-Length` and a few seconds, before closing. A client that
 writes its whole request before reading still gets that answer instead of a reset connection.
@@ -157,10 +159,13 @@ the expected and the actual value. Redirects are followed - Hugging Face hands t
 to plain HTTP. A model that is already installed makes no request at all. There is no resume yet (CAIM-03 puts resume
 in S2) and cancellation waits for MG-05; while a download runs the CLI prints a percentage.
 
-Only one install of a model writes at a time: it holds `<file>.lock` (created exclusively, touched every few seconds
-while the download runs), and creates `<file>.part` exclusively too, so two installs at once never share a file. A
-second install is told another one is running. A `.part` or a lock left by an install that died - a lock nobody has
-touched for two minutes - is cleared by the next install. The file is synced to disk before it is renamed into place.
+Each install writes its own `<file>.<random>.part`, created exclusively, and renames into place only the bytes it
+hashed itself, so two installs at once can never put a wrong file under the verified name. On top of that, one install
+of a model downloads at a time: it holds `<file>.lock` (created exclusively, touched every few seconds while the
+download runs), and a second install is told another one is running. A lock nobody has touched for two minutes was
+left by an install that died; the next install moves it aside under a name of its own (if several try at once, one
+rename wins) and takes over. `.part` files nobody has written to for two minutes are cleared the same way. The file is
+synced to disk before it is renamed into place.
 
 **The licence gate.** An entry is not offered - and the test over the embedded catalog fails in CI - when a field is
 missing or empty, when anything says `UNCLEAR`, when the URL is not HTTPS, when `sha256` is not 64 lowercase hex, when

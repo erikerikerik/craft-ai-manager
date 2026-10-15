@@ -122,13 +122,12 @@ pub fn install(model: &Model, root: &Path, fetch: &dyn Fetch, progress: &mut dyn
     download(model, root, fetch, progress)
 }
 
-/// The download itself: `.part` in the model's folder, hashed as it streams, refused if the server's
-/// length or the bytes read go past the catalog size, renamed and recorded only when the hash matches.
+/// The download itself, under the install lock: clear away what dead installs left, then fetch.
 ///
-/// C6: only the install holding `<file>.lock` may touch `.part`, and `.part` is created with
-/// `create_new`, so two installs at once can never write into the same file. A `.part` found while
-/// holding the lock was left by a run that died, so it is removed first. The bytes are synced to
-/// disk before the rename, so a power cut cannot leave a short file under the verified name.
+/// C6: the lock (`<file>.lock`) keeps two installs from downloading the same 200 MB at once, but
+/// correctness does not rest on it. Each install writes its own `<file>.<random>.part`, created with
+/// `create_new`, and only ever renames the bytes it hashed itself, so even two installs that both
+/// believe they hold the lock cannot put a wrong file under the verified name.
 fn download(model: &Model, root: &Path, fetch: &dyn Fetch, progress: &mut dyn FnMut(u64, u64)) -> Result<Outcome> {
     let folder = store::model_folder(root, model);
     std::fs::create_dir_all(&folder).map_err(|error| Fail::internal(format!("Craft AI Manager could not create {}: {error}", folder.display())))?;
@@ -137,13 +136,17 @@ fn download(model: &Model, root: &Path, fetch: &dyn Fetch, progress: &mut dyn Fn
         // Another install finished while this one waited for the lock.
         return Ok(Outcome::AlreadyInstalled);
     }
-    let part = store::part_file(root, model);
+    remove_dead_parts(&folder, model);
+    fetch_into_place(model, root, fetch, progress, &mut || lock.heartbeat())
+}
+
+/// Stream the file into this install's own `.part`, hashed as it arrives; refuse it if the server's
+/// length or the bytes read go past the catalog size; sync it to disk; and rename it into place and
+/// record it only when the hash matches. Any failure deletes this install's `.part` and nothing else.
+fn fetch_into_place(model: &Model, root: &Path, fetch: &dyn Fetch, progress: &mut dyn FnMut(u64, u64), alive: &mut dyn FnMut()) -> Result<Outcome> {
+    let tag = install_tag()?;
+    let part = store::part_file(root, model, &tag);
     let target = store::model_file(root, model);
-    match std::fs::remove_file(&part) {
-        Ok(()) => {}
-        Err(error) if error.kind() == ErrorKind::NotFound => {}
-        Err(error) => return Err(Fail::internal(format!("Craft AI Manager could not remove the unfinished download {}: {error}", part.display()))),
-    }
 
     let stream = fetch.open(&model.url)?;
     if let Some(claimed) = stream.claimed_len.filter(|claimed| *claimed > model.size) {
@@ -171,12 +174,11 @@ fn download(model: &Model, root: &Path, fetch: &dyn Fetch, progress: &mut dyn Fn
             Ok(read) => {
                 let Some(chunk) = buffer.get(..read) else { break };
                 let Some(next) = total.checked_add(read as u64) else {
-                    return Err(abandon(&part, &lock, Fail::too_large(format!("{} is more bytes than this machine was asked to store.", model.label()))));
+                    return Err(abandon(&part, Fail::too_large(format!("{} is more bytes than this machine was asked to store.", model.label()))));
                 };
                 if next > model.size {
                     return Err(abandon(
                         &part,
-                        &lock,
                         Fail::too_large(format!(
                             "{} is {} bytes in the catalog, and the server had sent {next} before it stopped. Nothing was saved.",
                             model.label(),
@@ -186,26 +188,25 @@ fn download(model: &Model, root: &Path, fetch: &dyn Fetch, progress: &mut dyn Fn
                 }
                 hasher.update(chunk);
                 if let Err(error) = file.write_all(chunk) {
-                    return Err(abandon(&part, &lock, Fail::internal(format!("Craft AI Manager could not write {}: {error}", part.display()))));
+                    return Err(abandon(&part, Fail::internal(format!("Craft AI Manager could not write {}: {error}", part.display()))));
                 }
                 total = next;
-                lock.heartbeat();
+                alive();
                 progress(total, model.size);
             }
             Err(error) if error.kind() == ErrorKind::Interrupted => continue,
-            Err(error) => return Err(abandon(&part, &lock, Fail::internal(format!("Craft AI Manager lost the download of {}: {error}", model.url)))),
+            Err(error) => return Err(abandon(&part, Fail::internal(format!("Craft AI Manager lost the download of {}: {error}", model.url)))),
         }
     }
 
     if let Err(error) = file.flush().and_then(|()| file.sync_all()) {
-        return Err(abandon(&part, &lock, Fail::internal(format!("Craft AI Manager could not finish writing {}: {error}", part.display()))));
+        return Err(abandon(&part, Fail::internal(format!("Craft AI Manager could not finish writing {}: {error}", part.display()))));
     }
     drop(file);
 
     if total != model.size {
         return Err(abandon(
             &part,
-            &lock,
             Fail::internal(format!("{} is {} bytes in the catalog, but the download was {total} bytes. Nothing was saved.", model.label(), model.size)),
         ));
     }
@@ -213,7 +214,6 @@ fn download(model: &Model, root: &Path, fetch: &dyn Fetch, progress: &mut dyn Fn
     if actual != model.sha256 {
         return Err(abandon(
             &part,
-            &lock,
             Fail::internal(format!(
                 "The file downloaded for {} has SHA-256 {actual}, not the {} the catalog expects. Nothing was saved.",
                 model.label(),
@@ -221,24 +221,37 @@ fn download(model: &Model, root: &Path, fetch: &dyn Fetch, progress: &mut dyn Fn
             )),
         ));
     }
-    if !lock.still_ours() {
-        // This download stalled for so long that another install took the lock over, so `.part`
-        // is now that install's file. Leave it alone.
-        return Err(Fail::conflict(format!(
-            "The download of {} stalled for so long that another install took over. Nothing was saved by this one.",
-            model.label()
-        )));
-    }
+    // The `.part` is this install's alone, so the bytes renamed here are the bytes just hashed.
     if let Err(error) = std::fs::rename(&part, &target) {
-        return Err(abandon(&part, &lock, Fail::internal(format!("Craft AI Manager could not put {} in place: {error}", target.display()))));
+        return Err(abandon(&part, Fail::internal(format!("Craft AI Manager could not put {} in place: {error}", target.display()))));
     }
     store::write_verified(root, model, &actual, total)?;
     Ok(Outcome::Downloaded { sha256: actual, bytes: total, elapsed_ms: millis_since(started) })
 }
 
-/// The lock an install holds while it owns `.part`: a file created with `create_new`, holding a
-/// random value so the holder can tell it is still its own, and touched every few seconds so a lock
-/// left by a dead install can be told apart from a live one.
+/// A short random tag that tells this install's files from any other's.
+fn install_tag() -> Result<String> {
+    let token = crate::token::random_token()?;
+    Ok(token.get(..16).unwrap_or(token.as_str()).to_string())
+}
+
+/// Delete the `.part` files that installs which died left behind: a live install writes to its own
+/// file every chunk, so one nobody has written to for [LOCK_STALE] is not being downloaded any more.
+/// (If a download did stall that long and comes back, its rename finds no file and it fails
+/// cleanly; on Windows the file is still open, so the delete simply does not happen.)
+fn remove_dead_parts(folder: &Path, model: &Model) {
+    let Ok(entries) = std::fs::read_dir(folder) else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if store::is_part_name(model, &name.to_string_lossy()) && is_stale(&entry.path()) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// The lock an install holds while it downloads: a file created with `create_new`, holding a random
+/// value so the holder can tell it is its own, and touched every few seconds so a lock left by a
+/// dead install can be told apart from a live one.
 struct InstallLock {
     path: PathBuf,
     nonce: String,
@@ -248,9 +261,9 @@ struct InstallLock {
 
 impl InstallLock {
     /// Take the lock, or say that another install has it. A lock nobody has touched for
-    /// [LOCK_STALE] belonged to an install that died, so it is taken over once.
+    /// [LOCK_STALE] belonged to an install that died, so it is taken over once - see [claim_stale].
     fn take(path: &Path, label: &str) -> Result<InstallLock> {
-        let nonce = crate::token::random_token()?;
+        let nonce = install_tag()?;
         for attempt in 0..2 {
             match OpenOptions::new().write(true).create_new(true).open(path) {
                 Ok(mut file) => {
@@ -261,8 +274,7 @@ impl InstallLock {
                     return Ok(InstallLock { path: path.to_path_buf(), nonce, file, touched: Instant::now() });
                 }
                 Err(error) if error.kind() == ErrorKind::AlreadyExists => {
-                    if attempt == 0 && lock_is_stale(path) {
-                        let _ = std::fs::remove_file(path);
+                    if attempt == 0 && is_stale(path) && claim_stale(path, &nonce) {
                         continue;
                     }
                     break;
@@ -282,23 +294,55 @@ impl InstallLock {
             self.touched = Instant::now();
         }
     }
-
-    /// Is the lock file on disk still the one this install wrote?
-    fn still_ours(&self) -> bool {
-        std::fs::read_to_string(&self.path).is_ok_and(|text| text == self.nonce)
-    }
 }
 
 impl Drop for InstallLock {
+    /// Release the lock without a check-then-delete race: move it aside to a name only this install
+    /// uses, and delete it there only if it is still the one this install wrote; if another install
+    /// had taken it over in the meantime, put that one back.
     fn drop(&mut self) {
-        if self.still_ours() {
-            let _ = std::fs::remove_file(&self.path);
+        let aside = sibling(&self.path, &format!("{}.release", self.nonce));
+        if std::fs::rename(&self.path, &aside).is_err() {
+            return;
         }
+        let ours = std::fs::read_to_string(&aside).is_ok_and(|text| text == self.nonce);
+        if !ours && std::fs::rename(&aside, &self.path).is_ok() {
+            return;
+        }
+        let _ = std::fs::remove_file(&aside);
     }
 }
 
-/// Has nobody touched this lock for [LOCK_STALE]? A lock whose age cannot be read counts as live.
-fn lock_is_stale(path: &Path) -> bool {
+/// Take a stale lock out of the way so that exactly one install can claim it: rename it to a name
+/// only this install uses (of several installs racing, one rename wins and the others find nothing
+/// to move), check that what was moved really is the stale lock and not a fresh one that replaced it
+/// in the meantime, and only then delete it.
+fn claim_stale(path: &Path, nonce: &str) -> bool {
+    let aside = sibling(path, &format!("{nonce}.stale"));
+    if std::fs::rename(path, &aside).is_err() {
+        return false;
+    }
+    if !is_stale(&aside) {
+        // A live install's lock arrived between the check and the rename: give it back.
+        if std::fs::rename(&aside, path).is_err() {
+            let _ = std::fs::remove_file(&aside);
+        }
+        return false;
+    }
+    let _ = std::fs::remove_file(&aside);
+    true
+}
+
+/// `<path>.<suffix>`, next to `path`.
+fn sibling(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.file_name().map(std::ffi::OsStr::to_os_string).unwrap_or_default();
+    name.push(".");
+    name.push(suffix);
+    path.with_file_name(name)
+}
+
+/// Has nobody touched this file for [LOCK_STALE]? A file whose age cannot be read counts as live.
+fn is_stale(path: &Path) -> bool {
     std::fs::metadata(path)
         .and_then(|metadata| metadata.modified())
         .ok()
@@ -340,12 +384,9 @@ pub fn verify(model: &Model, root: &Path) -> Result<Checked> {
     Ok(Checked { sha256: actual, bytes: metadata.len(), elapsed_ms })
 }
 
-/// Delete the half-written file, if it is still this install's, and hand back the error that
-/// explains why.
-fn abandon(part: &Path, lock: &InstallLock, fail: Fail) -> Fail {
-    if lock.still_ours() {
-        let _ = std::fs::remove_file(part);
-    }
+/// Delete this install's own half-written file and hand back the error that explains why.
+fn abandon(part: &Path, fail: Fail) -> Fail {
+    let _ = std::fs::remove_file(part);
     fail
 }
 
@@ -365,8 +406,8 @@ mod tests {
     use std::cell::RefCell;
 
     use crate::error::Status;
-    use crate::fetch::{LOCK_STALE, Outcome, install, verify};
-    use crate::store::{is_installed, lock_file, model_file, model_folder, part_file, read_verified, sha256_hex, write_acknowledgement};
+    use crate::fetch::{LOCK_STALE, Outcome, fetch_into_place, install, verify};
+    use crate::store::{is_installed, is_part_name, lock_file, model_file, model_folder, part_file, read_verified, sha256_hex, write_acknowledgement};
     use crate::testkit::{FakeFetch, Scratch, SlowFetch, test_model};
     use std::time::Duration;
 
@@ -374,6 +415,18 @@ mod tests {
     const NOTE: &str = "Trained on research-only data, so personal use only.";
 
     fn no_progress(_read: u64, _total: u64) {}
+
+    /// Every `.part`, lock or lock-aside file still in the model's folder.
+    fn leftovers(scratch: &Scratch, entry: &crate::catalog::Model) -> Vec<String> {
+        let Ok(list) = std::fs::read_dir(model_folder(&scratch.path, entry)) else { return Vec::new() };
+        list.flatten().map(|item| item.file_name().to_string_lossy().to_string()).filter(|name| is_part_name(entry, name) || name.contains(".lock")).collect()
+    }
+
+    /// Make a file look as if nobody has touched it for longer than [LOCK_STALE].
+    fn age(path: &std::path::Path) {
+        let file = std::fs::OpenOptions::new().write(true).open(path).expect("the file opens");
+        file.set_modified(std::time::SystemTime::now() - LOCK_STALE - Duration::from_secs(1)).expect("the file can be made old");
+    }
 
     /// The same number of bytes as the fixture, so a hash mismatch is what fails and not the size.
     fn same_length_other_bytes() -> Vec<u8> {
@@ -401,7 +454,7 @@ mod tests {
         assert_eq!(sha256, entry.sha256);
         let path = model_file(&scratch.path, &entry);
         assert_eq!(std::fs::read(&path).expect("the model file can be read"), FIXTURE, "the file is where the store says: {}", path.display());
-        assert!(!part_file(&scratch.path, &entry).exists(), "no half-written file is left behind");
+        assert!(leftovers(&scratch, &entry).is_empty(), "no half-written file is left behind");
         let record = read_verified(&scratch.path, &entry).expect("the verification record was written");
         assert_eq!(record.sha256, entry.sha256);
         assert_eq!(record.file, entry.file);
@@ -418,7 +471,7 @@ mod tests {
         assert_eq!(fail.status, Status::Internal);
         assert!(fail.sentence.contains(&entry.sha256), "the sentence names the hash that was expected: {fail}");
         assert!(fail.sentence.contains(&sha256_hex(FIXTURE)), "and the hash that arrived: {fail}");
-        assert!(!part_file(&scratch.path, &entry).exists(), "the half-written file is deleted");
+        assert!(leftovers(&scratch, &entry).is_empty(), "the half-written file is deleted");
         assert!(!model_file(&scratch.path, &entry).exists(), "nothing is put in place");
         assert!(read_verified(&scratch.path, &entry).is_none(), "and nothing is recorded");
         assert!(!is_installed(&scratch.path, &entry));
@@ -431,7 +484,7 @@ mod tests {
         let fetcher = FakeFetch::new(&FIXTURE[..FIXTURE.len() - 7]);
         let fail = install_into(&scratch, &entry, &fetcher).expect_err("the download stopped before the catalog size");
         assert!(fail.sentence.contains("bytes"), "the sentence talks about sizes: {fail}");
-        assert!(!part_file(&scratch.path, &entry).exists(), "the half-written file is deleted");
+        assert!(leftovers(&scratch, &entry).is_empty(), "the half-written file is deleted");
         assert!(!is_installed(&scratch.path, &entry));
     }
 
@@ -456,7 +509,7 @@ mod tests {
         let fail = install_into(&scratch, &entry, &fetcher).expect_err("the server sends more than the catalog size");
         assert_eq!(fail.status, Status::TooLarge);
         assert!(fail.sentence.contains(&entry.size.to_string()), "the sentence names the catalog size: {fail}");
-        assert!(!part_file(&scratch.path, &entry).exists(), "the half-written file is deleted");
+        assert!(leftovers(&scratch, &entry).is_empty(), "the half-written file is deleted");
         assert!(!is_installed(&scratch.path, &entry));
     }
 
@@ -567,7 +620,7 @@ mod tests {
                 let on_disk = std::fs::read(model_file(&scratch.path, &entry)).expect("the installed file can be read");
                 assert!(on_disk == good, "round {round}: the file recorded as verified is not the one the catalog describes");
             }
-            assert!(!part_file(&scratch.path, &entry).exists(), "round {round}: no half-written file is left behind");
+            assert!(leftovers(&scratch, &entry).is_empty(), "round {round}: no half-written file is left behind");
             // Whatever happened, a plain install afterwards ends with the right file.
             install(&entry, &scratch.path, &FakeFetch::new(&good), &mut no_progress).expect("a later install works");
             assert_eq!(std::fs::read(model_file(&scratch.path, &entry)).expect("the file"), good, "round {round}");
@@ -603,13 +656,77 @@ mod tests {
     }
 
     #[test]
-    fn a_part_file_left_by_a_dead_run_is_replaced() {
+    fn part_files_left_by_dead_runs_are_cleared_and_a_live_one_is_not() {
         let scratch = Scratch::new("fetch-stale-part");
         let entry = test_model(FIXTURE, None);
         std::fs::create_dir_all(model_folder(&scratch.path, &entry)).expect("the model folder");
-        std::fs::write(part_file(&scratch.path, &entry), b"left over from a run that crashed, and longer than the fixture").expect("a stale .part");
-        install_into(&scratch, &entry, &FakeFetch::new(FIXTURE)).expect("the stale file does not block an install");
+        let old_style = model_folder(&scratch.path, &entry).join(format!("{}.part", entry.file));
+        let dead = part_file(&scratch.path, &entry, "dead0000");
+        let live = part_file(&scratch.path, &entry, "live0000");
+        for path in [&old_style, &dead, &live] {
+            std::fs::write(path, b"left over from a run that crashed, and longer than the fixture").expect("a .part");
+        }
+        age(&old_style);
+        age(&dead);
+        install_into(&scratch, &entry, &FakeFetch::new(FIXTURE)).expect("old files do not block an install");
         assert_eq!(std::fs::read(model_file(&scratch.path, &entry)).expect("the model file"), FIXTURE);
-        assert!(!part_file(&scratch.path, &entry).exists());
+        assert!(!old_style.exists() && !dead.exists(), "what dead runs left is gone");
+        assert!(live.exists(), "a .part someone wrote to recently is not this install's to delete");
+    }
+
+    /// Two installs of the same model at the same moment, one served the right bytes and one the
+    /// wrong ones, both slow enough to overlap. Whatever happens, a file recorded as verified is the
+    /// right file and nothing is left behind.
+    fn race(scratch: &Scratch, entry: &crate::catalog::Model, good: &[u8], round: u32, run: &(dyn Fn(&SlowFetch) -> crate::error::Result<Outcome> + Sync)) {
+        let right = SlowFetch { bytes: good.to_vec(), chunk: 4 * 1024, delay: Duration::from_millis(2) };
+        let wrong = SlowFetch { bytes: patterned(0x5a), chunk: 4 * 1024, delay: Duration::from_millis(2 + u64::from(round % 3)) };
+        let start = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            let first = scope.spawn(|| {
+                start.wait();
+                run(&right)
+            });
+            let second = scope.spawn(|| {
+                start.wait();
+                run(&wrong)
+            });
+            let _ = first.join().expect("the first install thread");
+            let _ = second.join().expect("the second install thread");
+        });
+        if is_installed(&scratch.path, entry) {
+            let on_disk = std::fs::read(model_file(&scratch.path, entry)).expect("the installed file can be read");
+            assert!(on_disk == good, "round {round}: the file recorded as verified is not the one the catalog describes");
+        }
+        assert!(leftovers(scratch, entry).is_empty(), "round {round}: nothing is left behind: {:?}", leftovers(scratch, entry));
+    }
+
+    #[test]
+    fn two_downloads_that_both_think_they_hold_the_lock_cannot_install_the_wrong_bytes() {
+        // The follow-up to C6: correctness must not rest on the lock. Here the lock is skipped
+        // altogether, as if a stale-lock takeover had gone wrong, and each download still renames
+        // only the bytes it hashed itself.
+        for round in 0..6u32 {
+            let scratch = Scratch::new(&format!("fetch-no-lock-{round}"));
+            let good = patterned(0);
+            let entry = test_model(&good, None);
+            std::fs::create_dir_all(model_folder(&scratch.path, &entry)).expect("the model folder");
+            race(&scratch, &entry, &good, round, &|fetch| fetch_into_place(&entry, &scratch.path, fetch, &mut no_progress, &mut || {}));
+        }
+    }
+
+    #[test]
+    fn two_installs_racing_over_a_stale_lock_never_leave_a_wrong_file_marked_verified() {
+        // Both see the dead install's lock as stale at the same moment; only one may take it over.
+        for round in 0..6u32 {
+            let scratch = Scratch::new(&format!("fetch-stale-race-{round}"));
+            let good = patterned(0);
+            let entry = test_model(&good, None);
+            std::fs::create_dir_all(model_folder(&scratch.path, &entry)).expect("the model folder");
+            std::fs::write(lock_file(&scratch.path, &entry), "an install that died").expect("a lock");
+            age(&lock_file(&scratch.path, &entry));
+            race(&scratch, &entry, &good, round, &|fetch| install(&entry, &scratch.path, fetch, &mut no_progress));
+            install(&entry, &scratch.path, &FakeFetch::new(&good), &mut no_progress).expect("a later install works");
+            assert_eq!(std::fs::read(model_file(&scratch.path, &entry)).expect("the file"), good, "round {round}");
+        }
     }
 }

@@ -64,11 +64,19 @@ pub fn model_file(root: &Path, model: &Model) -> PathBuf {
     model_folder(root, model).join(&model.file)
 }
 
-/// The half-written download, renamed into place once the hash checks out.
+/// One install's half-written download, `<file>.<tag>.part`, renamed into place once the hash
+/// checks out. Every install picks its own random `tag`, so two installs never share a file (C6).
 #[must_use]
-pub fn part_file(root: &Path, model: &Model) -> PathBuf {
-    let name = format!("{}{PART_SUFFIX}", model.file);
+pub fn part_file(root: &Path, model: &Model, tag: &str) -> PathBuf {
+    let name = format!("{}.{tag}{PART_SUFFIX}", model.file);
     model_folder(root, model).join(name)
+}
+
+/// Is `name` a download in progress (or left behind) for this model's file, whoever wrote it? The
+/// untagged `<file>.part` of earlier versions counts too.
+#[must_use]
+pub fn is_part_name(model: &Model, name: &str) -> bool {
+    name.strip_prefix(model.file.as_str()).is_some_and(|rest| rest.ends_with(PART_SUFFIX) && (rest == PART_SUFFIX || rest.starts_with('.')))
 }
 
 /// The lock an install holds while it owns the `.part` file, so two installs never share one.
@@ -349,8 +357,11 @@ mod tests {
         let file = model_file(&scratch.path, &entry);
         assert!(file.starts_with(&scratch.path), "everything stays inside the models folder: {}", file.display());
         assert!(file.ends_with(PathBuf::from("lama").join("1").join("lama_fp32.onnx")), "id, then version, then the file name: {file:?}");
-        assert_eq!(part_file(&scratch.path, &entry).parent(), file.parent(), "the .part file is in the same folder");
-        assert!(part_file(&scratch.path, &entry).to_string_lossy().ends_with("lama_fp32.onnx.part"));
+        assert_eq!(part_file(&scratch.path, &entry, "a1b2").parent(), file.parent(), "the .part file is in the same folder");
+        assert!(part_file(&scratch.path, &entry, "a1b2").to_string_lossy().ends_with("lama_fp32.onnx.a1b2.part"), "and carries its install's tag");
+        assert!(super::is_part_name(&entry, "lama_fp32.onnx.a1b2.part") && super::is_part_name(&entry, "lama_fp32.onnx.part"));
+        assert!(!super::is_part_name(&entry, "lama_fp32.onnx") && !super::is_part_name(&entry, "lama_fp32.onnx.lock"));
+        assert!(!super::is_part_name(&entry, "other.onnx.a1b2.part") && !super::is_part_name(&entry, "lama_fp32.onnxx.part"));
         assert_eq!(verified_file(&scratch.path, &entry).parent(), file.parent());
     }
 }
