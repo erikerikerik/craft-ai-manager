@@ -2,7 +2,7 @@
 
 ## 2026-10-16 (midday): Codex-Strata (autopilot) - MG-08 clean shutdown on Ctrl+C
 
-- Branch `ai/mg-08-shutdown` from `origin/main` `ab2969a`; **PR pending**, draft, against `main`. Receipt: `agents/receipts/MG-08.md`. MG-09 merged as `3aca441` mid-flight, so the branch sits on it and the four files MG-09 also touched were merged by hand (`main.rs` and `README.md` clean; `guards.txt` and `HANDOFF.md` one conflict each, both sides kept).
+- Branch `ai/mg-08-shutdown` from `origin/main` `ab2969a`; **PR #6** (draft) against `main`. Receipt: `agents/receipts/MG-08.md`. MG-09 merged as `3aca441` mid-flight, so the branch sits on it and the four files MG-09 also touched were merged by hand (`main.rs` and `README.md` clean; `guards.txt` and `HANDOFF.md` one conflict each, both sides kept).
 - One new dependency: `ctrlc` 3.5.2 with the `termination` feature (MIT / Apache-2.0, inside the MG-07 `deny.toml` allow list). `Cargo.lock` gains 7 packages; on Windows ctrlc reuses the `windows-sys` 0.61.2 the tree already had.
 - `StopHandle::press()` in `crates/caim/src/server.rs` is the shutdown path the signal handler calls. The first press is the same stop Enter does - the flag goes up and `Runner::request_stop()` cancels the running and the queued jobs; a later press returns true and `main.rs` exits 1 from the signal thread. `Server::shutdown()` is unchanged, so `endpoint.json` is still removed only when it holds this start's token.
 - Two tests call that function directly, no real signals: one press cancels the running and the queued job and the next two presses say leave now; the same path through a real server removes the endpoint file and survives being called twice.
