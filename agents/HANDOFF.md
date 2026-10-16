@@ -7,6 +7,8 @@
 - `cargo test --test golden -- --ignored --nocapture`: 1 passed in 10.3 s - "141018 pixels outside the mask are identical; inside, 0.000 levels a channel from the committed answer, and the masked area moved from 65.6 to 23.1 away from the background colour".
 - Clean networked build for the run: deleted `target/agent-local`, left `ORT_LIB_PATH` unset so `ort` fetched its own onnxruntime, rebuilt, and started `caim serve` from that build for PhotoCraft's PC-06 end-to-end (first fill 9.3 s of provider time including the model load, second 2.2 s).
 - Gates: `cargo test` 206 passed / 0 failed / 2 ignored over 8 binaries; `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` clean. `agents/guards.txt` unchanged (all six lines are `cargo test`, all pass).
+- Review round 1 (Codex-cloud on `0184365`, 2026-10-16): one finding, P1 - the session had a handoff entry but no receipt, which `AGENTS.md`
+  requires. `agents/receipts/PC-06.md` now carries it; no code changed.
 - **Next:** the PR needs an independent review. On the PhotoCraft side PC-05 and PC-06 are `review`; Erik still owes the five-minute hands-on check (`photocraft/agents/receipts/PC-06.md`).
 
 ## 2026-10-15: Codex - BF-03 blocking-review follow-up
