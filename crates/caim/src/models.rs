@@ -437,12 +437,15 @@ mod tests {
         let scratch = Scratch::new("models-remove-link");
         let root = scratch.path.join("models");
         std::fs::create_dir_all(&root).expect("the models folder can be made");
-        let outside = scratch.path.join("elsewhere");
-        std::fs::create_dir_all(model_folder(&root, &test_model(FIXTURE, None))).expect("the folder the link points at can be made");
-        let keep = outside.join("1").join("keep.onnx");
-        std::fs::write(&keep, "keep these bytes").expect("a file outside the store can be written");
-        std::os::unix::fs::symlink(&outside, root.join("lama")).expect("the link can be made");
         let entry = test_model(FIXTURE, None);
+        // <root>/<id> is a link to a folder elsewhere, so <root>/<id>/<version> is really
+        // <elsewhere>/<version> - the folder a delete would follow the link into.
+        let outside = scratch.path.join("elsewhere");
+        let linked = outside.join(&entry.version);
+        std::fs::create_dir_all(&linked).expect("the folder the link points at can be made");
+        let keep = linked.join(&entry.file);
+        std::fs::write(&keep, "keep these bytes").expect("a file outside the store can be written");
+        std::os::unix::fs::symlink(&outside, root.join(&entry.id)).expect("the link can be made");
         let fail = remove_model(&entry, &root, None, &|_port| false).expect_err("a link in place of the model folder is refused");
         assert!(fail.sentence.contains("is a link, not a folder"), "the link is named: {fail}");
         assert!(keep.exists(), "the file the link leads to is untouched");
