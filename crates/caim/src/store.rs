@@ -301,7 +301,8 @@ mod tests {
     use crate::testkit::{Scratch, test_model};
 
     use super::{
-        Acknowledgement, MODELS_DIR, VERIFIED_NAME, folder_usage, hash_file, is_acknowledged, is_installed, model_file, model_folder, models_dir_in, part_file, read_verified, remove_verified, sha256_hex, verified_file, write_acknowledgement, write_verified,
+        Acknowledgement, MODELS_DIR, VERIFIED_NAME, folder_usage, hash_file, is_acknowledged, is_installed, model_file, model_folder, models_dir_in, part_file,
+        read_verified, remove_verified, sha256_hex, verified_file, write_acknowledgement, write_verified,
     };
 
     const FIXTURE: &[u8] = b"the bytes a small model would be made of";
