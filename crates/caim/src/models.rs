@@ -8,6 +8,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::catalog::{self, Model};
+use crate::endpoint;
 use crate::error::{Fail, Result, quoted};
 use crate::fetch::{self, Fetch, HttpFetch};
 use crate::store;
@@ -41,16 +42,19 @@ pub fn list() -> Result<Vec<String>> {
     Ok(list_lines(&catalog::load()?, &models_root()?))
 }
 
-/// The same, with the folder and the catalog handed over, for the tests.
+/// The same, with the folder and the catalog handed over, for the tests. Each line ends with the
+/// bytes that model's folder holds on disk, and the last line is the total for the models folder
+/// beside the folder itself (MG-09).
 #[must_use]
 pub fn list_lines(models: &[Model], root: &Path) -> Vec<String> {
-    models
+    let mut lines: Vec<String> = models
         .iter()
         .map(|model| {
             let state = if store::is_installed(root, model) { "installed" } else { "not installed" };
             let needs = if model.note.is_some() && !store::is_acknowledged(root, model) { "  needs acknowledgment" } else { "" };
+            let on_disk = store::folder_usage(&store::model_folder(root, model)).unwrap_or(store::Usage { bytes: 0, files: 0 });
             format!(
-                "{id}  {version}  {task}  {size} bytes  licences: code {code}, weights {weights}, training data {training}  {state}{needs}",
+                "{id}  {version}  {task}  {size} bytes  licences: code {code}, weights {weights}, training data {training}  {state}{needs}  on disk: {bytes} bytes",
                 id = model.id,
                 version = model.version,
                 task = model.task,
@@ -60,9 +64,16 @@ pub fn list_lines(models: &[Model], root: &Path) -> Vec<String> {
                 training = model.licence_training_data,
                 state = state,
                 needs = needs,
+                bytes = on_disk.bytes,
             )
         })
-        .collect()
+        .collect();
+    if lines.is_empty() {
+        lines.push("The model catalog has no entries.".to_string());
+    }
+    let total = store::folder_usage(root).unwrap_or(store::Usage { bytes: 0, files: 0 });
+    lines.push(format!("total on disk: {} bytes in {} files, models folder {}", total.bytes, total.files, root.display()));
+    lines
 }
 
 /// `caim models install <id> [--accept-note]`, with the folder and the fetcher handed over.
@@ -107,12 +118,99 @@ pub fn verify(id: &str) -> Result<String> {
     verify_model(&model, &models_root()?)
 }
 
+/// `caim models remove <id>`: delete one model's installed files - the model file, `verified.json`,
+/// `acknowledged.json`, and any `.part` or `.lock` left behind. `endpoint` is the endpoint file
+/// (None when the platform has nowhere to put one) and `probe` says whether a port answers, so a
+/// test can decide that without opening a socket.
+pub fn remove_model(model: &Model, root: &Path, endpoint: Option<&Path>, probe: &dyn Fn(u16) -> bool) -> Result<String> {
+    if let Some(port) = live_server_port(endpoint, probe) {
+        return Err(Fail::conflict(format!(
+            "Craft AI Manager is listening on port {port}, so it may be using {}. Stop it (press Enter in its window) and try again. Nothing was deleted.",
+            quoted(&model.label())
+        )));
+    }
+    let folder = installed_folder(root, model)?;
+    let Some(usage) = store::folder_usage(&folder) else {
+        return Err(Fail::not_found(format!(
+            "{} has nothing installed under {}. Nothing was deleted.",
+            quoted(&model.label()),
+            quoted(&folder.display().to_string())
+        )));
+    };
+    std::fs::remove_dir_all(&folder).map_err(|error| Fail::internal(format!("Craft AI Manager could not remove {}: {error}", folder.display())))?;
+    // The <id> folder goes with it when this was its last version, so the models folder does not
+    // fill up with empty names. remove_dir only succeeds on an empty folder, which is the check.
+    if let Some(parent) = folder.parent() {
+        let _ = std::fs::remove_dir(parent);
+    }
+    Ok(format!("{} is removed: {} files, {} bytes, from {}.", model.label(), usage.files, usage.bytes, folder.display()))
+}
+
+/// `caim models remove <id>` with the real folder, the real endpoint file and the real probe.
+pub fn remove(id: &str) -> Result<String> {
+    let model = find(id)?;
+    remove_model(&model, &models_root()?, endpoint::endpoint_file_from_env().as_deref(), &port_is_listening)
+}
+
+/// The port of a manager that is answering right now: the endpoint file names a port, and something
+/// listens on it. A file left behind by a manager that died names a port too, which is why the
+/// second half is asked separately.
+#[must_use]
+pub fn live_server_port(endpoint: Option<&Path>, probe: &dyn Fn(u16) -> bool) -> Option<u16> {
+    let port = endpoint::published_port(endpoint?)?;
+    probe(port).then_some(port)
+}
+
+/// The real probe: a connection that succeeds means something is listening on that loopback port.
+/// The timeout is short because the address is loopback, and nothing is ever sent, so a running
+/// manager only closes the connection again.
+#[must_use]
+fn port_is_listening(port: u16) -> bool {
+    let address = std::net::SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, port);
+    std::net::TcpStream::connect_timeout(&std::net::SocketAddr::V4(address), std::time::Duration::from_millis(250)).is_ok()
+}
+
+/// The folder one model's files live in, or a plain sentence when the catalog's names would point
+/// outside the models folder. The catalog gate already refuses such names; this is the belt, because
+/// what follows deletes a folder.
+fn installed_folder(root: &Path, model: &Model) -> Result<PathBuf> {
+    if !catalog::is_name(&model.id) || !catalog::is_name(&model.version) {
+        return Err(Fail::internal(format!(
+            "The catalog names {} {}, which cannot be used as folder names, so nothing was deleted.",
+            quoted(&model.id),
+            quoted(&model.version)
+        )));
+    }
+    let folder = store::model_folder(root, model);
+    let outside = folder.strip_prefix(root).map_or(true, |rest| rest.components().count() != 2);
+    if outside {
+        return Err(Fail::internal(format!(
+            "Craft AI Manager will not delete {} because it is not a model folder inside the models folder. Nothing was deleted.",
+            folder.display()
+        )));
+    }
+    Ok(folder)
+}
+
+/// `caim models where`: the models folder, and whether the environment named it.
+pub fn where_folder() -> Result<String> {
+    let root = models_root()?;
+    Ok(where_line(&root, std::env::var_os(store::MODELS_ENV).is_some_and(|value| !value.is_empty())))
+}
+
+/// The same sentence with the two inputs handed over, so it can be tested without changing the
+/// environment of a running process.
+#[must_use]
+fn where_line(root: &Path, from_env: bool) -> String {
+    if from_env { format!("models folder: {} (from {})", root.display(), store::MODELS_ENV) } else { format!("models folder: {}", root.display()) }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::catalog::{Model, OverrideNote};
     use crate::error::Status;
-    use crate::models::{find, install_model, list_lines, verify_model};
-    use crate::store::{is_acknowledged, is_installed};
+    use crate::models::{find, install_model, list_lines, live_server_port, remove_model, verify_model, where_line};
+    use crate::store::{acknowledged_file, folder_usage, is_acknowledged, is_installed, model_file, model_folder, verified_file};
     use crate::testkit::{FakeFetch, Scratch, test_model};
 
     const FIXTURE: &[u8] = b"a small stand-in for a two hundred megabyte model";
@@ -157,7 +255,7 @@ mod tests {
         assert!(line.contains("needs acknowledgment"), "{line}");
         install_model(&entry, &scratch.path, true, &FakeFetch::new(FIXTURE), &mut no_progress).expect("the fixture installs");
         let line = list_lines(std::slice::from_ref(&entry), &scratch.path).remove(0);
-        assert!(line.ends_with("installed"), "installed, and no longer asking for a note: {line}");
+        assert!(line.contains("  installed  on disk: "), "installed, no longer asking for a note, and its bytes on disk: {line}");
     }
 
     #[test]
@@ -215,5 +313,84 @@ mod tests {
         let fail = verify_model(&entry, &scratch.path).expect_err("there is nothing to check");
         assert_eq!(fail.status, Status::NotFound);
         assert!(fail.sentence.contains("lama 1"), "the sentence names the model: {fail}");
+    }
+
+    #[test]
+    fn list_lines_adds_the_bytes_on_disk_and_a_total() {
+        let scratch = Scratch::new("models-usage");
+        let root = scratch.path.join("models");
+        std::fs::create_dir_all(&root).expect("the models folder can be made");
+        let entry = test_model(FIXTURE, None);
+        let lines = list_lines(std::slice::from_ref(&entry), &root);
+        assert_eq!(lines.len(), 2, "one line for the model and one for the total");
+        assert!(lines[0].contains("on disk: 0 bytes"), "nothing is installed yet: {}", lines[0]);
+        install_model(&entry, &root, false, &FakeFetch::new(FIXTURE), &mut no_progress).expect("the fixture installs");
+        let file = std::fs::metadata(model_file(&root, &entry)).expect("the model file is there");
+        let record = std::fs::metadata(verified_file(&root, &entry)).expect("the record is there");
+        let wanted = file.len() + record.len();
+        let lines = list_lines(std::slice::from_ref(&entry), &root);
+        assert!(lines[0].contains(&format!("  installed  on disk: {wanted} bytes")), "the model line names its own bytes: {}", lines[0]);
+        assert_eq!(lines[1], format!("total on disk: {wanted} bytes in 2 files, models folder {}", root.display()), "the total names the folder as well");
+    }
+
+    #[test]
+    fn remove_model_deletes_the_file_and_both_records() {
+        let scratch = Scratch::new("models-remove");
+        let root = scratch.path.join("models");
+        let entry = test_model(FIXTURE, Some(NOTE));
+        install_model(&entry, &root, true, &FakeFetch::new(FIXTURE), &mut no_progress).expect("the fixture installs with its acknowledgment");
+        assert!(acknowledged_file(&root, &entry).exists(), "the acknowledgment is on disk before the removal");
+        let version = model_folder(&root, &entry);
+        assert_eq!(folder_usage(&version).expect("the version folder can be counted").files, 3, "the file, its record and the acknowledgment");
+        let message = remove_model(&entry, &root, None, &|_port| false).expect("nothing is listening, so it can go");
+        assert!(message.starts_with("lama 1 is removed"), "{message}");
+        assert!(message.contains("3 files"), "the sentence says how much went: {message}");
+        assert!(!version.exists(), "the version folder is gone");
+        assert!(!root.join("lama").exists(), "and the id folder with it, because that was its only version");
+        assert!(root.exists(), "the models folder itself stays");
+        let fail = remove_model(&entry, &root, None, &|_port| false).expect_err("there is nothing left to remove");
+        assert_eq!(fail.status, Status::NotFound);
+        assert!(fail.sentence.contains("Nothing was deleted"), "{fail}");
+    }
+
+    #[test]
+    fn remove_is_refused_while_a_manager_is_listening() {
+        let scratch = Scratch::new("models-remove-live");
+        let root = scratch.path.join("models");
+        let entry = test_model(FIXTURE, None);
+        install_model(&entry, &root, false, &FakeFetch::new(FIXTURE), &mut no_progress).expect("the fixture installs");
+        let file = scratch.path.join("endpoint.json");
+        crate::endpoint::write(&file, 41234, "a-token").expect("the endpoint file can be written");
+        let fail = remove_model(&entry, &root, Some(&file), &|_port| true).expect_err("a manager that is answering holds its models");
+        assert_eq!(fail.status, Status::Conflict);
+        assert!(fail.sentence.contains("41234"), "the sentence names the port it asked: {fail}");
+        assert!(is_installed(&root, &entry), "and nothing was deleted");
+        // A file left behind by a manager that died names a port too, which is why the port is asked as well.
+        let message = remove_model(&entry, &root, Some(&file), &|_port| false).expect("nobody answers that port, so the model can go");
+        assert!(message.starts_with("lama 1 is removed"), "{message}");
+        assert_eq!(live_server_port(None, &|_port| true), None, "no endpoint file means no live server");
+    }
+
+    #[test]
+    fn remove_never_touches_anything_outside_the_models_folder() {
+        let scratch = Scratch::new("models-remove-outside");
+        let root = scratch.path.join("models");
+        let keep = scratch.path.join("elsewhere").join("keep.txt");
+        std::fs::create_dir_all(scratch.path.join("elsewhere")).expect("a folder outside the store can be made");
+        std::fs::write(&keep, "keep these bytes").expect("a file outside the store can be written");
+        for id in ["..", r"..\elsewhere", "lama/../../elsewhere"] {
+            let entry = Model { id: id.to_string(), ..test_model(FIXTURE, None) };
+            let fail = remove_model(&entry, &root, None, &|_port| false).expect_err("a name that cannot be a folder is refused");
+            assert!(fail.sentence.contains("folder names"), "{id} is refused: {fail}");
+            assert!(keep.exists(), "the file outside the models folder is untouched");
+        }
+        assert!(!root.exists(), "and nothing was made in the models folder either");
+    }
+
+    #[test]
+    fn where_line_names_the_folder_and_says_who_named_it() {
+        let root = std::env::temp_dir().join("caim-models-where");
+        assert_eq!(where_line(&root, true), format!("models folder: {} (from CRAFT_AI_MODELS)", root.display()), "the environment gets named");
+        assert_eq!(where_line(&root, false), format!("models folder: {}", root.display()), "otherwise the folder speaks for itself");
     }
 }

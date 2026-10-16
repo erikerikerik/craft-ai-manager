@@ -144,19 +144,34 @@ pub fn remove(path: &Path, token: &str) -> Result<()> {
 
 /// Does the file at this path still hold this token?
 fn is_ours(path: &Path, token: &str) -> bool {
-    let Ok(file) = std::fs::File::open(path) else { return false };
+    read_value(path).is_some_and(|value| value.get("token").and_then(Value::as_str) == Some(token))
+}
+
+/// The port the manager published, when the file is there, within the size cap, and names a port.
+/// A file left behind by a manager that died still names a port, so anyone asking whether a server
+/// is running has to ask the port as well (MG-09).
+#[must_use]
+pub fn published_port(path: &Path) -> Option<u16> {
+    let port = read_value(path)?.get("port").and_then(Value::as_u64)?;
+    u16::try_from(port).ok()
+}
+
+/// The endpoint file as JSON, never reading past the cap so an oversized file is never parsed.
+/// `None` when it is missing, too big, or not JSON.
+fn read_value(path: &Path) -> Option<Value> {
+    let Ok(file) = std::fs::File::open(path) else { return None };
     let mut bytes = Vec::new();
     // Read past the cap so a file that is far too large is never parsed.
     let mut limited = file.take(MAX_FILE_BYTES.saturating_add(1));
     if limited.read_to_end(&mut bytes).is_err() || u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_FILE_BYTES {
-        return false;
+        return None;
     }
-    serde_json::from_str::<Value>(&String::from_utf8_lossy(&bytes)).is_ok_and(|value| value.get("token").and_then(Value::as_str) == Some(token))
+    serde_json::from_str::<Value>(&String::from_utf8_lossy(&bytes)).ok()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ENDPOINT_VERSION, endpoint_file_from_env, is_ours, remove, temp_path, write};
+    use super::{ENDPOINT_VERSION, endpoint_file_from_env, is_ours, published_port, remove, temp_path, write};
     use std::path::PathBuf;
 
     fn temp_endpoint(who: &str) -> PathBuf {
@@ -249,5 +264,20 @@ mod tests {
         drop(file);
         let mode = std::fs::metadata(&path).expect("the file is there").permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "the temp file is owner-read-write only, got {mode:o}");
+    }
+
+    #[test]
+    fn published_port_reads_the_port_and_refuses_a_bad_file() {
+        let path = temp_endpoint("port");
+        let _guard = TempFile(path.clone());
+        write(&path, 4004, "mine").expect("the file is written");
+        assert_eq!(published_port(&path), Some(4004), "the port the manager published");
+        std::fs::write(&path, r#"{"version": 1, "token": "mine"}"#).expect("a file naming no port can be written");
+        assert_eq!(published_port(&path), None, "a file that names no port publishes nothing");
+        std::fs::write(&path, r#"{"port": 99999999999}"#).expect("an absurd port can be written");
+        assert_eq!(published_port(&path), None, "a number that is not a port is refused");
+        std::fs::write(&path, "not json at all").expect("a file that is not JSON can be written");
+        assert_eq!(published_port(&path), None, "and so is a file that is not JSON");
+        assert_eq!(published_port(&path.with_file_name("not-there.json")), None, "and a file that is not there");
     }
 }

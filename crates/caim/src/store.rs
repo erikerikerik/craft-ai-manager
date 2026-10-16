@@ -187,6 +187,43 @@ pub fn write_acknowledgement(root: &Path, model: &Model) -> Result<()> {
     std::fs::write(&path, body).map_err(|error| Fail::internal(format!("Craft AI Manager could not write {}: {error}", path.display())))
 }
 
+/// What a folder holds on disk: the bytes of its regular files, and how many files that is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Usage {
+    /// Bytes in regular files, counting subfolders.
+    pub bytes: u64,
+    /// How many regular files those bytes came from.
+    pub files: u64,
+}
+
+/// Add up the files under a folder. `None` when the folder is not there. A folder that cannot be
+/// read adds nothing rather than failing the count, and a link is never followed, so a symlink
+/// cannot lead this outside the folder.
+#[must_use]
+pub fn folder_usage(path: &Path) -> Option<Usage> {
+    let Ok(metadata) = std::fs::metadata(path) else { return None };
+    if !metadata.is_dir() {
+        return None;
+    }
+    let mut usage = Usage { bytes: 0, files: 0 };
+    let mut folders = vec![path.to_path_buf()];
+    while let Some(folder) = folders.pop() {
+        let Ok(entries) = std::fs::read_dir(&folder) else { continue };
+        for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else { continue };
+            if kind.is_dir() {
+                folders.push(entry.path());
+            } else if kind.is_file()
+                && let Ok(file) = entry.metadata()
+            {
+                usage.bytes = usage.bytes.saturating_add(file.len());
+                usage.files = usage.files.saturating_add(1);
+            }
+        }
+    }
+    Some(usage)
+}
+
 /// Hash a file that is already on disk, in chunks.
 pub fn hash_file(path: &Path) -> Result<String> {
     let mut file = std::fs::File::open(path).map_err(|error| Fail::internal(format!("Craft AI Manager could not open {}: {error}", path.display())))?;
@@ -241,7 +278,7 @@ mod tests {
     use crate::testkit::{Scratch, test_model};
 
     use super::{
-        Acknowledgement, MODELS_DIR, VERIFIED_NAME, hash_file, is_acknowledged, is_installed, model_file, model_folder, models_dir_in, part_file,
+        Acknowledgement, MODELS_DIR, VERIFIED_NAME, folder_usage, hash_file, is_acknowledged, is_installed, model_file, model_folder, models_dir_in, part_file,
         read_verified, remove_verified, sha256_hex, verified_file, write_acknowledgement, write_verified,
     };
 
@@ -363,5 +400,24 @@ mod tests {
         assert!(!super::is_part_name(&entry, "lama_fp32.onnx") && !super::is_part_name(&entry, "lama_fp32.onnx.lock"));
         assert!(!super::is_part_name(&entry, "other.onnx.a1b2.part") && !super::is_part_name(&entry, "lama_fp32.onnxx.part"));
         assert_eq!(verified_file(&scratch.path, &entry).parent(), file.parent());
+    }
+
+    #[test]
+    fn folder_usage_adds_up_a_folder_and_refuses_a_missing_one() {
+        let scratch = Scratch::new("store-usage");
+        assert_eq!(folder_usage(&scratch.path.join("models")), None, "a folder that is not there has no usage");
+        let entry = test_model(FIXTURE, None);
+        let version = model_folder(&scratch.path, &entry);
+        std::fs::create_dir_all(&version).expect("the model folder can be made");
+        let file = model_file(&scratch.path, &entry);
+        std::fs::write(&file, FIXTURE).expect("the model file can be written");
+        assert_eq!(folder_usage(&file), None, "a file is not a folder");
+        write_verified(&scratch.path, &entry, &entry.sha256, entry.size).expect("the record can be written");
+        let record = std::fs::metadata(verified_file(&scratch.path, &entry)).expect("the record can be checked");
+        let usage = folder_usage(&version).expect("the version folder can be counted");
+        assert_eq!(usage.files, 2, "the model file and its record are both counted");
+        assert_eq!(usage.bytes, FIXTURE.len() as u64 + record.len(), "and so are their bytes");
+        assert_eq!(folder_usage(version.parent().expect("the id folder is there")), Some(usage), "the id folder counts the same two");
+        assert_eq!(folder_usage(&scratch.path), Some(usage), "and so does the models folder itself");
     }
 }

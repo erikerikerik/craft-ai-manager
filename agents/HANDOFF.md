@@ -1,5 +1,14 @@
 # HANDOFF: Craft AI Manager
 
+## 2026-10-16 (early): Codex-Strata (autopilot) - MG-09 models remove, disk use, where
+
+- Branch `ai/mg-09-models` from `main` `ab2969a`; PR pending (opened as a draft) against `main`. No new dependencies, no wire-protocol change.
+- `caim models list` ends each model line with `on disk: <bytes> bytes` and adds `total on disk: <bytes> bytes in <files> files, models folder <root>`. `caim models where` prints the folder and who named it. `caim models remove <id>` deletes `<id>\<version>\` (model file, `verified.json`, `acknowledged.json`, any `.part` and `.lock`), drops `<id>` when that was its last version, asks no questions, and refuses while the endpoint file names a port that answers on loopback. It never touches anything outside `<models folder>\<id>\<version>`: `catalog::is_name` on both parts plus a two-component `strip_prefix`.
+- Gates: `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` clean; `cargo test` 213 passed / 0 failed / 2 ignored (was 206). `agents/guards.txt` gained `MG-09 | craft-ai-manager | cargo test`; all seven CAIM lines pass in this worktree - 7 of 7 in 89 s, `E:\CraftML\work\logs\guards-20261016-0022.txt`.
+- Live check rather than a fake: `caim serve --fake-backend` published port 63705, so `models remove lama` refused with exit 3 and left the file on disk; after the server was stopped the same command removed it with exit 0.
+- Receipt: `agents/receipts/MG-09.md`. **Next:** an independent review of the PR. The PhotoCraft `agents/TASKS.md` row for MG-09 waits for PhotoCraft PR #17, which edits that same file.
+- Found on the way: PC-07's `run-guards.ps1` had a one-line bug - `$repos = if (...) { @($Repo) }` comes back as a bare string, so `$repos[0]` was `c` and `-Repo craft-ai-manager -RepoPath <worktree>` silently guarded the wrong checkout. Fixed on `ai/pc-07-guards` with a tripwire; that is the third push on PR #17, past the two-round limit in SPEC 17, so Erik decides.
+
 ## 2026-10-15 (late): Codex-Strata (autopilot) - PC-06 Part A: a real golden photo
 
 - Branch `ai/pc-06-golden-photo` from `main` `7dd46c8`, commit `44748aa`; **PR #3** against `main`. Fixtures and `golden.rs` only - no product code, no new dependencies.

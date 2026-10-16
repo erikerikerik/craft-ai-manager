@@ -32,6 +32,8 @@ fn main() -> std::process::ExitCode {
         Ok(Action::ModelsList) => models_list(),
         Ok(Action::ModelsInstall { id, accept_note }) => models_install(&id, accept_note),
         Ok(Action::ModelsVerify { id }) => models_verify(&id),
+        Ok(Action::ModelsRemove { id }) => models_remove(&id),
+        Ok(Action::ModelsWhere) => models_where(),
     }
 }
 
@@ -44,6 +46,8 @@ fn help() {
     println!("  models install    download one model, hashing it while it arrives");
     println!("  --accept-note     accept a flagged model's licence note and go ahead with the download");
     println!("  models verify     re-hash an installed model against the catalog");
+    println!("  models remove     delete one model's files from disk (refused while a manager is running)");
+    println!("  models where      print the models folder");
     println!("exit codes: 0 everything is fine, 1 something went wrong, 2 the arguments do not make sense,");
     println!("            3 the model is unknown, is not installed, or its note needs acknowledging");
     println!("Craft AI Manager {VERSION}: https://github.com/erikerikerik/craft-ai-manager");
@@ -73,13 +77,11 @@ fn serve(fake_backend: bool) -> std::process::ExitCode {
     }
 }
 
-/// `caim models list`: one line per catalog entry, then the state of each on disk.
+/// `caim models list`: one line per catalog entry with the bytes it holds on disk, then the total
+/// for the models folder beside the folder itself.
 fn models_list() -> std::process::ExitCode {
     match models::list() {
         Ok(lines) => {
-            if lines.is_empty() {
-                println!("The model catalog has no entries.");
-            }
             for line in lines {
                 println!("{line}");
             }
@@ -106,6 +108,29 @@ fn models_install(id: &str, accept_note: bool) -> std::process::ExitCode {
 /// `caim models verify <id>`: re-hash the file on disk against the catalog.
 fn models_verify(id: &str) -> std::process::ExitCode {
     match models::verify(id) {
+        Ok(message) => {
+            println!("{message}");
+            std::process::ExitCode::SUCCESS
+        }
+        Err(fail) => report(fail),
+    }
+}
+
+/// `caim models remove <id>`: delete one model's files. Refused while a manager is listening,
+/// because that manager may be using the model.
+fn models_remove(id: &str) -> std::process::ExitCode {
+    match models::remove(id) {
+        Ok(message) => {
+            println!("{message}");
+            std::process::ExitCode::SUCCESS
+        }
+        Err(fail) => report(fail),
+    }
+}
+
+/// `caim models where`: the models folder, and nothing else.
+fn models_where() -> std::process::ExitCode {
+    match models::where_folder() {
         Ok(message) => {
             println!("{message}");
             std::process::ExitCode::SUCCESS
