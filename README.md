@@ -179,15 +179,16 @@ installed until it is downloaded again.
 
 `caim models list` ends every model line with the bytes that model's folder holds (`on disk: 208044816 bytes`) and adds
 one last line with the total for the whole models folder and the folder's own path. `caim models where` prints that
-folder, and says when `CRAFT_AI_MODELS` is what named it.
+folder and says what named it: `CRAFT_AI_MODELS` when that is set, the default data folder otherwise. A models folder
+whose tree is deeper or broader than the walk can count is named as too many folders rather than shown as zero.
 
 `caim models remove <id>` deletes `<id>\<version>\`: the model file, `verified.json`, `acknowledged.json`, and any
 `.part` or `.lock` an interrupted install left behind. When that was the model's last version, the now empty `<id>`
 folder goes with it. It asks no questions, because the command is already explicit. It refuses while a manager is
 running: the endpoint file names a port, and a connection to that port answers, so the model may be in use. A file left
 behind by a manager that died does not refuse, because the port is asked as well. What it deletes is always
-`<models folder>\<id>\<version>` - the catalog gate refuses names that cannot be folder names, and the removal asks the
-same question again before it touches the disk.
+`<models folder>\<id>\<version>` - the catalog gate refuses names that cannot be folder names, the removal asks the
+same question again before it touches the disk, and a link in place of either folder is refused rather than followed.
 
 A download goes to `<file>.part` in the same folder and is hashed as it streams. A server whose `Content-Length`, or
 whose bytes read, go past the catalog's `size` is refused; a hash or size mismatch deletes the `.part` file and names

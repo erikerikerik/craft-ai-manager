@@ -52,9 +52,16 @@ pub fn list_lines(models: &[Model], root: &Path) -> Vec<String> {
         .map(|model| {
             let state = if store::is_installed(root, model) { "installed" } else { "not installed" };
             let needs = if model.note.is_some() && !store::is_acknowledged(root, model) { "  needs acknowledgment" } else { "" };
-            let on_disk = store::folder_usage(&store::model_folder(root, model)).unwrap_or(store::Usage { bytes: 0, files: 0 });
+            let folder = store::model_folder(root, model);
+            // A folder that is not there has nothing on disk; a folder past the walk cap says so
+            // rather than showing a number that was never finished.
+            let on_disk = match store::folder_usage(&folder) {
+                Some(usage) => format!("{} bytes", usage.bytes),
+                None if folder.is_dir() => "too many folders to count".to_string(),
+                None => "0 bytes".to_string(),
+            };
             format!(
-                "{id}  {version}  {task}  {size} bytes  licences: code {code}, weights {weights}, training data {training}  {state}{needs}  on disk: {bytes} bytes",
+                "{id}  {version}  {task}  {size} bytes  licences: code {code}, weights {weights}, training data {training}  {state}{needs}  on disk: {bytes}",
                 id = model.id,
                 version = model.version,
                 task = model.task,
@@ -64,15 +71,19 @@ pub fn list_lines(models: &[Model], root: &Path) -> Vec<String> {
                 training = model.licence_training_data,
                 state = state,
                 needs = needs,
-                bytes = on_disk.bytes,
+                bytes = on_disk,
             )
         })
         .collect();
     if lines.is_empty() {
         lines.push("The model catalog has no entries.".to_string());
     }
-    let total = store::folder_usage(root).unwrap_or(store::Usage { bytes: 0, files: 0 });
-    lines.push(format!("total on disk: {} bytes in {} files, models folder {}", total.bytes, total.files, root.display()));
+    let total = match store::folder_usage(root) {
+        Some(usage) => format!("{} bytes in {} files", usage.bytes, usage.files),
+        None if root.is_dir() => "too many folders to count".to_string(),
+        None => "0 bytes in 0 files".to_string(),
+    };
+    lines.push(format!("total on disk: {total}, models folder {}", root.display()));
     lines
 }
 
@@ -131,6 +142,12 @@ pub fn remove_model(model: &Model, root: &Path, endpoint: Option<&Path>, probe: 
     }
     let folder = installed_folder(root, model)?;
     let Some(usage) = store::folder_usage(&folder) else {
+        if folder.is_dir() {
+            return Err(Fail::internal(format!(
+                "Craft AI Manager will not delete {} because it holds more folders than a model folder should. Nothing was deleted.",
+                folder.display()
+            )));
+        }
         return Err(Fail::not_found(format!(
             "{} has nothing installed under {}. Nothing was deleted.",
             quoted(&model.label()),
@@ -172,7 +189,8 @@ fn port_is_listening(port: u16) -> bool {
 
 /// The folder one model's files live in, or a plain sentence when the catalog's names would point
 /// outside the models folder. The catalog gate already refuses such names; this is the belt, because
-/// what follows deletes a folder.
+/// what follows deletes a folder. A link in place of either folder is refused too: the check below
+/// reads the path as a name, and remove_dir_all follows a link.
 fn installed_folder(root: &Path, model: &Model) -> Result<PathBuf> {
     if !catalog::is_name(&model.id) || !catalog::is_name(&model.version) {
         return Err(Fail::internal(format!(
@@ -189,6 +207,21 @@ fn installed_folder(root: &Path, model: &Model) -> Result<PathBuf> {
             folder.display()
         )));
     }
+    // Two components is only what the path is called. A link in place of the id folder or the
+    // version folder keeps that name and points somewhere else, and remove_dir_all follows it, so
+    // both are looked at as they really sit on disk before anything is deleted.
+    let id_folder = root.join(&model.id);
+    for step in [&id_folder, &folder] {
+        if let Ok(metadata) = std::fs::symlink_metadata(step)
+            && metadata.file_type().is_symlink()
+        {
+            return Err(Fail::internal(format!(
+                "Craft AI Manager will not delete {} because {} is a link, not a folder. Nothing was deleted.",
+                folder.display(),
+                step.display()
+            )));
+        }
+    }
     Ok(folder)
 }
 
@@ -202,7 +235,11 @@ pub fn where_folder() -> Result<String> {
 /// environment of a running process.
 #[must_use]
 fn where_line(root: &Path, from_env: bool) -> String {
-    if from_env { format!("models folder: {} (from {})", root.display(), store::MODELS_ENV) } else { format!("models folder: {}", root.display()) }
+    if from_env {
+        format!("models folder: {} (from {})", root.display(), store::MODELS_ENV)
+    } else {
+        format!("models folder: {} (the default data folder)", root.display())
+    }
 }
 
 #[cfg(test)]
@@ -391,6 +428,53 @@ mod tests {
     fn where_line_names_the_folder_and_says_who_named_it() {
         let root = std::env::temp_dir().join("caim-models-where");
         assert_eq!(where_line(&root, true), format!("models folder: {} (from CRAFT_AI_MODELS)", root.display()), "the environment gets named");
-        assert_eq!(where_line(&root, false), format!("models folder: {}", root.display()), "otherwise the folder speaks for itself");
+        assert_eq!(where_line(&root, false), format!("models folder: {} (the default data folder)", root.display()), "the default names itself");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_refuses_a_link_in_place_of_a_model_folder() {
+        let scratch = Scratch::new("models-remove-link");
+        let root = scratch.path.join("models");
+        std::fs::create_dir_all(&root).expect("the models folder can be made");
+        let outside = scratch.path.join("elsewhere");
+        std::fs::create_dir_all(model_folder(&root, &test_model(FIXTURE, None))).expect("the folder the link points at can be made");
+        let keep = outside.join("1").join("keep.onnx");
+        std::fs::write(&keep, "keep these bytes").expect("a file outside the store can be written");
+        std::os::unix::fs::symlink(&outside, root.join("lama")).expect("the link can be made");
+        let entry = test_model(FIXTURE, None);
+        let fail = remove_model(&entry, &root, None, &|_port| false).expect_err("a link in place of the model folder is refused");
+        assert!(fail.sentence.contains("is a link, not a folder"), "the link is named: {fail}");
+        assert!(keep.exists(), "the file the link leads to is untouched");
+    }
+
+    #[test]
+    fn remove_refuses_a_folder_with_more_folders_than_a_model_folder_should_have() {
+        let scratch = Scratch::new("models-remove-deep");
+        let root = scratch.path.join("models");
+        let entry = test_model(FIXTURE, None);
+        let mut deep = model_folder(&root, &entry);
+        for _ in 0..17 {
+            deep = deep.join("next");
+        }
+        std::fs::create_dir_all(&deep).expect("a tree past the walk cap can be made");
+        let fail = remove_model(&entry, &root, None, &|_port| false).expect_err("a folder past the walk cap is refused");
+        assert!(fail.sentence.contains("more folders than a model folder should"), "the refusal says why: {fail}");
+        assert!(deep.exists(), "nothing was deleted");
+    }
+
+    #[test]
+    fn list_says_when_a_folder_holds_too_many_folders_to_count() {
+        let scratch = Scratch::new("models-list-deep");
+        let root = scratch.path.join("models");
+        let entry = test_model(FIXTURE, None);
+        let mut deep = model_folder(&root, &entry);
+        for _ in 0..17 {
+            deep = deep.join("next");
+        }
+        std::fs::create_dir_all(&deep).expect("a tree past the walk cap can be made");
+        let lines = list_lines(&[entry], &root);
+        assert!(lines[0].ends_with("  on disk: too many folders to count"), "the model line says it could not count: {}", lines[0]);
+        assert!(lines[1].starts_with("total on disk: too many folders to count, models folder "), "the total says it too: {}", lines[1]);
     }
 }

@@ -1,5 +1,13 @@
 # HANDOFF: Craft AI Manager
 
+## 2026-10-16 (early, later): Codex-Strata (autopilot) - MG-09 review round 1
+
+- Codex-cloud reviewed `dfe2ac0` on PR #4 and asked for changes: one P1 and two P2s. All three are fixed on `ai/mg-09-models` in the commit after `2d589147`, and the re-review asked for covers that commit only. This is round 1 of the two SPEC v1.1 amendment 17 allows.
+- The P1 is the one that mattered: a symlink or Windows junction at `<models>\<id>` passed the two-component `strip_prefix` belt while `remove_dir_all` followed the link, so `models remove` could delete files outside the models folder. `installed_folder` now asks `symlink_metadata` about the id folder and the version folder and refuses with the link named. A `#[cfg(unix)]` test covers it in the ubuntu CI job, and a junction made here with `New-Item -ItemType Junction` printed the refusal and left the files behind it on disk.
+- The two P2s: `models where` now says `(the default data folder)` when `CRAFT_AI_MODELS` is unset, which is what the README and the first receipt already promised; and `folder_usage` stops at 16 folders deep or 4096 folders held, with `models list` printing `too many folders to count` and `models remove` refusing, instead of holding a stack of paths sized by whatever is on disk.
+- Gates after the fixes, in this worktree: `cargo fmt --check` 0, `cargo clippy --all-targets -- -D warnings` 0, `cargo test` 215 passed / 0 failed / 2 ignored (three tests added). Smoke re-run against the new build: `models where`, `models list`, `models remove`, and a real `caim serve --fake-backend` on port 61819 refusing while it answers.
+- **Next:** Codex-cloud's re-review of the fix commit, then both CAIM CI jobs, before PR #4 can merge. The PhotoCraft `agents/TASKS.md` row for MG-09 still waits for PhotoCraft PR #17, which edits that same file.
+
 ## 2026-10-16 (early): Codex-Strata (autopilot) - MG-09 models remove, disk use, where
 
 - Branch `ai/mg-09-models` from `main` `ab2969a`, commit `dfe2ac0a`; **PR #4** (draft) against `main`. No new dependencies, no wire-protocol change.

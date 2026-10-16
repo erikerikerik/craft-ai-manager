@@ -34,6 +34,11 @@ const PART_SUFFIX: &str = ".part";
 const LOCK_SUFFIX: &str = ".lock";
 /// How much is hashed at a time, so a 200 MB file never sits in memory.
 const HASH_CHUNK: usize = 64 * 1024;
+/// How deep [folder_usage] will walk. A models folder is two deep (`<id>/<version>`), so this is a
+/// wall against a tree built to exhaust memory, not a limit a real store comes near.
+const MAX_WALK_DEPTH: usize = 16;
+/// How many folders [folder_usage] holds at once, for the same reason.
+const MAX_WALK_FOLDERS: usize = 4_096;
 
 /// The models folder: `CRAFT_AI_MODELS` when it names one, otherwise the default. `None` when the
 /// platform has nowhere to put files at all.
@@ -196,9 +201,11 @@ pub struct Usage {
     pub files: u64,
 }
 
-/// Add up the files under a folder. `None` when the folder is not there. A folder that cannot be
-/// read adds nothing rather than failing the count, and a link is never followed, so a symlink
-/// cannot lead this outside the folder.
+/// Add up the files under a folder. `None` when the folder is not there, and `None` when the tree is
+/// deeper or broader than the two caps above - a tree no model folder has, and the caller is then
+/// asked to say it could not count rather than report a number it did not finish computing. A folder
+/// that cannot be read adds nothing rather than failing the count, and a link is never followed, so
+/// a symlink cannot lead this outside the folder.
 #[must_use]
 pub fn folder_usage(path: &Path) -> Option<Usage> {
     let Ok(metadata) = std::fs::metadata(path) else { return None };
@@ -206,13 +213,18 @@ pub fn folder_usage(path: &Path) -> Option<Usage> {
         return None;
     }
     let mut usage = Usage { bytes: 0, files: 0 };
-    let mut folders = vec![path.to_path_buf()];
-    while let Some(folder) = folders.pop() {
+    // The depth travels with the folder rather than with the shape of the stack, so the cap holds
+    // however the folders come back out.
+    let mut folders = vec![(path.to_path_buf(), 0usize)];
+    while let Some((folder, depth)) = folders.pop() {
         let Ok(entries) = std::fs::read_dir(&folder) else { continue };
         for entry in entries.flatten() {
             let Ok(kind) = entry.file_type() else { continue };
             if kind.is_dir() {
-                folders.push(entry.path());
+                if depth >= MAX_WALK_DEPTH || folders.len() >= MAX_WALK_FOLDERS {
+                    return None;
+                }
+                folders.push((entry.path(), depth + 1));
             } else if kind.is_file()
                 && let Ok(file) = entry.metadata()
             {
@@ -419,5 +431,12 @@ mod tests {
         assert_eq!(usage.bytes, FIXTURE.len() as u64 + record.len(), "and so are their bytes");
         assert_eq!(folder_usage(version.parent().expect("the id folder is there")), Some(usage), "the id folder counts the same two");
         assert_eq!(folder_usage(&scratch.path), Some(usage), "and so does the models folder itself");
+        let deep = scratch.path.join("deep");
+        let mut leaf = deep.clone();
+        for _ in 0..super::MAX_WALK_DEPTH + 1 {
+            leaf = leaf.join("next");
+        }
+        std::fs::create_dir_all(&leaf).expect("a tree past the depth cap can be made");
+        assert_eq!(folder_usage(&deep), None, "a tree past the depth cap is refused rather than counted");
     }
 }
