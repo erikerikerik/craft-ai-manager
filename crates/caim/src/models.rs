@@ -231,7 +231,9 @@ fn installed_folder(root: &Path, model: &Model) -> Result<PathBuf> {
 /// The first step of `<models folder>/<id>/<version>` that is a link rather than a folder, counting
 /// the models folder itself. The disk-use walk and the removal both refuse such a path: they read the
 /// path as a name, and the filesystem follows a link sitting in the middle of it, so a link at the id
-/// folder would make `<id>/<version>` a folder somewhere else entirely.
+/// folder would make `<id>/<version>` a folder somewhere else entirely. Each step is looked at as it
+/// is spelled, less any trailing separator - [store::is_link] takes that off first, because a models
+/// folder named `CRAFT_AI_MODELS=/somewhere/models/` would otherwise answer about its target.
 #[must_use]
 fn linked_step(root: &Path, model: &Model) -> Option<PathBuf> {
     let id_folder = root.join(&model.id);
@@ -531,6 +533,30 @@ mod tests {
         let root = scratch.path.join("models");
         std::os::unix::fs::symlink(&outside, &root).expect("the link can be made");
         let lines = list_lines(&[entry], &root);
+        assert!(lines[0].ends_with("  on disk: a link, not a folder"), "the model line says it did not count: {}", lines[0]);
+        assert!(lines[1].starts_with("total on disk: a link, not a folder"), "the total says it too: {}", lines[1]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_models_folder_named_with_a_trailing_separator_is_still_checked_for_a_link() {
+        let scratch = Scratch::new("models-root-link-slash");
+        let entry = test_model(FIXTURE, None);
+        let outside = scratch.path.join("elsewhere");
+        let linked = outside.join(&entry.id).join(&entry.version);
+        std::fs::create_dir_all(&linked).expect("the folder the link points at can be made");
+        std::fs::write(linked.join(&entry.file), FIXTURE).expect("a file outside the store can be written");
+        let root = scratch.path.join("models");
+        std::os::unix::fs::symlink(&outside, &root).expect("the link can be made");
+        // CRAFT_AI_MODELS="/somewhere/models/" names the same folder spelled with a trailing
+        // separator, which is how a shell or a config file tends to write it. Asked about like that,
+        // the filesystem answers about `outside` rather than about the link, so the link is
+        // invisible unless the separator comes off before the link is looked at.
+        let with_a_slash = std::path::PathBuf::from(format!("{}/", root.display()));
+        let fail = remove_model(&entry, &with_a_slash, None, &|_port| false).expect_err("the link behind the trailing separator is refused");
+        assert!(fail.sentence.contains("is a link, not a folder"), "the link is named: {fail}");
+        assert!(linked.join(&entry.file).exists(), "the file the link leads to is untouched");
+        let lines = list_lines(&[entry], &with_a_slash);
         assert!(lines[0].ends_with("  on disk: a link, not a folder"), "the model line says it did not count: {}", lines[0]);
         assert!(lines[1].starts_with("total on disk: a link, not a folder"), "the total says it too: {}", lines[1]);
     }

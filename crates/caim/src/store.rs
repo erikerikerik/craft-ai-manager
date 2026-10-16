@@ -48,11 +48,14 @@ pub fn models_dir() -> Option<PathBuf> {
 }
 
 /// The same decision with the two inputs handed over, so it can be tested without changing the
-/// environment of a running process.
+/// environment of a running process. The folder the environment names is normalised first: a
+/// trailing separator (`CRAFT_AI_MODELS=/store/models/`) would otherwise let a link called `models`
+/// hide from every `is_link` check that follows, because the filesystem then answers about the folder
+/// on the far side of the link rather than about the link.
 #[must_use]
 pub fn models_dir_in(named: Option<std::ffi::OsString>, data_dir: Option<PathBuf>) -> Option<PathBuf> {
     match named {
-        Some(value) if !value.is_empty() => Some(PathBuf::from(value)),
+        Some(value) if !value.is_empty() => Some(without_trailing_separators(&PathBuf::from(value))),
         _ => data_dir.map(|dir| dir.join(MODELS_DIR)),
     }
 }
@@ -201,32 +204,46 @@ pub struct Usage {
     pub files: u64,
 }
 
+/// The path in the shape the link checks below can trust: any trailing separator is dropped. A
+/// trailing slash asks the filesystem for a directory, so `symlink_metadata("/store/models/")` answers
+/// about the folder a link called `models` points at rather than the link itself, and the link would
+/// slip past every check that follows. Rebuilding from [Path::components] folds doubled separators and
+/// `.` steps too, and leaves a root (`/`, `C:\`) and an empty path exactly as they are.
+#[must_use]
+fn without_trailing_separators(path: &Path) -> PathBuf {
+    path.components().collect()
+}
+
 /// True when the path is there but is a link rather than the folder itself. [folder_usage] refuses
 /// such a path, and the callers use this to say why nothing was counted rather than asking
-/// `Path::is_dir`, which follows the link and answers about the folder on the other side of it.
+/// `Path::is_dir`, which follows the link and answers about the folder on the other side of it. The
+/// path is looked at as it is spelled, less any trailing separator - see [without_trailing_separators].
 #[must_use]
 pub fn is_link(path: &Path) -> bool {
-    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink())
+    std::fs::symlink_metadata(without_trailing_separators(path)).is_ok_and(|metadata| metadata.file_type().is_symlink())
 }
 
 /// Add up the files under a folder. `None` when the folder is not there, when a link sits in its
 /// place, and `None` when the tree is deeper or broader than the two caps above - a tree no model
 /// folder has, and the caller is then asked to say it could not count rather than report a number it
 /// did not finish computing. A folder that cannot be read adds nothing rather than failing the
-/// count, and no link is followed: the folder handed in is refused by [is_link], and a link found
-/// inside the walk is skipped, so this never walks outside the folder it was handed.
+/// count, and no link is followed: the folder handed in is refused as it is spelled, a trailing
+/// separator included (see [without_trailing_separators]), and a link found inside the walk is
+/// skipped, so this never walks outside the folder it was handed.
 #[must_use]
 pub fn folder_usage(path: &Path) -> Option<Usage> {
     // read_dir follows a link, so the folder handed in is read as it really sits on disk: a link
-    // here would walk a tree that is not inside the models folder at all.
-    let Ok(metadata) = std::fs::symlink_metadata(path) else { return None };
+    // here would walk a tree that is not inside the models folder at all. The same is true of a
+    // trailing separator, which makes the filesystem answer about the far side of the link.
+    let start = without_trailing_separators(path);
+    let Ok(metadata) = std::fs::symlink_metadata(&start) else { return None };
     if !metadata.is_dir() {
         return None;
     }
     let mut usage = Usage { bytes: 0, files: 0 };
     // The depth travels with the folder rather than with the shape of the stack, so the cap holds
     // however the folders come back out.
-    let mut folders = vec![(path.to_path_buf(), 0usize)];
+    let mut folders = vec![(start, 0usize)];
     while let Some((folder, depth)) = folders.pop() {
         let Ok(entries) = std::fs::read_dir(&folder) else { continue };
         for entry in entries.flatten() {
@@ -405,6 +422,11 @@ mod tests {
     fn the_models_folder_follows_the_environment_then_the_data_dir() {
         let data = PathBuf::from("data");
         assert_eq!(models_dir_in(Some(OsString::from("elsewhere")), Some(data.clone())), Some(PathBuf::from("elsewhere")), "CRAFT_AI_MODELS wins");
+        assert_eq!(
+            models_dir_in(Some(OsString::from("elsewhere/")), Some(data.clone())),
+            Some(PathBuf::from("elsewhere")),
+            "a trailing separator is dropped, so a link cannot hide behind one"
+        );
         assert_eq!(models_dir_in(None, Some(data.clone())), Some(data.join(MODELS_DIR)), "otherwise it sits in the data dir");
         assert_eq!(models_dir_in(Some(OsString::new()), Some(data.clone())), Some(data.join(MODELS_DIR)), "an empty override is not a folder");
         assert_eq!(models_dir_in(None, None), None, "and a platform with no data dir has no models folder");
@@ -463,5 +485,11 @@ mod tests {
         assert!(!folder_usage(&linked).is_some_and(|usage| usage.files > 0), "a link is not a folder to walk: {:?}", folder_usage(&linked));
         assert!(super::is_link(&linked), "and the caller can say why nothing was counted");
         assert!(!super::is_link(&real), "the folder on the other side of the link is a folder");
+        // The same folder spelled with a trailing separator, which is how a shell or a config file
+        // tends to write it. Asked about like that, the filesystem answers about `real` rather than
+        // about the link, which is how a link slipped past the guard in round 3.
+        let with_a_slash = PathBuf::from(format!("{}/", linked.display()));
+        assert!(super::is_link(&with_a_slash), "a trailing separator does not hide the link: {}", with_a_slash.display());
+        assert!(!folder_usage(&with_a_slash).is_some_and(|usage| usage.files > 0), "and the walk refuses it too: {:?}", folder_usage(&with_a_slash));
     }
 }
