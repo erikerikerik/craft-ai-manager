@@ -10,6 +10,7 @@ use std::io::Write;
 
 use craft_ai_manager::error::{Fail, Status};
 use craft_ai_manager::models;
+use craft_ai_manager::server::StopHandle;
 use craft_ai_manager::{Action, EXIT_FAILED, EXIT_MODEL, EXIT_USAGE, ServeOptions, Server, USAGE, VERSION, classify};
 
 fn main() -> std::process::ExitCode {
@@ -55,7 +56,16 @@ fn help() {
 
 /// Run the server until something asks it to stop, then shut down cleanly.
 fn serve(fake_backend: bool) -> std::process::ExitCode {
-    let mut server = match Server::start(ServeOptions { fake_backend, ..ServeOptions::default() }) {
+    // MG-08 review round 2: the signal handler goes in before `Server::start` writes the endpoint
+    // file, so a supervisor that stops the process the moment it can find the port still gets the
+    // clean stop instead of the operating system's default handling.
+    let stop = StopHandle::new();
+    if let Err(fail) = watch_signals(&stop) {
+        // A machine that will not take the handler still stops on Enter, and `Server::drop` still
+        // removes the endpoint file, so this is a note rather than a reason not to run.
+        eprintln!("{}", fail.sentence);
+    }
+    let mut server = match Server::start_with_stop(ServeOptions { fake_backend, ..ServeOptions::default() }, &stop) {
         Ok(server) => server,
         Err(fail) => return report(fail),
     };
@@ -67,7 +77,7 @@ fn serve(fake_backend: bool) -> std::process::ExitCode {
     }
     println!("backend: {}", server.backend_note());
     if std::io::stdin().is_terminal() {
-        println!("press Enter to stop cleanly. Ctrl+C works too, but on Windows it ends the process where it stands and leaves the endpoint file behind.");
+        println!("press Enter or Ctrl+C to stop cleanly. A second Ctrl+C leaves at once.");
         watch_stdin(server.stop_signal());
     }
     server.wait();
@@ -179,11 +189,9 @@ impl Progress {
     }
 }
 
-/// A Ctrl+C on Windows ends the process where it stands, which would leave the endpoint file
-/// behind, so when stdin is a terminal Enter stops the server properly instead. A stale file is
-/// harmless - a client sees a refused connection, and the next start replaces it - but this way the
-/// shutdown is clean and the file goes away. There is no signal handler in `std`, and MG-01 adds no
-/// dependency for one.
+/// Enter on a terminal asks the server to stop. MG-08 added a signal handler, so Ctrl+C does the
+/// same thing now; this stays because it also works where a signal cannot be delivered, and because
+/// the Enter behaviour is documented and people use it.
 fn watch_stdin(stop: std::sync::Arc<std::sync::atomic::AtomicBool>) {
     let _ = std::thread::Builder::new().name("caim-stdin".to_string()).spawn(move || {
         let mut line = String::new();
@@ -191,4 +199,20 @@ fn watch_stdin(stop: std::sync::Arc<std::sync::atomic::AtomicBool>) {
             stop.store(true, std::sync::atomic::Ordering::Relaxed);
         }
     });
+}
+
+/// MG-08: Ctrl+C, Ctrl+Break and a console close on Windows, and SIGINT, SIGTERM and SIGHUP
+/// elsewhere, stop the server exactly as Enter does. A second press while that stop is still
+/// running ends the process at once with a non-zero code, which is what someone pressing Ctrl+C
+/// again expects. `StopHandle::press` is the part the tests call directly; this is only the wiring.
+/// `serve` calls this before `Server::start`, so the handler is in place before the endpoint file
+/// says this start is ready.
+fn watch_signals(handle: &StopHandle) -> Result<(), Fail> {
+    let handle = handle.clone();
+    ctrlc::set_handler(move || {
+        if handle.press() {
+            std::process::exit(i32::from(EXIT_FAILED));
+        }
+    })
+    .map_err(|error| Fail::internal(format!("Craft AI Manager could not watch for Ctrl+C: {error}")))
 }

@@ -1,5 +1,15 @@
 # HANDOFF: Craft AI Manager
 
+## 2026-10-16 (midday): Codex-Strata (autopilot) - MG-08 clean shutdown on Ctrl+C
+
+- Branch `ai/mg-08-shutdown` from `origin/main` `ab2969a`; **PR #6** (draft) against `main`. Receipt: `agents/receipts/MG-08.md`. MG-09 merged as `3aca441` mid-flight, so the branch sits on it and the four files MG-09 also touched were merged by hand (`main.rs` and `README.md` clean; `guards.txt` and `HANDOFF.md` one conflict each, both sides kept).
+- One new dependency: `ctrlc` 3.5.2 with the `termination` feature (MIT / Apache-2.0, inside the MG-07 `deny.toml` allow list). `Cargo.lock` gains 7 packages; on Windows ctrlc reuses the `windows-sys` 0.61.2 the tree already had.
+- `StopHandle::press()` in `crates/caim/src/server.rs` is the shutdown path the signal handler calls. The first press is the same stop Enter does - the flag goes up and `Runner::request_stop()` cancels the running and the queued jobs; a later press returns true and `main.rs` exits 1 from the signal thread. `Server::shutdown()` is unchanged, so `endpoint.json` is still removed only when it holds this start's token.
+- Three tests call that function directly, no real signals: one press cancels the running and the queued job and the next two presses say leave now; the same path through a real server removes the endpoint file and survives being called twice; and (round 2) a press that arrives before the server exists still stops that start and leaves no endpoint file.
+- Manual Windows check with `GenerateConsoleCtrlEvent`: one Ctrl+C gives exit 0 and `endpoint.json` gone; two Ctrl+C 0 ms apart give exit 1 with the file left behind; two at 250 ms arrive after the clean stop had finished, so exit 0 and the file gone. Two at 30 ms is the boundary case and flips run to run (0, 1, 0 on the round-2 tree).
+- **Review round 2** (Codex, one P2 on `312e50d2`): the handler was installed after `Server::start` had already written `endpoint.json`, so a supervisor that stops the process the moment it finds the port got the operating system's default handling instead of the clean stop. `StopHandle::new()` now makes the stop before the start, `Server::start_with_stop` adopts it and `attach()` hands it the runner before the endpoint file is written, and `serve` installs the handler first. `Server::start` is the same call with a fresh handle, so nothing else changes.
+- Gates: `cargo fmt --check` 0, `cargo clippy --all-targets -- -D warnings` 0, `cargo test` 218 passed / 0 failed / 2 ignored, guards 8 of 8 in 62.6 s (`E:\CraftML\work\logs\guards-20261016-1056.txt`). Built `--offline` throughout: crates.io is unreachable from this PC and ctrlc with its dependencies was already in the cargo cache; the seven new lock entries read MIT / MIT+Apache-2.0 / Zlib from their cached manifests, all inside the MG-07 allow list, which the `deny` job on this branch now confirms.
+- **Next:** a re-review of the round-2 commits, then CI. The PhotoCraft `agents/TASKS.md` rows for MG-07, MG-08 and MG-09 go on `ai/mg-07-08-09-status`, which can be pushed now that PhotoCraft PR #17 has merged as `0852599`.
 ## 2026-10-15 (night): Codex-Strata (autopilot) - MG-07 CAIM CI: licence gate and MSRV job
 
 - Branch `ai/mg-07-ci` from `origin/main` `ab2969a`, commit `8589a04c`; **PR #5** (draft) against `main`. Two files: new `deny.toml` and two new jobs in `.github/workflows/ci.yml`. No product code, no dependency change, `Cargo.lock` untouched.
@@ -248,5 +258,6 @@
   whether one worker thread is enough (CAIM-12).
 - PC-06 (end-to-end on the 4090 against the real manager) is now unblocked: it needs MG-05, which this is.
 - Still open from MG-01: no Ctrl+C handler, jobs in memory only, MSRV declared but untested in CI.
+
 
 

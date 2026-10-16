@@ -139,10 +139,13 @@ milliseconds the run took.
 
 ### Stopping it
 
-Press Enter in the terminal: that stops the server cleanly and removes `endpoint.json`. Ctrl+C stops the process too,
-but MG-01 adds no dependency and `std` has no signal handler, so on Windows Ctrl+C ends the process where it stands
-and leaves the file behind. That is safe - a client that reads a stale file gets a refused connection and re-reads
-it, and the next start replaces the file - but Enter is the clean stop.
+Press Enter or Ctrl+C: either one stops the server cleanly - the job that is running and any queued
+one are cancelled, the listener closes, and `endpoint.json` goes away. MG-08 added a signal handler
+(`ctrlc`), so Ctrl+C now does what Enter does: Ctrl+C and Ctrl+Break on Windows, a console close or
+logoff there too, and SIGINT, SIGTERM and SIGHUP on Linux and macOS. A second Ctrl+C while a
+shutdown is still running ends the process at once with exit code 1, and the endpoint file may then
+still be there. That stays safe: a client that reads a stale file gets a refused connection, and the
+next start replaces it.
 
 ## Models
 
@@ -227,3 +230,4 @@ licensed for non-commercial research (decision D2 in the PhotoCraft task list).
 | 1 | something went wrong: the server could not start, a download failed, or a file or hash did not match the catalog |
 | 2 | the arguments do not make sense |
 | 3 | the model is unknown, is not installed, or its note needs acknowledging |
+

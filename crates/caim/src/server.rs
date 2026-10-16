@@ -131,14 +131,23 @@ pub struct Server {
     endpoint_path: Option<PathBuf>,
     /// Which backend this start picked, for the line `caim serve` prints.
     backend_note: &'static str,
-    stop: Arc<AtomicBool>,
     accept: Option<JoinHandle<()>>,
     runner: Arc<Runner>,
+    /// MG-08: the stop for this start - the flag the accept loop watches, how often something has
+    /// asked it to stop, and whether a second ask cut a shutdown short. Shared with every
+    /// `StopHandle` for this start, including one the binary made before the server existed.
+    stop_state: Arc<StopState>,
 }
 
 impl Server {
     /// Bind the socket, make the token, write the endpoint file, and start the threads.
     pub fn start(options: ServeOptions) -> Result<Server> {
+        Self::start_with_stop(options, &StopHandle::new())
+    }
+
+    /// `Server::start` with a stop handle the caller already holds, so a Ctrl+C handler installed
+    /// before this call still stops this server (MG-08 review round 2).
+    pub fn start_with_stop(options: ServeOptions, handle: &StopHandle) -> Result<Server> {
         let token = token::random_token()?;
         let listener =
             TcpListener::bind((LOCAL_HOST, 0)).map_err(|error| Fail::internal(format!("Craft AI Manager could not listen on 127.0.0.1: {error}")))?;
@@ -154,6 +163,10 @@ impl Server {
         let fill_offered = !matches!(backend, Backend::NoModel);
         let backend_note = backend.note();
         let runner = Arc::new(Runner::with_memory_limit(backend, options.max_queue, options.memory_limit)?);
+        // MG-08 review round 2: the handle gets the runner before the endpoint file exists, so a
+        // press that arrived while this start was still setting up cancels its jobs too.
+        handle.attach(&runner);
+        let stop_state = Arc::clone(&handle.state);
         let endpoint_path = options.endpoint_file.clone().or_else(endpoint::endpoint_file_from_env);
         if let Some(path) = endpoint_path.as_ref()
             && let Err(error) = endpoint::write(path, port, &token)
@@ -161,7 +174,6 @@ impl Server {
             runner.stop();
             return Err(error);
         }
-        let stop = Arc::new(AtomicBool::new(false));
         let context = Arc::new(Context {
             port,
             token: token.clone(),
@@ -172,15 +184,15 @@ impl Server {
             drain_timeout: options.drain_timeout,
             write_timeout: options.write_timeout,
             active: Mutex::new(Vec::new()),
-            stop: Arc::clone(&stop),
+            stop: Arc::clone(&stop_state.stop),
             runner: Arc::clone(&runner),
         });
-        let accept_stop = Arc::clone(&stop);
-        let handle = std::thread::Builder::new()
+        let accept_stop = Arc::clone(&stop_state.stop);
+        let accept = std::thread::Builder::new()
             .name("caim-accept".to_string())
             .spawn(move || accept_loop(listener, context, accept_stop, options.max_connections))
             .map_err(|error| Fail::internal(format!("Craft AI Manager could not start its listener thread: {error}")))?;
-        Ok(Server { port, token, endpoint_path, backend_note, stop, accept: Some(handle), runner })
+        Ok(Server { port, token, endpoint_path, backend_note, accept: Some(accept), runner, stop_state })
     }
 
     /// The port the operating system gave us.
@@ -211,13 +223,20 @@ impl Server {
     /// server itself.
     #[must_use]
     pub fn stop_signal(&self) -> Arc<AtomicBool> {
-        Arc::clone(&self.stop)
+        Arc::clone(&self.stop_state.stop)
     }
 
     /// Ask the server to stop; `Server::wait` then joins the threads.
     pub fn request_stop(&self) {
-        self.stop.store(true, Ordering::Relaxed);
+        self.stop_state.stop.store(true, Ordering::Relaxed);
         self.runner.request_stop();
+    }
+
+    /// The same stop as a handle the signal-handler thread can own (MG-08): the `ctrlc` closure has
+    /// to be `'static`, so it cannot borrow the server itself.
+    #[must_use]
+    pub fn stop_handle(&self) -> StopHandle {
+        StopHandle { state: Arc::clone(&self.stop_state) }
     }
 
     /// Wait for the accept loop and the job worker to finish.
@@ -236,6 +255,86 @@ impl Server {
             endpoint::remove(path, &self.token)?;
         }
         Ok(())
+    }
+}
+
+/// What one start owns for stopping: the flag the accept loop watches, the runner whose jobs get
+/// cancelled, and how often something has asked this start to stop.
+struct StopState {
+    stop: Arc<AtomicBool>,
+    pressed: Arc<AtomicBool>,
+    forced: Arc<AtomicBool>,
+    /// The runner of the start this stop belongs to. `Server::start_with_stop` fills it in, so a
+    /// handle made before that start has no jobs to cancel until the moment it does.
+    runner: Mutex<Option<Arc<Runner>>>,
+}
+
+/// The stop path that Enter, Ctrl+C and the tests share (MG-08). `Server::stop_handle` hands a copy
+/// to the signal handler, and `StopHandle::new` makes one before a server exists so the binary can
+/// install its Ctrl+C handler before the endpoint file says the start is ready. The first `press`
+/// asks the server to stop exactly as Enter does: the flag goes up so the accept loop stops taking
+/// connections, and every running or queued job is cancelled. A `press` after that one is a second
+/// Ctrl+C while the stop is still running: it reports true so the binary can end the process at
+/// once, and `forced` says so afterwards too.
+#[derive(Clone)]
+pub struct StopHandle {
+    state: Arc<StopState>,
+}
+
+impl Default for StopHandle {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl StopHandle {
+    /// A stop with no server yet, for a signal handler that has to be in place before the endpoint
+    /// file appears (MG-08 review round 2).
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            state: Arc::new(StopState {
+                stop: Arc::new(AtomicBool::new(false)),
+                pressed: Arc::new(AtomicBool::new(false)),
+                forced: Arc::new(AtomicBool::new(false)),
+                runner: Mutex::new(None),
+            }),
+        }
+    }
+
+    /// One press of Ctrl+C, Ctrl+Break, a console close, or SIGTERM. `false` means this was the
+    /// first press and the server is stopping; `true` means the process should leave now.
+    pub fn press(&self) -> bool {
+        if self.state.pressed.swap(true, Ordering::Relaxed) {
+            self.state.forced.store(true, Ordering::Relaxed);
+            return true;
+        }
+        self.state.stop.store(true, Ordering::Relaxed);
+        if let Some(runner) = self.state.runner.lock().unwrap_or_else(PoisonError::into_inner).as_ref() {
+            runner.request_stop();
+        }
+        false
+    }
+
+    /// True once a second press has cut a shutdown short.
+    #[must_use]
+    pub fn forced(&self) -> bool {
+        self.state.forced.load(Ordering::Relaxed)
+    }
+
+    /// The flag the accept loop watches, so the binary can watch stdin without owning the server.
+    #[must_use]
+    pub fn stop_signal(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.state.stop)
+    }
+
+    /// Give this stop the runner of the start it belongs to, and cancel that runner's jobs straight
+    /// away if something already asked this start to stop.
+    fn attach(&self, runner: &Arc<Runner>) {
+        *self.state.runner.lock().unwrap_or_else(PoisonError::into_inner) = Some(Arc::clone(runner));
+        if self.state.stop.load(Ordering::Relaxed) {
+            runner.request_stop();
+        }
     }
 }
 
@@ -580,7 +679,7 @@ pub const ENDPOINT_VARIABLE: &str = ENDPOINT_ENV;
 
 #[cfg(test)]
 mod tests {
-    use super::{Accept, Context, MAX_CONNECTIONS, READ_TIMEOUT, ServeOptions, Server, accept_loop, state_name};
+    use super::{Accept, Context, MAX_CONNECTIONS, READ_TIMEOUT, ServeOptions, Server, StopHandle, accept_loop, state_name};
     use crate::job::{Backend, MAX_QUEUE, Runner, State};
     use std::io::{ErrorKind, Read, Write};
     use std::net::{TcpListener, TcpStream};
@@ -674,5 +773,81 @@ mod tests {
         server.shutdown().expect("shutdown is clean");
         assert!(std::fs::metadata(&path).is_err(), "a clean shutdown removes the endpoint file");
         assert_eq!(state_name(State::Done), "done");
+    }
+
+    /// MG-08: the function a Ctrl+C calls, called directly instead of sending a real signal.
+    #[test]
+    fn one_press_cancels_the_running_and_queued_jobs_and_a_second_press_says_leave_now() {
+        let runner = Arc::new(Runner::new(Backend::Fake { step_delay: Duration::from_millis(40) }, MAX_QUEUE).expect("the worker starts"));
+        let running = runner.submit(tiny_frame(), tiny_mask()).expect("the first job is queued");
+        assert_eq!(settled(&runner, &running), State::Running, "the first job is inside the backend");
+        let queued = runner.submit(tiny_frame(), tiny_mask()).expect("the second job is queued");
+        let handle = StopHandle::new();
+        handle.attach(&runner);
+        assert!(!handle.press(), "the first press asks the server to stop");
+        assert!(handle.stop_signal().load(Ordering::Relaxed), "the accept loop is told to stop");
+        runner.stop();
+        for id in [&running, &queued] {
+            assert_eq!(runner.state(id).expect("the job is still known").0, State::Cancelled, "the Ctrl+C cancels it");
+        }
+        assert!(handle.press(), "a second press while the stop is still running says leave now");
+        assert!(handle.forced(), "and it still says so afterwards");
+        assert!(handle.press(), "a third press says the same");
+    }
+
+    /// MG-08: the same stop path through a real server, called twice, so a second Ctrl+C that
+    /// arrives after the endpoint file is already gone cannot fail the shutdown or leave it behind.
+    #[test]
+    fn the_signal_stop_removes_the_endpoint_file_and_survives_being_called_twice() {
+        let path = temp_endpoint("signal");
+        let _ = std::fs::remove_file(&path);
+        let mut server =
+            Server::start(ServeOptions { fake_backend: true, endpoint_file: Some(path.clone()), ..ServeOptions::default() }).expect("the server starts");
+        let handle = server.stop_handle();
+        assert!(!handle.press(), "the first press asks the server to stop");
+        server.shutdown().expect("the stop a Ctrl+C asked for is clean");
+        assert!(std::fs::metadata(&path).is_err(), "the endpoint file goes away");
+        assert!(handle.press(), "a press after that is a second Ctrl+C, so it says leave now");
+        server.shutdown().expect("shutting down twice is fine");
+        assert!(std::fs::metadata(&path).is_err(), "and the file stays gone");
+    }
+
+    /// MG-08 review round 2: the binary installs its Ctrl+C handler before the endpoint file
+    /// exists, so a press can arrive before the server does. That press still stops the start, and
+    /// the start still leaves no endpoint file behind.
+    #[test]
+    fn a_press_before_the_server_exists_stops_that_start_as_soon_as_it_is_ready() {
+        let path = temp_endpoint("early");
+        let _ = std::fs::remove_file(&path);
+        let handle = StopHandle::new();
+        assert!(!handle.press(), "the press that arrives before the server asks it to stop");
+        let mut server = Server::start_with_stop(ServeOptions { fake_backend: true, endpoint_file: Some(path.clone()), ..ServeOptions::default() }, &handle)
+            .expect("the server starts");
+        assert!(std::fs::metadata(&path).is_ok(), "the endpoint file is written while the stop is already up");
+        server.wait();
+        assert!(!handle.forced(), "one press is one stop, so nothing was forced");
+        server.shutdown().expect("the stop that arrived early is still clean");
+        assert!(std::fs::metadata(&path).is_err(), "and the endpoint file goes away");
+    }
+
+    fn tiny_frame() -> crate::image::Frame {
+        crate::image::Frame { width: 2, height: 2, channels: 3, bit_depth: 8, samples: vec![10, 20, 30, 200, 100, 50, 40, 60, 80, 90, 20, 10] }
+    }
+
+    fn tiny_mask() -> Vec<u8> {
+        vec![255, 0, 0, 0]
+    }
+
+    /// Wait for a job to start or finish, without spinning forever if it never does.
+    fn settled(runner: &Runner, id: &str) -> State {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while std::time::Instant::now() < deadline {
+            let (state, _, _) = runner.state(id).expect("the job exists");
+            if state.is_finished() || state == State::Running {
+                return state;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("the job never started or finished");
     }
 }

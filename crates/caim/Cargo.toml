@@ -19,6 +19,10 @@ workspace = true
 # side and the same rule here): no async runtime, no web framework, no multipart crate. The HTTP
 # framing, the multipart parser and the job queue are ours, and every one of them is bounded.
 [dependencies]
+# MG-08: Ctrl+C, Ctrl+Break and a console close on Windows, and SIGINT, SIGTERM and SIGHUP on
+# Unix, stop the server the way Enter does. MIT / Apache-2.0, so it is inside the deny.toml gate.
+# `termination` is what adds SIGTERM and SIGHUP to the signals the handler sees.
+ctrlc = { version = "3.5.2", features = ["termination"] }
 getrandom = "0.4"
 httparse = "1.10"
 # MG-04: the real LaMa runner. `ort` 2.x with its default features, which download a prebuilt ONNX
