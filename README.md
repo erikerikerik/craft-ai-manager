@@ -27,11 +27,9 @@ colour fill - is still there behind `--fake-backend`; since BF-01 it follows the
 ```text
 caim                        # the same as: caim serve
 caim serve --fake-backend   # jobs run on the built-in mean-colour fill
-caim models list            # what the catalog offers, what is installed, and what it costs on disk
+caim models list            # what the catalog offers, and what is installed
 caim models install <id>    # download one model, hashing it while it arrives
 caim models verify <id>     # re-hash an installed model against the catalog
-caim models remove <id>     # delete one model's installed files (refused while a manager is running)
-caim models where           # the models folder this run uses
 caim --version
 ```
 
@@ -139,10 +137,13 @@ milliseconds the run took.
 
 ### Stopping it
 
-Press Enter in the terminal: that stops the server cleanly and removes `endpoint.json`. Ctrl+C stops the process too,
-but MG-01 adds no dependency and `std` has no signal handler, so on Windows Ctrl+C ends the process where it stands
-and leaves the file behind. That is safe - a client that reads a stale file gets a refused connection and re-reads
-it, and the next start replaces the file - but Enter is the clean stop.
+Press Enter or Ctrl+C: either one stops the server cleanly - the job that is running and any queued
+one are cancelled, the listener closes, and `endpoint.json` goes away. MG-08 added a signal handler
+(`ctrlc`), so Ctrl+C now does what Enter does: Ctrl+C and Ctrl+Break on Windows, a console close or
+logoff there too, and SIGINT, SIGTERM and SIGHUP on Linux and macOS. A second Ctrl+C while a
+shutdown is still running ends the process at once with exit code 1, and the endpoint file may then
+still be there. That stays safe: a client that reads a stale file gets a refused connection, and the
+next start replaces it.
 
 ## Models
 
@@ -158,8 +159,6 @@ caim models list                        # task, size, licences, and whether it i
 caim models install lama                # download it, hashing while it arrives
 caim models install lama --accept-note  # accept a flagged model's note first, then download
 caim models verify lama                 # re-hash the file on disk (startup does not)
-caim models remove lama                 # delete lama's installed files (refused while a manager answers)
-caim models where                       # the models folder this run uses, and what named it
 ```
 
 Models live in the same data directory as `endpoint.json`:
@@ -176,22 +175,6 @@ A model counts as **installed** only when three things agree: the file is there,
 a `verified.json` - written only after a successful SHA-256 check - names the same hash. Startup never re-hashes a
 200 MB file; `caim models verify <id>` does, and a failed check removes the record so the model stops counting as
 installed until it is downloaded again.
-
-`caim models list` ends every model line with the bytes that model's folder holds (`on disk: 208044816 bytes`) and adds
-one last line with the total for the whole models folder and the folder's own path. `caim models where` prints that
-folder and says what named it: `CRAFT_AI_MODELS` when that is set, the default data folder otherwise. A models folder
-whose tree is deeper or broader than the walk can count is named as too many folders rather than shown as zero, and so
-is one where a link sits in place of the models folder or of a model's own folder: the bytes on the other side of a
-link are never counted, because they are not in the models folder.
-
-`caim models remove <id>` deletes `<id>\<version>\`: the model file, `verified.json`, `acknowledged.json`, and any
-`.part` or `.lock` an interrupted install left behind. When that was the model's last version, the now empty `<id>`
-folder goes with it. It asks no questions, because the command is already explicit. It refuses while a manager is
-running: the endpoint file names a port, and a connection to that port answers, so the model may be in use. A file left
-behind by a manager that died does not refuse, because the port is asked as well. What it deletes is always
-`<models folder>\<id>\<version>` - the catalog gate refuses names that cannot be folder names, the removal asks the
-same question again before it touches the disk, and a link in place of the models folder or of either model folder is
-refused rather than followed.
 
 A download goes to `<file>.part` in the same folder and is hashed as it streams. A server whose `Content-Length`, or
 whose bytes read, go past the catalog's `size` is refused; a hash or size mismatch deletes the `.part` file and names

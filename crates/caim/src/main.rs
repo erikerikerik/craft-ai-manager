@@ -10,6 +10,7 @@ use std::io::Write;
 
 use craft_ai_manager::error::{Fail, Status};
 use craft_ai_manager::models;
+use craft_ai_manager::server::StopHandle;
 use craft_ai_manager::{Action, EXIT_FAILED, EXIT_MODEL, EXIT_USAGE, ServeOptions, Server, USAGE, VERSION, classify};
 
 fn main() -> std::process::ExitCode {
@@ -32,8 +33,6 @@ fn main() -> std::process::ExitCode {
         Ok(Action::ModelsList) => models_list(),
         Ok(Action::ModelsInstall { id, accept_note }) => models_install(&id, accept_note),
         Ok(Action::ModelsVerify { id }) => models_verify(&id),
-        Ok(Action::ModelsRemove { id }) => models_remove(&id),
-        Ok(Action::ModelsWhere) => models_where(),
     }
 }
 
@@ -46,8 +45,6 @@ fn help() {
     println!("  models install    download one model, hashing it while it arrives");
     println!("  --accept-note     accept a flagged model's licence note and go ahead with the download");
     println!("  models verify     re-hash an installed model against the catalog");
-    println!("  models remove     delete one model's files from disk (refused while a manager is running)");
-    println!("  models where      print the models folder");
     println!("exit codes: 0 everything is fine, 1 something went wrong, 2 the arguments do not make sense,");
     println!("            3 the model is unknown, is not installed, or its note needs acknowledging");
     println!("Craft AI Manager {VERSION}: https://github.com/erikerikerik/craft-ai-manager");
@@ -67,8 +64,13 @@ fn serve(fake_backend: bool) -> std::process::ExitCode {
     }
     println!("backend: {}", server.backend_note());
     if std::io::stdin().is_terminal() {
-        println!("press Enter to stop cleanly. Ctrl+C works too, but on Windows it ends the process where it stands and leaves the endpoint file behind.");
+        println!("press Enter or Ctrl+C to stop cleanly. A second Ctrl+C leaves at once.");
         watch_stdin(server.stop_signal());
+    }
+    if let Err(fail) = watch_signals(server.stop_handle()) {
+        // A machine that will not take the handler still stops on Enter, and `Server::drop` still
+        // removes the endpoint file, so this is a note rather than a reason not to run.
+        eprintln!("{}", fail.sentence);
     }
     server.wait();
     match server.shutdown() {
@@ -77,11 +79,13 @@ fn serve(fake_backend: bool) -> std::process::ExitCode {
     }
 }
 
-/// `caim models list`: one line per catalog entry with the bytes it holds on disk, then the total
-/// for the models folder beside the folder itself.
+/// `caim models list`: one line per catalog entry, then the state of each on disk.
 fn models_list() -> std::process::ExitCode {
     match models::list() {
         Ok(lines) => {
+            if lines.is_empty() {
+                println!("The model catalog has no entries.");
+            }
             for line in lines {
                 println!("{line}");
             }
@@ -108,29 +112,6 @@ fn models_install(id: &str, accept_note: bool) -> std::process::ExitCode {
 /// `caim models verify <id>`: re-hash the file on disk against the catalog.
 fn models_verify(id: &str) -> std::process::ExitCode {
     match models::verify(id) {
-        Ok(message) => {
-            println!("{message}");
-            std::process::ExitCode::SUCCESS
-        }
-        Err(fail) => report(fail),
-    }
-}
-
-/// `caim models remove <id>`: delete one model's files. Refused while a manager is listening,
-/// because that manager may be using the model.
-fn models_remove(id: &str) -> std::process::ExitCode {
-    match models::remove(id) {
-        Ok(message) => {
-            println!("{message}");
-            std::process::ExitCode::SUCCESS
-        }
-        Err(fail) => report(fail),
-    }
-}
-
-/// `caim models where`: the models folder, and nothing else.
-fn models_where() -> std::process::ExitCode {
-    match models::where_folder() {
         Ok(message) => {
             println!("{message}");
             std::process::ExitCode::SUCCESS
@@ -179,11 +160,9 @@ impl Progress {
     }
 }
 
-/// A Ctrl+C on Windows ends the process where it stands, which would leave the endpoint file
-/// behind, so when stdin is a terminal Enter stops the server properly instead. A stale file is
-/// harmless - a client sees a refused connection, and the next start replaces it - but this way the
-/// shutdown is clean and the file goes away. There is no signal handler in `std`, and MG-01 adds no
-/// dependency for one.
+/// Enter on a terminal asks the server to stop. MG-08 added a signal handler, so Ctrl+C does the
+/// same thing now; this stays because it also works where a signal cannot be delivered, and because
+/// the Enter behaviour is documented and people use it.
 fn watch_stdin(stop: std::sync::Arc<std::sync::atomic::AtomicBool>) {
     let _ = std::thread::Builder::new().name("caim-stdin".to_string()).spawn(move || {
         let mut line = String::new();
@@ -191,4 +170,17 @@ fn watch_stdin(stop: std::sync::Arc<std::sync::atomic::AtomicBool>) {
             stop.store(true, std::sync::atomic::Ordering::Relaxed);
         }
     });
+}
+
+/// MG-08: Ctrl+C, Ctrl+Break and a console close on Windows, and SIGINT, SIGTERM and SIGHUP
+/// elsewhere, stop the server exactly as Enter does. A second press while that stop is still
+/// running ends the process at once with a non-zero code, which is what someone pressing Ctrl+C
+/// again expects. `StopHandle::press` is the part the tests call directly; this is only the wiring.
+fn watch_signals(handle: StopHandle) -> Result<(), Fail> {
+    ctrlc::set_handler(move || {
+        if handle.press() {
+            std::process::exit(i32::from(EXIT_FAILED));
+        }
+    })
+    .map_err(|error| Fail::internal(format!("Craft AI Manager could not watch for Ctrl+C: {error}")))
 }

@@ -134,6 +134,10 @@ pub struct Server {
     stop: Arc<AtomicBool>,
     accept: Option<JoinHandle<()>>,
     runner: Arc<Runner>,
+    /// MG-08: how often something has asked this start to stop, and whether a second ask cut a
+    /// shutdown short. Shared with every `StopHandle` this server hands out.
+    pressed: Arc<AtomicBool>,
+    forced: Arc<AtomicBool>,
 }
 
 impl Server {
@@ -162,6 +166,8 @@ impl Server {
             return Err(error);
         }
         let stop = Arc::new(AtomicBool::new(false));
+        let pressed = Arc::new(AtomicBool::new(false));
+        let forced = Arc::new(AtomicBool::new(false));
         let context = Arc::new(Context {
             port,
             token: token.clone(),
@@ -180,7 +186,7 @@ impl Server {
             .name("caim-accept".to_string())
             .spawn(move || accept_loop(listener, context, accept_stop, options.max_connections))
             .map_err(|error| Fail::internal(format!("Craft AI Manager could not start its listener thread: {error}")))?;
-        Ok(Server { port, token, endpoint_path, backend_note, stop, accept: Some(handle), runner })
+        Ok(Server { port, token, endpoint_path, backend_note, stop, accept: Some(handle), runner, pressed: Arc::clone(&pressed), forced: Arc::clone(&forced) })
     }
 
     /// The port the operating system gave us.
@@ -220,6 +226,13 @@ impl Server {
         self.runner.request_stop();
     }
 
+    /// The same stop as a handle the signal-handler thread can own (MG-08): the `ctrlc` closure has
+    /// to be `'static`, so it cannot borrow the server itself.
+    #[must_use]
+    pub fn stop_handle(&self) -> StopHandle {
+        StopHandle { stop: Arc::clone(&self.stop), runner: Arc::clone(&self.runner), pressed: Arc::clone(&self.pressed), forced: Arc::clone(&self.forced) }
+    }
+
     /// Wait for the accept loop and the job worker to finish.
     pub fn wait(&mut self) {
         if let Some(handle) = self.accept.take() {
@@ -236,6 +249,39 @@ impl Server {
             endpoint::remove(path, &self.token)?;
         }
         Ok(())
+    }
+}
+
+/// The stop path that Enter, Ctrl+C and the tests share (MG-08). `Server::stop_handle` hands a copy
+/// to the signal handler. The first `press` asks the server to stop exactly as Enter does: the flag
+/// goes up so the accept loop stops taking connections, and every running or queued job is
+/// cancelled. A `press` after that one is a second Ctrl+C while the stop is still running: it
+/// reports true so the binary can end the process at once, and `forced` says so afterwards too.
+#[derive(Clone)]
+pub struct StopHandle {
+    stop: Arc<AtomicBool>,
+    runner: Arc<Runner>,
+    pressed: Arc<AtomicBool>,
+    forced: Arc<AtomicBool>,
+}
+
+impl StopHandle {
+    /// One press of Ctrl+C, Ctrl+Break, a console close, or SIGTERM. `false` means this was the
+    /// first press and the server is stopping; `true` means the process should leave now.
+    pub fn press(&self) -> bool {
+        if self.pressed.swap(true, Ordering::Relaxed) {
+            self.forced.store(true, Ordering::Relaxed);
+            return true;
+        }
+        self.stop.store(true, Ordering::Relaxed);
+        self.runner.request_stop();
+        false
+    }
+
+    /// True once a second press has cut a shutdown short.
+    #[must_use]
+    pub fn forced(&self) -> bool {
+        self.forced.load(Ordering::Relaxed)
     }
 }
 
@@ -580,7 +626,7 @@ pub const ENDPOINT_VARIABLE: &str = ENDPOINT_ENV;
 
 #[cfg(test)]
 mod tests {
-    use super::{Accept, Context, MAX_CONNECTIONS, READ_TIMEOUT, ServeOptions, Server, accept_loop, state_name};
+    use super::{Accept, Context, MAX_CONNECTIONS, READ_TIMEOUT, ServeOptions, Server, StopHandle, accept_loop, state_name};
     use crate::job::{Backend, MAX_QUEUE, Runner, State};
     use std::io::{ErrorKind, Read, Write};
     use std::net::{TcpListener, TcpStream};
@@ -674,5 +720,67 @@ mod tests {
         server.shutdown().expect("shutdown is clean");
         assert!(std::fs::metadata(&path).is_err(), "a clean shutdown removes the endpoint file");
         assert_eq!(state_name(State::Done), "done");
+    }
+
+    /// MG-08: the function a Ctrl+C calls, called directly instead of sending a real signal.
+    #[test]
+    fn one_press_cancels_the_running_and_queued_jobs_and_a_second_press_says_leave_now() {
+        let runner = Arc::new(Runner::new(Backend::Fake { step_delay: Duration::from_millis(40) }, MAX_QUEUE).expect("the worker starts"));
+        let running = runner.submit(tiny_frame(), tiny_mask()).expect("the first job is queued");
+        assert_eq!(settled(&runner, &running), State::Running, "the first job is inside the backend");
+        let queued = runner.submit(tiny_frame(), tiny_mask()).expect("the second job is queued");
+        let handle = StopHandle {
+            stop: Arc::new(AtomicBool::new(false)),
+            runner: Arc::clone(&runner),
+            pressed: Arc::new(AtomicBool::new(false)),
+            forced: Arc::new(AtomicBool::new(false)),
+        };
+        assert!(!handle.press(), "the first press asks the server to stop");
+        assert!(handle.stop.load(Ordering::Relaxed), "the accept loop is told to stop");
+        runner.stop();
+        for id in [&running, &queued] {
+            assert_eq!(runner.state(id).expect("the job is still known").0, State::Cancelled, "the Ctrl+C cancels it");
+        }
+        assert!(handle.press(), "a second press while the stop is still running says leave now");
+        assert!(handle.forced(), "and it still says so afterwards");
+        assert!(handle.press(), "a third press says the same");
+    }
+
+    /// MG-08: the same stop path through a real server, called twice, so a second Ctrl+C that
+    /// arrives after the endpoint file is already gone cannot fail the shutdown or leave it behind.
+    #[test]
+    fn the_signal_stop_removes_the_endpoint_file_and_survives_being_called_twice() {
+        let path = temp_endpoint("signal");
+        let _ = std::fs::remove_file(&path);
+        let mut server =
+            Server::start(ServeOptions { fake_backend: true, endpoint_file: Some(path.clone()), ..ServeOptions::default() }).expect("the server starts");
+        let handle = server.stop_handle();
+        assert!(!handle.press(), "the first press asks the server to stop");
+        server.shutdown().expect("the stop a Ctrl+C asked for is clean");
+        assert!(std::fs::metadata(&path).is_err(), "the endpoint file goes away");
+        assert!(handle.press(), "a press after that is a second Ctrl+C, so it says leave now");
+        server.shutdown().expect("shutting down twice is fine");
+        assert!(std::fs::metadata(&path).is_err(), "and the file stays gone");
+    }
+
+    fn tiny_frame() -> crate::image::Frame {
+        crate::image::Frame { width: 2, height: 2, channels: 3, bit_depth: 8, samples: vec![10, 20, 30, 200, 100, 50, 40, 60, 80, 90, 20, 10] }
+    }
+
+    fn tiny_mask() -> Vec<u8> {
+        vec![255, 0, 0, 0]
+    }
+
+    /// Wait for a job to start or finish, without spinning forever if it never does.
+    fn settled(runner: &Runner, id: &str) -> State {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while std::time::Instant::now() < deadline {
+            let (state, _, _) = runner.state(id).expect("the job exists");
+            if state.is_finished() || state == State::Running {
+                return state;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("the job never started or finished");
     }
 }
