@@ -32,6 +32,13 @@ allow = [
 ]
 confidence-threshold = 0.9
 
+# The one crate this repo owns is PolyForm Noncommercial (LICENSE.md), which the rule above
+# deliberately does not allow for third-party code. An exception is scoped to that crate by name,
+# so a dependency carrying the same licence still fails the gate.
+[[licenses.exceptions]]
+name = "craft-ai-manager"
+allow = ["PolyForm-Noncommercial-1.0.0"]
+
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
