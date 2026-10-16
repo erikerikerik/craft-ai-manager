@@ -2,7 +2,7 @@
 
 ## 2026-10-15 (late): Codex-Strata (autopilot) - PC-06 Part A: a real golden photo
 
-- Branch `ai/pc-06-golden-photo` from `main` `7dd46c8`, commit `44748aa`; PR opened with `gh pr create --repo erikerikerik/craft-ai-manager --base main`. Fixtures and `golden.rs` only - no product code, no new dependencies.
+- Branch `ai/pc-06-golden-photo` from `main` `7dd46c8`, commit `44748aa`; **PR #3** against `main`. Fixtures and `golden.rs` only - no product code, no new dependencies.
 - `crates/caim/tests/fixtures/` now holds Wikimedia Commons "Orange buoy in water.jpg" by W.carter, **CC0 1.0** (licence read from the file page and confirmed through the Commons `extmetadata` API), cropped to 3283x3283 and resized to 448x448 (288,217 bytes, inside the 768 px / 300 KB limits), a hand-made soft-edged mask over the buoy, its handle and its reflection, and a fresh `expected.png` from a LaMa run that was looked at and judged a good removal. `SOURCE.md` records the URL, author, licence, dates and the exact mask recipe; `golden.rs` reads the side length from one const.
 - `cargo test --test golden -- --ignored --nocapture`: 1 passed in 10.3 s - "141018 pixels outside the mask are identical; inside, 0.000 levels a channel from the committed answer, and the masked area moved from 65.6 to 23.1 away from the background colour".
 - Clean networked build for the run: deleted `target/agent-local`, left `ORT_LIB_PATH` unset so `ort` fetched its own onnxruntime, rebuilt, and started `caim serve` from that build for PhotoCraft's PC-06 end-to-end (first fill 9.3 s of provider time including the model load, second 2.2 s).
