@@ -18,6 +18,9 @@ const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
 const TOLERANCE: f64 = 2.0;
 /// How wide the band of untouched pixels around the mask is, used as the surrounding background.
 const RING: usize = 12;
+/// The committed fixture is square: 448x448. `lama::dilate` only works on a square plane, so the
+/// photo is a square crop of the original rather than the full landscape.
+const SIDE: u32 = 448;
 
 fn fixture(name: &str) -> PathBuf {
     Path::new(FIXTURES).join(name)
@@ -35,14 +38,14 @@ fn lama_takes_the_object_out_and_leaves_the_rest_alone() {
     let input_bytes = std::fs::read(&input).expect("the fixture image is committed");
     let expected_bytes = std::fs::read(&expected).expect("the committed answer is there");
     let mask_bytes = std::fs::read(fixture("mask.png")).expect("the fixture mask is committed");
-    let frame = image::decode_image(&input_bytes, 256, 256, 3, 8).expect("the fixture image is 8-bit RGB");
-    let mask = image::decode_mask(&mask_bytes, 256, 256).expect("the fixture mask is 8-bit grayscale");
+    let frame = image::decode_image(&input_bytes, SIDE, SIDE, 3, 8).expect("the fixture image is 8-bit RGB");
+    let mask = image::decode_mask(&mask_bytes, SIDE, SIDE).expect("the fixture mask is 8-bit grayscale");
     let root = store::models_dir().expect("CRAFT_AI_MODELS or the platform model folder");
     let pipeline = lama::ready_pipeline_in(Some(&root)).expect("install LaMa first: caim models install lama --accept-note");
     let filled = pipeline.run_fill(&frame, &mask, &AtomicBool::new(false), &mut |_, _| {}).expect("the model runs");
 
     // Same size, channels and depth as the image that went in.
-    assert_eq!((filled.frame.width, filled.frame.height), (256, 256), "the answer is the same size");
+    assert_eq!((filled.frame.width, filled.frame.height), (SIDE, SIDE), "the answer is the same size");
     assert_eq!((filled.frame.channels, filled.frame.bit_depth), (3, 8), "and the same shape");
     assert_eq!((filled.model, filled.device, filled.provider), ("lama", "cpu", "local"), "the provenance is the real model");
 
@@ -59,7 +62,7 @@ fn lama_takes_the_object_out_and_leaves_the_rest_alone() {
     assert!(outside > 0, "the fixture mask does not cover the whole image");
 
     // Inside the mask the answer is the committed one, to within two levels a channel.
-    let answer = image::decode_image(&expected_bytes, 256, 256, 3, 8).expect("the committed answer is 8-bit RGB");
+    let answer = image::decode_image(&expected_bytes, SIDE, SIDE, 3, 8).expect("the committed answer is 8-bit RGB");
     let mut total = 0.0f64;
     let mut inside = 0usize;
     for (pixel, &covered) in mask.iter().enumerate() {
@@ -78,7 +81,7 @@ fn lama_takes_the_object_out_and_leaves_the_rest_alone() {
     // And the object really is gone: the masked area is closer to the background around it than
     // the object used to be.
     let plane: Vec<f32> = mask.iter().map(|sample| f32::from(*sample) / 255.0).collect();
-    let ring = lama::dilate(&plane, 256, RING);
+    let ring = lama::dilate(&plane, SIDE as usize, RING);
     let mut colour = [0.0f64; 3];
     let mut around = 0usize;
     for (pixel, &covered) in mask.iter().enumerate() {
