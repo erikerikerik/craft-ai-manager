@@ -34,6 +34,11 @@ const PART_SUFFIX: &str = ".part";
 const LOCK_SUFFIX: &str = ".lock";
 /// How much is hashed at a time, so a 200 MB file never sits in memory.
 const HASH_CHUNK: usize = 64 * 1024;
+/// How deep [folder_usage] will walk. A models folder is two deep (`<id>/<version>`), so this is a
+/// wall against a tree built to exhaust memory, not a limit a real store comes near.
+const MAX_WALK_DEPTH: usize = 16;
+/// How many folders [folder_usage] holds at once, for the same reason.
+const MAX_WALK_FOLDERS: usize = 4_096;
 
 /// The models folder: `CRAFT_AI_MODELS` when it names one, otherwise the default. `None` when the
 /// platform has nowhere to put files at all.
@@ -43,11 +48,14 @@ pub fn models_dir() -> Option<PathBuf> {
 }
 
 /// The same decision with the two inputs handed over, so it can be tested without changing the
-/// environment of a running process.
+/// environment of a running process. The folder the environment names is normalised first: a
+/// trailing separator (`CRAFT_AI_MODELS=/store/models/`) would otherwise let a link called `models`
+/// hide from every `is_link` check that follows, because the filesystem then answers about the folder
+/// on the far side of the link rather than about the link.
 #[must_use]
 pub fn models_dir_in(named: Option<std::ffi::OsString>, data_dir: Option<PathBuf>) -> Option<PathBuf> {
     match named {
-        Some(value) if !value.is_empty() => Some(PathBuf::from(value)),
+        Some(value) if !value.is_empty() => Some(without_trailing_separators(&PathBuf::from(value))),
         _ => data_dir.map(|dir| dir.join(MODELS_DIR)),
     }
 }
@@ -187,6 +195,75 @@ pub fn write_acknowledgement(root: &Path, model: &Model) -> Result<()> {
     std::fs::write(&path, body).map_err(|error| Fail::internal(format!("Craft AI Manager could not write {}: {error}", path.display())))
 }
 
+/// What a folder holds on disk: the bytes of its regular files, and how many files that is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Usage {
+    /// Bytes in regular files, counting subfolders.
+    pub bytes: u64,
+    /// How many regular files those bytes came from.
+    pub files: u64,
+}
+
+/// The path in the shape the link checks below can trust: any trailing separator is dropped. A
+/// trailing slash asks the filesystem for a directory, so `symlink_metadata("/store/models/")` answers
+/// about the folder a link called `models` points at rather than the link itself, and the link would
+/// slip past every check that follows. Rebuilding from [Path::components] folds doubled separators and
+/// `.` steps too, and leaves a root (`/`, `C:\`) and an empty path exactly as they are.
+#[must_use]
+fn without_trailing_separators(path: &Path) -> PathBuf {
+    path.components().collect()
+}
+
+/// True when the path is there but is a link rather than the folder itself. [folder_usage] refuses
+/// such a path, and the callers use this to say why nothing was counted rather than asking
+/// `Path::is_dir`, which follows the link and answers about the folder on the other side of it. The
+/// path is looked at as it is spelled, less any trailing separator - see [without_trailing_separators].
+#[must_use]
+pub fn is_link(path: &Path) -> bool {
+    std::fs::symlink_metadata(without_trailing_separators(path)).is_ok_and(|metadata| metadata.file_type().is_symlink())
+}
+
+/// Add up the files under a folder. `None` when the folder is not there, when a link sits in its
+/// place, and `None` when the tree is deeper or broader than the two caps above - a tree no model
+/// folder has, and the caller is then asked to say it could not count rather than report a number it
+/// did not finish computing. A folder that cannot be read adds nothing rather than failing the
+/// count, and no link is followed: the folder handed in is refused as it is spelled, a trailing
+/// separator included (see [without_trailing_separators]), and a link found inside the walk is
+/// skipped, so this never walks outside the folder it was handed.
+#[must_use]
+pub fn folder_usage(path: &Path) -> Option<Usage> {
+    // read_dir follows a link, so the folder handed in is read as it really sits on disk: a link
+    // here would walk a tree that is not inside the models folder at all. The same is true of a
+    // trailing separator, which makes the filesystem answer about the far side of the link.
+    let start = without_trailing_separators(path);
+    let Ok(metadata) = std::fs::symlink_metadata(&start) else { return None };
+    if !metadata.is_dir() {
+        return None;
+    }
+    let mut usage = Usage { bytes: 0, files: 0 };
+    // The depth travels with the folder rather than with the shape of the stack, so the cap holds
+    // however the folders come back out.
+    let mut folders = vec![(start, 0usize)];
+    while let Some((folder, depth)) = folders.pop() {
+        let Ok(entries) = std::fs::read_dir(&folder) else { continue };
+        for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else { continue };
+            if kind.is_dir() {
+                if depth >= MAX_WALK_DEPTH || folders.len() >= MAX_WALK_FOLDERS {
+                    return None;
+                }
+                folders.push((entry.path(), depth + 1));
+            } else if kind.is_file()
+                && let Ok(file) = entry.metadata()
+            {
+                usage.bytes = usage.bytes.saturating_add(file.len());
+                usage.files = usage.files.saturating_add(1);
+            }
+        }
+    }
+    Some(usage)
+}
+
 /// Hash a file that is already on disk, in chunks.
 pub fn hash_file(path: &Path) -> Result<String> {
     let mut file = std::fs::File::open(path).map_err(|error| Fail::internal(format!("Craft AI Manager could not open {}: {error}", path.display())))?;
@@ -241,7 +318,7 @@ mod tests {
     use crate::testkit::{Scratch, test_model};
 
     use super::{
-        Acknowledgement, MODELS_DIR, VERIFIED_NAME, hash_file, is_acknowledged, is_installed, model_file, model_folder, models_dir_in, part_file,
+        Acknowledgement, MODELS_DIR, VERIFIED_NAME, folder_usage, hash_file, is_acknowledged, is_installed, model_file, model_folder, models_dir_in, part_file,
         read_verified, remove_verified, sha256_hex, verified_file, write_acknowledgement, write_verified,
     };
 
@@ -345,6 +422,11 @@ mod tests {
     fn the_models_folder_follows_the_environment_then_the_data_dir() {
         let data = PathBuf::from("data");
         assert_eq!(models_dir_in(Some(OsString::from("elsewhere")), Some(data.clone())), Some(PathBuf::from("elsewhere")), "CRAFT_AI_MODELS wins");
+        assert_eq!(
+            models_dir_in(Some(OsString::from("elsewhere/")), Some(data.clone())),
+            Some(PathBuf::from("elsewhere")),
+            "a trailing separator is dropped, so a link cannot hide behind one"
+        );
         assert_eq!(models_dir_in(None, Some(data.clone())), Some(data.join(MODELS_DIR)), "otherwise it sits in the data dir");
         assert_eq!(models_dir_in(Some(OsString::new()), Some(data.clone())), Some(data.join(MODELS_DIR)), "an empty override is not a folder");
         assert_eq!(models_dir_in(None, None), None, "and a platform with no data dir has no models folder");
@@ -363,5 +445,51 @@ mod tests {
         assert!(!super::is_part_name(&entry, "lama_fp32.onnx") && !super::is_part_name(&entry, "lama_fp32.onnx.lock"));
         assert!(!super::is_part_name(&entry, "other.onnx.a1b2.part") && !super::is_part_name(&entry, "lama_fp32.onnxx.part"));
         assert_eq!(verified_file(&scratch.path, &entry).parent(), file.parent());
+    }
+
+    #[test]
+    fn folder_usage_adds_up_a_folder_and_refuses_a_missing_one() {
+        let scratch = Scratch::new("store-usage");
+        assert_eq!(folder_usage(&scratch.path.join("models")), None, "a folder that is not there has no usage");
+        let entry = test_model(FIXTURE, None);
+        let version = model_folder(&scratch.path, &entry);
+        std::fs::create_dir_all(&version).expect("the model folder can be made");
+        let file = model_file(&scratch.path, &entry);
+        std::fs::write(&file, FIXTURE).expect("the model file can be written");
+        assert_eq!(folder_usage(&file), None, "a file is not a folder");
+        write_verified(&scratch.path, &entry, &entry.sha256, entry.size).expect("the record can be written");
+        let record = std::fs::metadata(verified_file(&scratch.path, &entry)).expect("the record can be checked");
+        let usage = folder_usage(&version).expect("the version folder can be counted");
+        assert_eq!(usage.files, 2, "the model file and its record are both counted");
+        assert_eq!(usage.bytes, FIXTURE.len() as u64 + record.len(), "and so are their bytes");
+        assert_eq!(folder_usage(version.parent().expect("the id folder is there")), Some(usage), "the id folder counts the same two");
+        assert_eq!(folder_usage(&scratch.path), Some(usage), "and so does the models folder itself");
+        let deep = scratch.path.join("deep");
+        let mut leaf = deep.clone();
+        for _ in 0..super::MAX_WALK_DEPTH + 1 {
+            leaf = leaf.join("next");
+        }
+        std::fs::create_dir_all(&leaf).expect("a tree past the depth cap can be made");
+        assert_eq!(folder_usage(&deep), None, "a tree past the depth cap is refused rather than counted");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn folder_usage_refuses_a_link_handed_in_as_the_folder() {
+        let scratch = Scratch::new("store-usage-link");
+        let real = scratch.path.join("real");
+        std::fs::create_dir_all(&real).expect("the folder the link points at can be made");
+        std::fs::write(real.join("keep.onnx"), "keep these bytes").expect("a file outside the store can be written");
+        let linked = scratch.path.join("models");
+        std::os::unix::fs::symlink(&real, &linked).expect("the link can be made");
+        assert!(!folder_usage(&linked).is_some_and(|usage| usage.files > 0), "a link is not a folder to walk: {:?}", folder_usage(&linked));
+        assert!(super::is_link(&linked), "and the caller can say why nothing was counted");
+        assert!(!super::is_link(&real), "the folder on the other side of the link is a folder");
+        // The same folder spelled with a trailing separator, which is how a shell or a config file
+        // tends to write it. Asked about like that, the filesystem answers about `real` rather than
+        // about the link, which is how a link slipped past the guard in round 3.
+        let with_a_slash = PathBuf::from(format!("{}/", linked.display()));
+        assert!(super::is_link(&with_a_slash), "a trailing separator does not hide the link: {}", with_a_slash.display());
+        assert!(!folder_usage(&with_a_slash).is_some_and(|usage| usage.files > 0), "and the walk refuses it too: {:?}", folder_usage(&with_a_slash));
     }
 }

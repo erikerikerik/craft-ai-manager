@@ -358,7 +358,7 @@ fn is_sha256(text: &str) -> bool {
 /// Whether a catalog name is safe to use as one folder or file name. A bad entry must not be able to
 /// point the store outside `models\\<id>\\<version>\\`.
 #[must_use]
-fn is_name(text: &str) -> bool {
+pub(crate) fn is_name(text: &str) -> bool {
     !text.is_empty() && text != "." && text != ".." && !text.contains(['/', '\\', ':', '*', '?', '"', '<', '>', '|']) && !text.chars().any(char::is_control)
 }
 

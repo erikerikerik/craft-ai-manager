@@ -30,10 +30,17 @@ pub enum Action {
         /// The model id, as the catalog writes it.
         id: String,
     },
+    /// Delete one model's installed files from disk.
+    ModelsRemove {
+        /// The model id, as the catalog writes it.
+        id: String,
+    },
+    /// Print the models folder.
+    ModelsWhere,
 }
 
 /// The usage lines, printed by `--help` and when the arguments do not parse.
-pub const USAGE: &str = "usage: caim [serve] [--fake-backend]\n       caim models list\n       caim models install <id> [--accept-note]\n       caim models verify <id>\n       caim --version | caim --help";
+pub const USAGE: &str = "usage: caim [serve] [--fake-backend]\n       caim models list\n       caim models install <id> [--accept-note]\n       caim models verify <id>\n       caim models remove <id>\n       caim models where\n       caim --version | caim --help";
 
 /// Map the arguments after the program name to an [Action](crate::Action). Serving is the default, so
 /// the only positional words are the optional `serve` and the `models` commands. The error is a
@@ -62,12 +69,15 @@ pub fn classify(args: &[String]) -> Result<Action> {
     }
     let action = match words.as_slice() {
         [] | ["serve"] => Action::Serve { fake_backend },
-        ["models"] => return Err(Fail::bad_request("Craft AI Manager needs a models command: list, install or verify.")),
+        ["models"] => return Err(Fail::bad_request("Craft AI Manager needs a models command: list, install, verify, remove or where.")),
         ["models", "list"] => Action::ModelsList,
         ["models", "install"] => return Err(Fail::bad_request("Craft AI Manager needs a model id: caim models install <id>.")),
         ["models", "verify"] => return Err(Fail::bad_request("Craft AI Manager needs a model id: caim models verify <id>.")),
+        ["models", "remove"] => return Err(Fail::bad_request("Craft AI Manager needs a model id: caim models remove <id>.")),
         ["models", "install", id] => Action::ModelsInstall { id: (*id).to_string(), accept_note },
         ["models", "verify", id] => Action::ModelsVerify { id: (*id).to_string() },
+        ["models", "remove", id] => Action::ModelsRemove { id: (*id).to_string() },
+        ["models", "where"] => Action::ModelsWhere,
         ["models", other] => {
             return Err(Fail::bad_request(format!("Craft AI Manager does not know the models command {}. Try list, install or verify.", quoted(other))));
         }
@@ -136,6 +146,8 @@ mod tests {
             Action::ModelsInstall { id: "lama".to_string(), accept_note: false }
         );
         assert_eq!(classify(&args(&["models", "verify", "lama"])).expect("verify takes an id"), Action::ModelsVerify { id: "lama".to_string() });
+        assert_eq!(classify(&args(&["models", "remove", "lama"])).expect("remove takes an id"), Action::ModelsRemove { id: "lama".to_string() });
+        assert_eq!(classify(&args(&["models", "where"])).expect("where takes nothing else"), Action::ModelsWhere);
     }
 
     #[test]
@@ -147,7 +159,7 @@ mod tests {
 
     #[test]
     fn a_models_command_without_an_id_is_a_plain_sentence() {
-        for command in ["install", "verify"] {
+        for command in ["install", "verify", "remove"] {
             let fail = classify(&args(&["models", command])).expect_err("a model id is needed");
             assert_eq!(fail.status, Status::BadRequest);
             assert!(fail.sentence.contains("<id>"), "the sentence says what is missing: {fail}");
@@ -177,6 +189,8 @@ mod tests {
         assert!(USAGE.contains("models list"));
         assert!(USAGE.contains("models install"));
         assert!(USAGE.contains("models verify"));
+        assert!(USAGE.contains("models remove"));
+        assert!(USAGE.contains("models where"));
         assert!(USAGE.contains("--accept-note"));
         assert!(USAGE.contains("models install <id>"), "the usage line shows a model id, not a stray bracket");
         assert!(USAGE.contains("models verify <id>"), "the usage line shows a model id, not a stray bracket");
