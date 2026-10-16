@@ -10,3 +10,5 @@ MG-04 | craft-ai-manager | cargo test
 BF-01 | craft-ai-manager | cargo test
 BF-03 | craft-ai-manager | cargo test
 MG-08 | craft-ai-manager | cargo test
+MG-09 | craft-ai-manager | cargo test
+
