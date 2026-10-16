@@ -56,7 +56,16 @@ fn help() {
 
 /// Run the server until something asks it to stop, then shut down cleanly.
 fn serve(fake_backend: bool) -> std::process::ExitCode {
-    let mut server = match Server::start(ServeOptions { fake_backend, ..ServeOptions::default() }) {
+    // MG-08 review round 2: the signal handler goes in before `Server::start` writes the endpoint
+    // file, so a supervisor that stops the process the moment it can find the port still gets the
+    // clean stop instead of the operating system's default handling.
+    let stop = StopHandle::new();
+    if let Err(fail) = watch_signals(&stop) {
+        // A machine that will not take the handler still stops on Enter, and `Server::drop` still
+        // removes the endpoint file, so this is a note rather than a reason not to run.
+        eprintln!("{}", fail.sentence);
+    }
+    let mut server = match Server::start_with_stop(ServeOptions { fake_backend, ..ServeOptions::default() }, &stop) {
         Ok(server) => server,
         Err(fail) => return report(fail),
     };
@@ -70,11 +79,6 @@ fn serve(fake_backend: bool) -> std::process::ExitCode {
     if std::io::stdin().is_terminal() {
         println!("press Enter or Ctrl+C to stop cleanly. A second Ctrl+C leaves at once.");
         watch_stdin(server.stop_signal());
-    }
-    if let Err(fail) = watch_signals(server.stop_handle()) {
-        // A machine that will not take the handler still stops on Enter, and `Server::drop` still
-        // removes the endpoint file, so this is a note rather than a reason not to run.
-        eprintln!("{}", fail.sentence);
     }
     server.wait();
     match server.shutdown() {
@@ -201,7 +205,10 @@ fn watch_stdin(stop: std::sync::Arc<std::sync::atomic::AtomicBool>) {
 /// elsewhere, stop the server exactly as Enter does. A second press while that stop is still
 /// running ends the process at once with a non-zero code, which is what someone pressing Ctrl+C
 /// again expects. `StopHandle::press` is the part the tests call directly; this is only the wiring.
-fn watch_signals(handle: StopHandle) -> Result<(), Fail> {
+/// `serve` calls this before `Server::start`, so the handler is in place before the endpoint file
+/// says this start is ready.
+fn watch_signals(handle: &StopHandle) -> Result<(), Fail> {
+    let handle = handle.clone();
     ctrlc::set_handler(move || {
         if handle.press() {
             std::process::exit(i32::from(EXIT_FAILED));
