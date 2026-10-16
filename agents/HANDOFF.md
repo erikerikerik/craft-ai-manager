@@ -1,5 +1,15 @@
 # HANDOFF: Craft AI Manager
 
+## 2026-10-15 (night): Codex-Strata (autopilot) - MG-07 CAIM CI: licence gate and MSRV job
+
+- Branch `ai/mg-07-ci` from `origin/main` `ab2969a`; a **draft** PR against `main` follows the push and the next entry names it. Two files: new `deny.toml` and two new jobs in `.github/workflows/ci.yml`. No product code, no dependency change, `Cargo.lock` untouched.
+- `deny.toml` allows exactly the ten licences the prompt names (MIT, Apache-2.0, Apache-2.0 WITH LLVM-exception, BSD-2-Clause, BSD-3-Clause, ISC, Zlib, Unicode-3.0, Unicode-DFS-2016, CDLA-Permissive-2.0) and denies the rest; `advisories` runs with an empty ignore list; duplicate versions only warn; `[sources]` is crates.io only. Offline pre-check over `cargo metadata --offline --all-features` (126 packages, SPDX `OR`/`AND` legs): **0 outside the list**, so nothing had to be escalated for a licence widening.
+- `deny` job pins `EmbarkStudios/cargo-deny-action` to `3c6349835b2b7b196a839186cb8b78e02f7b5f25` (v2.1.1, checked against annotated tag object `c3bbe7e4e3f7baeee1a3dd9aec0a3b2aded580fb` on 2026-10-16, runs cargo-deny 0.20.2). `msrv` job installs Rust `1.95` (the `rust-version` in `Cargo.toml`) and runs `cargo build --all-targets` plus `cargo test` on ubuntu.
+- `cargo-deny` cannot be installed on this PC in this session (no route to crates.io: `cargo install cargo-deny --locked` -> `schannel: SEC_E_NO_CREDENTIALS`), so the conditional `MG-07 | craft-ai-manager | cargo deny check` guard line was **not** added - it would fail on every machine without the tool. The licence gate lives in CI. Receipt: `agents/receipts/MG-07.md`.
+- Gates here in `target/agent-mg-07`: `cargo fmt --check` clean, `cargo clippy --all-targets -- -D warnings` clean, `cargo test` 206 passed / 0 failed / 2 ignored. The six existing `agents/guards.txt` lines are unchanged and pass in this worktree: 6 of 6 in 56.2 s, `E:\CraftML\work\logs\guards-20261016-1018.txt`.
+- Pushed through the GitHub Git Data API with `gh` (`E:\CraftML\work\.codex-tmp\ghpush\push-via-api.ps1`, local only, not committed): `git push` still cannot authenticate on this account because every Git credential helper dies in the sandbox, and this path never reads or passes a stored credential. CN-00's scoped token plus a working helper would remove the need for either.
+- **Next:** independent review of the PR, then the two new CI jobs. MSRV 1.95 has never been built anywhere before this run - if the `msrv` job fails, the prompt's rule is a small fix or a raised `rust-version`, recorded in the receipt. PhotoCraft's `MG-07` row goes in on branch `ai/mg-07-status` after PhotoCraft PR #17 merges, because both PRs touch `agents/TASKS.md`.
+
 ## 2026-10-15 (late): Codex-Strata (autopilot) - PC-06 Part A: a real golden photo
 
 - Branch `ai/pc-06-golden-photo` from `main` `7dd46c8`, commit `44748aa`; **PR #3** against `main`. Fixtures and `golden.rs` only - no product code, no new dependencies.
