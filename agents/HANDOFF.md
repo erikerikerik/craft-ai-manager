@@ -9,6 +9,15 @@
 - Manual Windows check with `GenerateConsoleCtrlEvent`: one Ctrl+C gives exit 0 and `endpoint.json` gone; two Ctrl+C 0 ms apart give exit 1 with the file left behind; two at 30 ms and at 250 ms arrive after the clean stop had finished, so exit 0 and the file gone.
 - Gates: `cargo fmt --check` 0, `cargo clippy --all-targets -- -D warnings` 0, `cargo test` 217 passed / 0 failed / 2 ignored, guards 8 of 8 in 63.1 s (`E:\CraftML\work\logs\guards-20261016-1039.txt`). Built `--offline` throughout: crates.io is unreachable from this PC and ctrlc with its dependencies was already in the cargo cache; the seven new lock entries read MIT / MIT+Apache-2.0 / Zlib from their cached manifests, all inside the MG-07 allow list.
 - **Next:** the PR needs an independent review and green CI. The PhotoCraft `agents/TASKS.md` row goes on `ai/mg-08-status` after PhotoCraft PR #17 merges.
+## 2026-10-15 (night): Codex-Strata (autopilot) - MG-07 CAIM CI: licence gate and MSRV job
+
+- Branch `ai/mg-07-ci` from `origin/main` `ab2969a`, commit `8589a04c`; **PR #5** (draft) against `main`. Two files: new `deny.toml` and two new jobs in `.github/workflows/ci.yml`. No product code, no dependency change, `Cargo.lock` untouched.
+- `deny.toml` allows exactly the ten licences the prompt names (MIT, Apache-2.0, Apache-2.0 WITH LLVM-exception, BSD-2-Clause, BSD-3-Clause, ISC, Zlib, Unicode-3.0, Unicode-DFS-2016, CDLA-Permissive-2.0) and denies the rest; `advisories` runs with an empty ignore list; duplicate versions only warn; `[sources]` is crates.io only. Offline pre-check over `cargo metadata --offline --all-features` (126 packages, SPDX `OR`/`AND` legs): **0 outside the list**, so nothing had to be escalated for a licence widening.
+- `deny` job pins `EmbarkStudios/cargo-deny-action` to `3c6349835b2b7b196a839186cb8b78e02f7b5f25` (v2.1.1, checked against annotated tag object `c3bbe7e4e3f7baeee1a3dd9aec0a3b2aded580fb` on 2026-10-16, runs cargo-deny 0.20.2). `msrv` job installs Rust `1.95` (the `rust-version` in `Cargo.toml`) and runs `cargo build --all-targets` plus `cargo test` on ubuntu.
+- `cargo-deny` cannot be installed on this PC in this session (no route to crates.io: `cargo install cargo-deny --locked` -> `schannel: SEC_E_NO_CREDENTIALS`), so the conditional `MG-07 | craft-ai-manager | cargo deny check` guard line was **not** added - it would fail on every machine without the tool. The licence gate lives in CI. Receipt: `agents/receipts/MG-07.md`.
+- Gates here in `target/agent-mg-07`: `cargo fmt --check` clean, `cargo clippy --all-targets -- -D warnings` clean, `cargo test` 206 passed / 0 failed / 2 ignored. The six existing `agents/guards.txt` lines are unchanged and pass in this worktree: 6 of 6 in 56.2 s, `E:\CraftML\work\logs\guards-20261016-1018.txt`.
+- Pushed through the GitHub Git Data API with `gh` (`E:\CraftML\work\.codex-tmp\ghpush\push-via-api.ps1`, local only, not committed): `git push` still cannot authenticate on this account because every Git credential helper dies in the sandbox, and this path never reads or passes a stored credential. CN-00's scoped token plus a working helper would remove the need for either. The token that was printed into a session log has been revoked and the replacement carries `workflow` scope, which is why `.github/workflows/ci.yml` pushed cleanly this time.
+- **Next:** independent review of the PR, then the two new CI jobs. MSRV 1.95 has never been built anywhere before this run - if the `msrv` job fails, the prompt's rule is a small fix or a raised `rust-version`, recorded in the receipt. PhotoCraft's `MG-07` row goes in on branch `ai/mg-07-status` after PhotoCraft PR #17 merges, because both PRs touch `agents/TASKS.md`.
 ## 2026-10-16 (midday): Codex-Strata (autopilot) - MG-09 review round 4
 
 - Two things came back from the round-3 push `f9a25a7d`. Both CAIM CI jobs failed at `Format`: that patch put the `store.rs` test module's `use super::{ ... }` list on one line, past rustfmt's width, and `main` wraps the same list over two. `cargo fmt` fixed it in `fec29fd7`, which is green; the lesson is that `cargo fmt --check` has to be the last thing run before a push, not one of the first.
@@ -248,5 +257,6 @@
   whether one worker thread is enough (CAIM-12).
 - PC-06 (end-to-end on the 4090 against the real manager) is now unblocked: it needs MG-05, which this is.
 - Still open from MG-01: no Ctrl+C handler, jobs in memory only, MSRV declared but untested in CI.
+
 
 
