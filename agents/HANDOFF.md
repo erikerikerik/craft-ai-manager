@@ -1,5 +1,13 @@
 # HANDOFF: Craft AI Manager
 
+## 2026-10-16 (morning): Codex-Strata (autopilot) - MG-09 review round 3
+
+- Codex-cloud reviewed the second commit `813d63ca` on PR #4 and found one more P2: the disk-use walk followed a link it was handed. `folder_usage` opened the folder with `std::fs::metadata`, which follows a link, and `read_dir` follows it too, so with a symlink or junction at `<models>\<id>` `models list` counted the tree on the other side of the link and printed its bytes - while the doc comment promised a link is never followed. `DirEntry::file_type` only stops links met after the walk starts.
+- Round 3, on `ai/mg-09-models`: `store::is_link` (a `symlink_metadata` answer), `folder_usage` reading the folder it was handed with `symlink_metadata`, and one shared `models::linked_step` that names the first link in `<models folder>/<id>/<version>` - the models folder included - which both the removal and `models list` now use. `models list` prints `on disk: a link, not a folder` and `total on disk: a link, not a folder` instead of a count taken through a link; the removal sentence is unchanged.
+- Three `#[cfg(unix)]` tests cover it (the ubuntu job runs them), and a junction on this Windows box was checked by hand: a plain store still counts its bytes, a junction at `<store>\lama` and a junction at the models folder both refuse to be counted, and `models remove` still refuses with the link named in both shapes with the files behind it intact (`E:\CraftML\work\.codex-tmp\mg09\smoke-link-r3.txt`).
+- Gates after round 3: `cargo fmt --check` 0, `cargo clippy --all-targets -- -D warnings` 0, `cargo test` 215 passed / 0 failed / 2 ignored here (the three new tests are unix-only), guards 7 of 7 in 56.9 s (`E:\CraftML\work\logs\guards-20261016-0954.txt`).
+- **Next:** Codex-cloud's re-review of this commit and both CAIM CI jobs. Erik asked for this third round; SPEC v1.1 amendment 17's two-round limit means any further change on this branch is his call again.
+
 ## 2026-10-16 (early, later): Codex-Strata (autopilot) - MG-09 review round 1
 
 - Codex-cloud reviewed `dfe2ac0` on PR #4 and asked for changes: one P1 and two P2s. All three are fixed on `ai/mg-09-models` in the commit after `2d589147`, and the re-review asked for covers that commit only. This is round 1 of the two SPEC v1.1 amendment 17 allows.

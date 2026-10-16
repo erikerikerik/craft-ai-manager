@@ -201,14 +201,25 @@ pub struct Usage {
     pub files: u64,
 }
 
-/// Add up the files under a folder. `None` when the folder is not there, and `None` when the tree is
-/// deeper or broader than the two caps above - a tree no model folder has, and the caller is then
-/// asked to say it could not count rather than report a number it did not finish computing. A folder
-/// that cannot be read adds nothing rather than failing the count, and a link is never followed, so
-/// a symlink cannot lead this outside the folder.
+/// True when the path is there but is a link rather than the folder itself. [folder_usage] refuses
+/// such a path, and the callers use this to say why nothing was counted rather than asking
+/// `Path::is_dir`, which follows the link and answers about the folder on the other side of it.
+#[must_use]
+pub fn is_link(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink())
+}
+
+/// Add up the files under a folder. `None` when the folder is not there, when a link sits in its
+/// place, and `None` when the tree is deeper or broader than the two caps above - a tree no model
+/// folder has, and the caller is then asked to say it could not count rather than report a number it
+/// did not finish computing. A folder that cannot be read adds nothing rather than failing the
+/// count, and no link is followed: the folder handed in is refused by [is_link], and a link found
+/// inside the walk is skipped, so this never walks outside the folder it was handed.
 #[must_use]
 pub fn folder_usage(path: &Path) -> Option<Usage> {
-    let Ok(metadata) = std::fs::metadata(path) else { return None };
+    // read_dir follows a link, so the folder handed in is read as it really sits on disk: a link
+    // here would walk a tree that is not inside the models folder at all.
+    let Ok(metadata) = std::fs::symlink_metadata(path) else { return None };
     if !metadata.is_dir() {
         return None;
     }
@@ -290,8 +301,7 @@ mod tests {
     use crate::testkit::{Scratch, test_model};
 
     use super::{
-        Acknowledgement, MODELS_DIR, VERIFIED_NAME, folder_usage, hash_file, is_acknowledged, is_installed, model_file, model_folder, models_dir_in, part_file,
-        read_verified, remove_verified, sha256_hex, verified_file, write_acknowledgement, write_verified,
+        Acknowledgement, MODELS_DIR, VERIFIED_NAME, folder_usage, hash_file, is_acknowledged, is_installed, model_file, model_folder, models_dir_in, part_file, read_verified, remove_verified, sha256_hex, verified_file, write_acknowledgement, write_verified,
     };
 
     const FIXTURE: &[u8] = b"the bytes a small model would be made of";
@@ -438,5 +448,19 @@ mod tests {
         }
         std::fs::create_dir_all(&leaf).expect("a tree past the depth cap can be made");
         assert_eq!(folder_usage(&deep), None, "a tree past the depth cap is refused rather than counted");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn folder_usage_refuses_a_link_handed_in_as_the_folder() {
+        let scratch = Scratch::new("store-usage-link");
+        let real = scratch.path.join("real");
+        std::fs::create_dir_all(&real).expect("the folder the link points at can be made");
+        std::fs::write(real.join("keep.onnx"), "keep these bytes").expect("a file outside the store can be written");
+        let linked = scratch.path.join("models");
+        std::os::unix::fs::symlink(&real, &linked).expect("the link can be made");
+        assert!(!folder_usage(&linked).is_some_and(|usage| usage.files > 0), "a link is not a folder to walk: {:?}", folder_usage(&linked));
+        assert!(super::is_link(&linked), "and the caller can say why nothing was counted");
+        assert!(!super::is_link(&real), "the folder on the other side of the link is a folder");
     }
 }

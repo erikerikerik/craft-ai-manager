@@ -54,11 +54,15 @@ pub fn list_lines(models: &[Model], root: &Path) -> Vec<String> {
             let needs = if model.note.is_some() && !store::is_acknowledged(root, model) { "  needs acknowledgment" } else { "" };
             let folder = store::model_folder(root, model);
             // A folder that is not there has nothing on disk; a folder past the walk cap says so
-            // rather than showing a number that was never finished.
-            let on_disk = match store::folder_usage(&folder) {
-                Some(usage) => format!("{} bytes", usage.bytes),
-                None if folder.is_dir() => "too many folders to count".to_string(),
-                None => "0 bytes".to_string(),
+            // rather than showing a number that was never finished, and so does a link, because the
+            // walk refuses it rather than counting the tree on the other side of it.
+            let on_disk = match linked_step(root, model) {
+                Some(_) => "a link, not a folder".to_string(),
+                None => match store::folder_usage(&folder) {
+                    Some(usage) => format!("{} bytes", usage.bytes),
+                    None if folder.is_dir() => "too many folders to count".to_string(),
+                    None => "0 bytes".to_string(),
+                },
             };
             format!(
                 "{id}  {version}  {task}  {size} bytes  licences: code {code}, weights {weights}, training data {training}  {state}{needs}  on disk: {bytes}",
@@ -78,10 +82,14 @@ pub fn list_lines(models: &[Model], root: &Path) -> Vec<String> {
     if lines.is_empty() {
         lines.push("The model catalog has no entries.".to_string());
     }
-    let total = match store::folder_usage(root) {
-        Some(usage) => format!("{} bytes in {} files", usage.bytes, usage.files),
-        None if root.is_dir() => "too many folders to count".to_string(),
-        None => "0 bytes in 0 files".to_string(),
+    let total = if store::is_link(root) {
+        "a link, not a folder".to_string()
+    } else {
+        match store::folder_usage(root) {
+            Some(usage) => format!("{} bytes in {} files", usage.bytes, usage.files),
+            None if root.is_dir() => "too many folders to count".to_string(),
+            None => "0 bytes in 0 files".to_string(),
+        }
     };
     lines.push(format!("total on disk: {total}, models folder {}", root.display()));
     lines
@@ -207,22 +215,33 @@ fn installed_folder(root: &Path, model: &Model) -> Result<PathBuf> {
             folder.display()
         )));
     }
-    // Two components is only what the path is called. A link in place of the id folder or the
-    // version folder keeps that name and points somewhere else, and remove_dir_all follows it, so
-    // both are looked at as they really sit on disk before anything is deleted.
-    let id_folder = root.join(&model.id);
-    for step in [&id_folder, &folder] {
-        if let Ok(metadata) = std::fs::symlink_metadata(step)
-            && metadata.file_type().is_symlink()
-        {
-            return Err(Fail::internal(format!(
-                "Craft AI Manager will not delete {} because {} is a link, not a folder. Nothing was deleted.",
-                folder.display(),
-                step.display()
-            )));
-        }
+    // Two components is only what the path is called. A link in place of the models folder, the id
+    // folder or the version folder keeps that name and points somewhere else, and remove_dir_all
+    // follows it, so every step is looked at as it really sits on disk before anything is deleted.
+    if let Some(step) = linked_step(root, model) {
+        return Err(Fail::internal(format!(
+            "Craft AI Manager will not delete {} because {} is a link, not a folder. Nothing was deleted.",
+            folder.display(),
+            step.display()
+        )));
     }
     Ok(folder)
+}
+
+/// The first step of `<models folder>/<id>/<version>` that is a link rather than a folder, counting
+/// the models folder itself. The disk-use walk and the removal both refuse such a path: they read the
+/// path as a name, and the filesystem follows a link sitting in the middle of it, so a link at the id
+/// folder would make `<id>/<version>` a folder somewhere else entirely.
+#[must_use]
+fn linked_step(root: &Path, model: &Model) -> Option<PathBuf> {
+    let id_folder = root.join(&model.id);
+    let version_folder = store::model_folder(root, model);
+    for step in [root, id_folder.as_path(), version_folder.as_path()] {
+        if store::is_link(step) {
+            return Some(step.to_path_buf());
+        }
+    }
+    None
 }
 
 /// `caim models where`: the models folder, and whether the environment named it.
@@ -479,5 +498,40 @@ mod tests {
         let lines = list_lines(&[entry], &root);
         assert!(lines[0].ends_with("  on disk: too many folders to count"), "the model line says it could not count: {}", lines[0]);
         assert!(lines[1].starts_with("total on disk: too many folders to count, models folder "), "the total says it too: {}", lines[1]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn list_refuses_to_count_a_model_folder_that_is_a_link() {
+        let scratch = Scratch::new("models-list-link");
+        let root = scratch.path.join("models");
+        std::fs::create_dir_all(&root).expect("the models folder can be made");
+        let entry = test_model(FIXTURE, None);
+        // <root>/<id> is a link to a folder elsewhere, so <root>/<id>/<version> is really
+        // <elsewhere>/<version> - the tree a count would follow the link into.
+        let outside = scratch.path.join("elsewhere");
+        let linked = outside.join(&entry.version);
+        std::fs::create_dir_all(&linked).expect("the folder the link points at can be made");
+        std::fs::write(linked.join(&entry.file), FIXTURE).expect("a file outside the store can be written");
+        std::os::unix::fs::symlink(&outside, root.join(&entry.id)).expect("the link can be made");
+        let lines = list_lines(&[entry], &root);
+        assert!(lines[0].ends_with("  on disk: a link, not a folder"), "the model line says it did not count: {}", lines[0]);
+        assert!(lines[1].starts_with("total on disk: 0 bytes in 0 files"), "the total skips the link as well: {}", lines[1]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn list_refuses_to_count_a_models_folder_that_is_a_link() {
+        let scratch = Scratch::new("models-list-root-link");
+        let entry = test_model(FIXTURE, None);
+        let outside = scratch.path.join("elsewhere");
+        let linked = outside.join(&entry.id).join(&entry.version);
+        std::fs::create_dir_all(&linked).expect("the folder the link points at can be made");
+        std::fs::write(linked.join(&entry.file), FIXTURE).expect("a file outside the store can be written");
+        let root = scratch.path.join("models");
+        std::os::unix::fs::symlink(&outside, &root).expect("the link can be made");
+        let lines = list_lines(&[entry], &root);
+        assert!(lines[0].ends_with("  on disk: a link, not a folder"), "the model line says it did not count: {}", lines[0]);
+        assert!(lines[1].starts_with("total on disk: a link, not a folder"), "the total says it too: {}", lines[1]);
     }
 }
