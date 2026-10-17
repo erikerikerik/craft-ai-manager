@@ -4,7 +4,7 @@
 
 mod support;
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
@@ -66,6 +66,69 @@ fn open_does_not_start_a_second_manager_while_the_first_is_busy() {
     drop(holder);
     assert_eq!(server.get("/v1/health").status, 200, "the same manager answers again once a slot frees");
     let _ = server.shutdown();
+}
+
+#[test]
+fn open_starts_a_manager_when_a_stranger_holds_the_published_port() {
+    // A manager crashed and left endpoint.json behind, and another local service has taken the port
+    // and answers 503 to whatever it gets. That is not the manager, so `caim open` has to start one
+    // rather than report a manager that is not there.
+    let folder = std::env::temp_dir().join(format!("caim-it-{}-open-stranger", std::process::id()));
+    let _ = std::fs::remove_dir_all(&folder);
+    std::fs::create_dir_all(&folder).expect("a folder for the endpoint file");
+    let endpoint = folder.join("endpoint.json");
+    let listener = std::net::TcpListener::bind(std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0))).expect("a port for the stranger");
+    let stale_port = listener.local_addr().expect("the stranger's own port").port();
+    let _stranger = std::thread::spawn(move || {
+        for _ in 0..4 {
+            let Ok((mut client, _)) = listener.accept() else { return };
+            let mut request = [0u8; 512];
+            let _ = client.read(&mut request);
+            let body = "<html><head><title>503 Service Unavailable</title></head><body>the server next door is busy</body></html>";
+            let reply =
+                format!("HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            let _ = client.write_all(reply.as_bytes());
+        }
+    });
+    craft_ai_manager::endpoint::write(&endpoint, stale_port, "a-token-from-a-manager-that-crashed").expect("a stale endpoint file can be written");
+    // Ask the stranger once first, so its thread is parked in `accept` before the probe asks it the
+    // same question. A fake that has not been scheduled yet answers nothing at all, and then the test
+    // would be measuring the scheduler rather than the probe.
+    let hello = support::talk(stale_port, b"GET /v1/health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+    assert_eq!(hello.status, 503, "the stranger is the one answering on the port the dead manager left");
+    let probe = craft_ai_manager::endpoint::health_probe(stale_port, "a-token-from-a-manager-that-crashed");
+    assert_eq!(probe, craft_ai_manager::endpoint::Health::Absent, "and the probe agrees that a stranger is not a manager");
+    let store = support::empty_store("open-stranger");
+    let mut child = open_run(&endpoint, &store);
+    // The run has to start a manager of its own, so the endpoint file changes to a new port.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let (port, token) = loop {
+        let text = std::fs::read_to_string(&endpoint).unwrap_or_default();
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+            let published = value.get("port").and_then(serde_json::Value::as_u64).and_then(|number| u16::try_from(number).ok());
+            let found = value.get("token").and_then(serde_json::Value::as_str).map(str::to_string);
+            if let (Some(published), Some(found)) = (published, found)
+                && published != stale_port
+            {
+                break (published, found);
+            }
+        }
+        if child.try_wait().expect("the child is ours to watch").is_some() {
+            let (out, err) = read_output(&mut child);
+            panic!("caim open gave up instead of starting a manager over the stranger's port. stdout: {out} stderr: {err}");
+        }
+        assert!(Instant::now() < deadline, "the stranger kept the port, so no manager ever started");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let request = format!("GET /v1/health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n");
+    let health = support::talk(port, request.as_bytes());
+    // Stop the manager before asserting, so a failing assert cannot leave one running.
+    let _ = child.kill();
+    child.wait().expect("the manager stopped");
+    let (out, _err) = read_output(&mut child);
+    assert_eq!(health.status, 200, "a real manager started, on a port of its own");
+    assert!(!out.contains("already running"), "and it never claimed a manager was already there: {out}");
+    let _ = std::fs::remove_dir_all(&folder);
 }
 
 #[test]

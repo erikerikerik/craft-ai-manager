@@ -34,6 +34,12 @@ pub const APP_VERSION: u64 = 1;
 /// How long to wait for a manager to answer `/v1/health`. Loopback answers at once, so this is
 /// only a guard against a port somebody else has taken over.
 const HEALTH_TIMEOUT: Duration = Duration::from_millis(250);
+/// The words every Craft AI Manager error body carries (`crate::http::error_body`), which is what
+/// tells a busy manager's 503 from another local service's.
+const CAIM_ERROR_MARK: &str = "Craft AI Manager";
+/// How much of a health reply is read before deciding. A real one is a status line, three headers
+/// and one short JSON body; past this is somebody else's page.
+const MAX_PROBE_BYTES: usize = 2048;
 /// The endpoint file is JSON, and the protocol caps JSON at 64 KiB.
 const MAX_FILE_BYTES: u64 = 64 * 1024;
 /// The file beside `endpoint.json` that says one `caim open` is deciding whether to start a
@@ -239,9 +245,10 @@ pub fn published_credentials(path: &Path) -> Option<(u16, String)> {
 pub enum Health {
     /// A manager answered `/v1/health` with a 200.
     Ready,
-    /// Something answered with a 503. That is a manager whose connection slots are all taken: the
-    /// accept loop refuses a request before it even routes it (`server.rs`, `refuse_busy`). It is
-    /// running, only busy, and starting a second manager over its endpoint file would be wrong.
+    /// Something answered with a 503 that carries this program's own error sentence. That is a
+    /// manager whose connection slots are all taken: the accept loop refuses a request before it
+    /// even routes it (`server.rs`, `refuse_busy`). It is running, only busy, and starting a second
+    /// manager over its endpoint file would be wrong. A 503 from anything else is `Absent`.
     Busy,
     /// Nothing answered the way a manager does: a shut port, a socket that died, a reply that is
     /// not a status line we know, or a stranger holding the port.
@@ -249,10 +256,11 @@ pub enum Health {
 }
 
 /// What the manager on loopback at `port` says about itself when asked with this token: `GET
-/// /v1/health`, and the answer is one status line.
+/// /v1/health`, and nearly all of the answer is one status line.
 ///
 /// This is a raw request rather than a client library on purpose. `caim open` has to answer a
-/// simple question about a machine-local port, and the whole of the answer is one status line.
+/// simple question about a machine-local port. Only a 503 needs more than its status line, because
+/// 503 is the ordinary way for any local service to say it cannot take a request.
 #[must_use]
 pub fn health_probe(port: u16, token: &str) -> Health {
     if token.chars().any(|ch| matches!(ch, '\r' | '\n' | '\0')) {
@@ -268,12 +276,14 @@ pub fn health_probe(port: u16, token: &str) -> Health {
     if stream.write_all(request.as_bytes()).and_then(|()| stream.flush()).is_err() {
         return Health::Absent;
     }
-    // One read can legally hand back half a status line, so keep reading until the line ends, the
-    // peer hangs up, or the health check has had its say. Deciding on a fragment would start a second
-    // manager on top of the one that is running and overwrite its endpoint file.
+    // One read can legally hand back half a status line, so keep reading until the line ends, the peer
+    // hangs up, or the health check has had its say. Deciding on a fragment would start a second manager
+    // on top of the one that is running and overwrite its endpoint file. A 503 needs the body too,
+    // because 503 is the ordinary way for any local service to say it cannot take a request.
     let deadline = Instant::now() + HEALTH_TIMEOUT;
     let mut head: Vec<u8> = Vec::new();
-    let mut buffer = [0u8; 32];
+    let mut buffer = [0u8; 256];
+    let mut reads_past_headers = 0usize;
     loop {
         match stream.read(&mut buffer) {
             Ok(0) => break,
@@ -285,22 +295,58 @@ pub fn health_probe(port: u16, token: &str) -> Health {
             // Out of time or a dead socket: decide on whatever arrived.
             Err(_) => break,
         }
-        let line_is_over = head.windows(2).any(|pair| pair[0] == b'\r' && pair[1] == b'\n');
-        if line_is_over || head.len() >= 32 || Instant::now() >= deadline {
+        if head.len() >= MAX_PROBE_BYTES || Instant::now() >= deadline {
             break;
+        }
+        let so_far = String::from_utf8_lossy(&head);
+        if !so_far.contains("\r\n") {
+            continue;
+        }
+        // A 200, a 401 and anything else are decided by the status line alone: only this program
+        // answers /v1/health that way to the token the endpoint file holds.
+        if !status_line_says(&so_far, "503") {
+            break;
+        }
+        // A 503 is this program's busy answer as soon as its own sentence is in the body. One more
+        // read covers a body that arrives after the headers; then the reply is somebody else's.
+        if so_far.contains(CAIM_ERROR_MARK) {
+            break;
+        }
+        if so_far.contains("\r\n\r\n") {
+            reads_past_headers += 1;
+            if reads_past_headers >= 2 {
+                break;
+            }
         }
     }
     let text = String::from_utf8_lossy(&head);
-    if text.starts_with("HTTP/1.1 200") || text.starts_with("HTTP/1.0 200") {
+    if status_line_says(&text, "200") {
         Health::Ready
-    } else if text.starts_with("HTTP/1.1 503") || text.starts_with("HTTP/1.0 503") {
-        Health::Busy
+    } else if status_line_says(&text, "503") {
+        if text.contains(CAIM_ERROR_MARK) {
+            Health::Busy
+        } else if text.contains("\r\n\r\n") {
+            // A whole 503 from something that is not this program: a dev server or a proxy that has
+            // taken the port a crashed manager left behind. Nothing is running, so a manager may start.
+            Health::Absent
+        } else {
+            // The reply stopped after its status line. A busy manager writes its headers and body in
+            // one pass, so a half answer is far more likely a slow one than a stranger, and starting a
+            // second manager over a live one is the worse mistake - round 2's P1.
+            Health::Busy
+        }
     } else {
         // A 401 means the port is answering but not with the token the file holds. The launch lock
         // below closes the window where that could happen while a manager is starting, and a port
         // that answers for nobody else is one a real manager can take over, so this stays Absent.
         Health::Absent
     }
+}
+
+/// Does this reply carry `code` on its status line, under either HTTP version?
+fn status_line_says(text: &str, code: &str) -> bool {
+    let after_version = text.strip_prefix("HTTP/1.1 ").or_else(|| text.strip_prefix("HTTP/1.0 "));
+    after_version.is_some_and(|rest| rest.starts_with(code))
 }
 
 /// What `caim open` should do about a manager (amendment 18).
@@ -315,8 +361,9 @@ pub enum Launch {
 /// Look at the endpoint file this run would write, and ask whether a manager is already answering
 /// there. A missing, unreadable, or dead file means start one: the file is a hint, not a promise.
 ///
-/// A manager that answers 503 because every connection slot is taken is a manager that is running,
-/// so it counts as already running too.
+/// A manager that answers 503 with its own busy sentence because every connection slot is taken is
+/// a manager that is running, so it counts as already running too. A 503 from anything else on that
+/// port is a stranger that took the port a dead manager left, and it does not stop a start.
 #[must_use]
 pub fn launch_decision(endpoint: Option<&Path>) -> Launch {
     let Some(path) = endpoint.filter(|path| path.is_file()) else { return Launch::Start };
@@ -646,7 +693,12 @@ mod tests {
                 let Ok((mut client, _)) = listener.accept() else { return };
                 let mut request = [0u8; 512];
                 let _ = client.read(&mut request);
-                let _ = client.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 2\r\n\r\nno");
+                let body = r#"{"error":"Craft AI Manager already has 8 requests open, so it cannot take another one yet."}"#;
+                let reply = format!(
+                    "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = client.write_all(reply.as_bytes());
                 let _ = client.flush();
             }
         });
@@ -655,6 +707,52 @@ mod tests {
         let _guard = TempFile(path.clone());
         write(&path, port, "token").expect("a file naming a busy manager can be written");
         assert_eq!(launch_decision(Some(&path)), Launch::AlreadyRunning { port }, "and the launch decision agrees, so nothing is started");
+        server.join().expect("the fake manager finished");
+    }
+
+    #[test]
+    fn a_stranger_answer_503_on_the_port_is_not_the_running_manager() {
+        // A manager crashed and left its endpoint file behind, and something else - a dev server,
+        // a proxy - has taken the port. Its 503 says nothing about Craft AI Manager, so reading it
+        // as "a manager is running" would have caim open report a manager that is not there.
+        let listener = std::net::TcpListener::bind(std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0))).expect("a free port");
+        let port = listener.local_addr().expect("the address of a bound port").port();
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let Ok((mut client, _)) = listener.accept() else { return };
+                let mut request = [0u8; 512];
+                let _ = client.read(&mut request);
+                let body = "<html><head><title>503 Service Unavailable</title></head><body>the server next door is busy</body></html>";
+                let reply =
+                    format!("HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                let _ = client.write_all(reply.as_bytes());
+                let _ = client.flush();
+            }
+        });
+        assert_eq!(health_probe(port, "token"), Health::Absent, "a 503 that is not ours is a stranger on the port, not a manager");
+        let path = temp_endpoint("stranger");
+        let _guard = TempFile(path.clone());
+        write(&path, port, "token").expect("a file naming a stranger port can be written");
+        assert_eq!(launch_decision(Some(&path)), Launch::Start, "so a manager may start and take the port back");
+        server.join().expect("the fake stranger finished");
+    }
+
+    #[test]
+    fn a_cut_off_503_answer_does_not_start_a_second_manager() {
+        // A busy manager writes its headers and body in one pass, so a reply that stops after the
+        // status line is far more likely a slow manager than a stranger. Starting a second manager
+        // over a live one is the worse mistake, so an unfinished 503 still counts as running.
+        let listener = std::net::TcpListener::bind(std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0))).expect("a free port");
+        let port = listener.local_addr().expect("the address of a bound port").port();
+        let server = std::thread::spawn(move || {
+            let Ok((mut client, _)) = listener.accept() else { return };
+            let mut request = [0u8; 512];
+            let _ = client.read(&mut request);
+            let _ = client.write_all(b"HTTP/1.1 503 Service Unavailable\r\n");
+            let _ = client.flush();
+            std::thread::sleep(std::time::Duration::from_millis(400));
+        });
+        assert_eq!(health_probe(port, "token"), Health::Busy, "a 503 whose body never arrived is still a manager that is running");
         server.join().expect("the fake manager finished");
     }
 
