@@ -1,5 +1,14 @@
 # HANDOFF: Craft AI Manager
 
+## 2026-10-17: Codex-Strata (autopilot) - MG-12 round 3, second look (one P2 in the new launch lock)
+
+- Same branch `ai/mg-12-resume-launch` and **PR #7**, on top of the round-3 head `34d3d06`. Codex-cloud's re-review of that head came back with one P2, and it is in the lock that round 3 had just added, so this finishes the authorised round rather than opening a fourth subject. Receipt: `agents/receipts/MG-12.md`, section "Round 3, second look".
+- **P2 - a launch lock that cannot be made read as another run holding it** (`crates/caim/src/endpoint.rs:347`). `LaunchLock::take` answered `None` for three different things - another run holding it, a folder it could not create, a lock file it could not write - and `caim open` printed "being started by another `caim open`" and exited 0 for all three. On a machine where the endpoint folder cannot be written, that promises a manager nobody is starting. `take` now answers `LockOutcome::Taken` / `Held` / `Failed(Fail)`; `open` (`crates/caim/src/main.rs:110`) exits 0 on `Held` alone and sends `Failed` through `report`, which prints the sentence and exits 1. Nothing is started in that case: a run that cannot write its lock cannot reliably write the `endpoint.json` clients look for either.
+- New: one unit test and one integration test (`crates/caim/tests/open_command.rs:112`) that runs the real binary against an endpoint path whose folder is an ordinary file, and checks a nonzero exit, no "being started by another" sentence, and no endpoint file.
+- Gates: `cargo fmt --check` 0, `cargo clippy --all-targets -- -D warnings` 0, `cargo test` 258 passed / 0 failed / 2 ignored (was 256), guards 9 of 9 in 98.2 s (`E:\CraftML\work\logs\guards-20261017-0904.txt`). `cargo deny check` still cannot run here (cargo-deny is not installed); `Cargo.toml` and `Cargo.lock` are untouched, so the CI `deny` job has the input it passed on `34d3d06`.
+- **Next:** re-review of the one new commit only. Clean plus four green checks means `gh pr ready 7` and `gh pr merge 7 --merge`, then the PhotoCraft docs PR that moves the MG-12 row to `done`. MG-10 is the next ready task and touches this repo, so it waits for that merge.
+
+
 ## 2026-10-17: Codex-Strata (autopilot) - MG-12 review round 3 (two P2, the authorised third round)
 
 - Same branch `ai/mg-12-resume-launch` and **PR #7**. Round 2 ended at the two-round cap and I stopped and reported; Erik decision D14 authorised a third round for exactly these two findings, then merge on approval plus green CI. Receipt: `agents/receipts/MG-12.md`, section "Review round 3".

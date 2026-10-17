@@ -65,6 +65,9 @@ With nothing answering it serves exactly what `caim serve` serves - the window c
 "Open Craft AI Manager" button runs `caim open`, which is why every start records where this program lives. Two
 `caim open` runs launched at the same moment decide once: the first holds `open.lock` beside the endpoint file while it
 starts a manager, and the second waits for that lock (up to 5 s) and then sees the manager the first one started.
+A lock this machine cannot make at all - the folder is not there and cannot be created, say - is an error, not
+contention: `caim open` prints what went wrong and exits 1 rather than saying another run is starting a manager
+that nobody is starting.
 
 Three more files live in that same folder. `app.json` and `activity.jsonl` are never deleted on exit; `open.lock`
 exists only while a `caim open` is deciding whether to start a manager:

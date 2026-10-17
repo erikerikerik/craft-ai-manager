@@ -327,6 +327,21 @@ pub fn launch_decision(endpoint: Option<&Path>) -> Launch {
     }
 }
 
+/// What asking for the launch lock ended up as. Contention and a machine that cannot make a lock
+/// are different answers: one says another run is starting a manager, the other says nobody is, and
+/// `caim open` has to say which.
+pub enum LockOutcome {
+    /// This run holds the lock, so this run gets to decide whether a manager is running.
+    Taken(LaunchLock),
+    /// Another `caim open` holds the lock and has not finished starting, and this run waited out
+    /// [LAUNCH_LOCK_WAIT] for it. Nothing to start here: that run is the one writing the endpoint file.
+    Held,
+    /// The lock could not be made at all: no folder to put it in, a folder that cannot be written, a
+    /// token that could not be made, a write that failed. Nobody else is starting a manager, so this is
+    /// a failure to report rather than a promise about another run.
+    Failed(Fail),
+}
+
 /// The lock one `caim open` holds while it decides whether a manager is running and, when none
 /// is, starts one. Deciding and starting are one step, not two: without the lock, two `caim open`
 /// runs launched at the same moment can both decide to start, both serve, and race to replace
@@ -339,38 +354,47 @@ pub struct LaunchLock {
 }
 
 impl LaunchLock {
-    /// Take the lock, or `None` when another `caim open` holds it. A held lock is waited for up to
-    /// [LAUNCH_LOCK_WAIT], which is how the second run ends up seeing the manager the first one
-    /// started instead of starting its own; a lock older than [LAUNCH_LOCK_STALE] belonged to a run
-    /// that died partway through starting, and is taken over once - see [crate::fetch::claim_stale].
+    /// Take the lock: [LockOutcome::Taken] when this run holds it, [LockOutcome::Held] when another
+    /// `caim open` holds it, and [LockOutcome::Failed] when no lock could be made at all. A held lock is
+    /// waited for up to [LAUNCH_LOCK_WAIT], which is how the second run ends up seeing the manager the
+    /// first one started instead of starting its own; a lock older than [LAUNCH_LOCK_STALE] belonged to
+    /// a run that died partway through starting, and is taken over once - see [crate::fetch::claim_stale].
     #[must_use]
-    pub fn take(path: &Path) -> Option<LaunchLock> {
-        let nonce = crate::token::random_token().ok()?;
+    pub fn take(path: &Path) -> LockOutcome {
+        let nonce = match crate::token::random_token() {
+            Ok(nonce) => nonce,
+            Err(fail) => return LockOutcome::Failed(fail),
+        };
         // The lock lives beside the endpoint file, so the folder comes first: a machine that has
         // never run the manager has no folder yet, and that is not somebody else holding the lock.
-        let parent = path.parent().filter(|parent| !parent.as_os_str().is_empty())?;
-        if std::fs::create_dir_all(parent).is_err() {
-            return None;
+        let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) else {
+            return LockOutcome::Failed(Fail::internal("Craft AI Manager has no folder to put its launch lock in."));
+        };
+        if let Err(error) = std::fs::create_dir_all(parent) {
+            return LockOutcome::Failed(Fail::internal(format!("Craft AI Manager could not create {}: {error}", parent.display())));
         }
         let deadline = Instant::now() + LAUNCH_LOCK_WAIT;
         loop {
             match OpenOptions::new().write(true).create_new(true).open(path) {
                 Ok(mut file) => {
-                    if file.write_all(nonce.as_bytes()).and_then(|()| file.flush()).is_err() {
+                    if let Err(error) = file.write_all(nonce.as_bytes()).and_then(|()| file.flush()) {
                         let _ = std::fs::remove_file(path);
-                        return None;
+                        return LockOutcome::Failed(Fail::internal(format!("Craft AI Manager could not write its launch lock at {}: {error}", path.display())));
                     }
-                    return Some(LaunchLock { path: path.to_path_buf(), nonce });
+                    return LockOutcome::Taken(LaunchLock { path: path.to_path_buf(), nonce });
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                // A folder that is not there, a file we cannot read: nothing to be decided safely.
-                Err(_) => return None,
+                // A folder that is not there, a file we cannot create: nothing can be decided safely,
+                // and no other run is deciding it either, so this is not contention.
+                Err(error) => {
+                    return LockOutcome::Failed(Fail::internal(format!("Craft AI Manager could not open its launch lock at {}: {error}", path.display())));
+                }
             }
             if crate::fetch::is_older_than(path, LAUNCH_LOCK_STALE) && crate::fetch::claim_stale(path, &nonce, LAUNCH_LOCK_STALE) {
                 continue;
             }
             if Instant::now() >= deadline {
-                return None;
+                return LockOutcome::Held;
             }
             std::thread::sleep(LAUNCH_LOCK_POLL);
         }
@@ -410,10 +434,11 @@ fn read_value(path: &Path) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::{
-        APP_NAME, APP_VERSION, ENDPOINT_VERSION, Health, LAUNCH_LOCK_NAME, LAUNCH_LOCK_STALE, LAUNCH_LOCK_WAIT, Launch, LaunchLock, app_path_for,
+        APP_NAME, APP_VERSION, ENDPOINT_VERSION, Health, LAUNCH_LOCK_NAME, LAUNCH_LOCK_STALE, LAUNCH_LOCK_WAIT, Launch, LaunchLock, LockOutcome, app_path_for,
         endpoint_file_from_env, health_probe, is_ours, launch_decision, launch_lock_path_for, published_credentials, published_port, remove, temp_path, write,
         write_app,
     };
+    use crate::error::Status;
     use std::io::{Read, Write};
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant, SystemTime};
@@ -638,14 +663,14 @@ mod tests {
         let folder = lock_folder("hand-over");
         let path = launch_lock_path_for(&folder.join("endpoint.json"));
         assert_eq!(path.file_name().expect("a file name").to_string_lossy(), LAUNCH_LOCK_NAME, "the lock sits beside the endpoint file");
-        let first = LaunchLock::take(&path).expect("the first run takes the lock");
+        let first = take_lock(&path);
         // The first run lets go as soon as its server is listening, so the second run waits a
         // moment and then decides with its eyes open rather than starting a manager of its own.
         let holder = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(120));
             drop(first);
         });
-        let second = LaunchLock::take(&path).expect("the second run gets the lock once the first lets go");
+        let second = take_lock(&path);
         holder.join().expect("the first run let go");
         drop(second);
         assert_nothing_left_behind(&folder);
@@ -658,12 +683,12 @@ mod tests {
         // holding would start a second manager, which is the very thing the lock exists to stop.
         let folder = lock_folder("held");
         let path = launch_lock_path_for(&folder.join("endpoint.json"));
-        let held = LaunchLock::take(&path).expect("the first run takes the lock");
+        let held = take_lock(&path);
         let started = Instant::now();
-        assert!(LaunchLock::take(&path).is_none(), "a second run gives up rather than starting its own");
+        assert!(matches!(LaunchLock::take(&path), LockOutcome::Held), "a second run gives up rather than starting its own");
         assert!(started.elapsed() >= LAUNCH_LOCK_WAIT, "it waits for the whole window before giving up");
         drop(held);
-        assert!(LaunchLock::take(&path).is_some(), "and the lock is free again once the first run is done");
+        assert!(matches!(LaunchLock::take(&path), LockOutcome::Taken(_)), "and the lock is free again once the first run is done");
         assert_nothing_left_behind(&folder);
         let _ = std::fs::remove_dir_all(&folder);
     }
@@ -676,11 +701,38 @@ mod tests {
         let file = std::fs::File::options().write(true).open(&path).expect("the lock file can be opened");
         file.set_modified(SystemTime::now() - LAUNCH_LOCK_STALE - Duration::from_secs(1)).expect("the lock can be made old");
         drop(file);
-        let taken = LaunchLock::take(&path).expect("a lock nobody is holding any more is taken over");
+        let taken = take_lock(&path);
         assert!(path.is_file(), "and it is held again");
         drop(taken);
         assert_nothing_left_behind(&folder);
         let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn a_launch_lock_that_cannot_be_made_is_a_failure_not_another_run() {
+        // Something is sitting where the lock's folder belongs, so the folder cannot be made. That is
+        // a broken machine, not another `caim open` holding the lock: the run has to say so and fail
+        // rather than exit 0 promising a manager that nobody is starting.
+        let folder = lock_folder("no-folder");
+        let blocker = folder.join("not-a-folder");
+        std::fs::write(&blocker, "an ordinary file, where a folder belongs").expect("a file can sit where the folder belongs");
+        let path = launch_lock_path_for(&blocker.join("endpoint.json"));
+        let outcome = LaunchLock::take(&path);
+        let LockOutcome::Failed(fail) = outcome else {
+            panic!("a lock that cannot be made is a failure, not contention or a lock we now hold");
+        };
+        assert_eq!(fail.status, Status::Internal, "so `caim open` reports it and exits nonzero");
+        assert!(!path.exists(), "and nothing was left behind where the lock would have been");
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    /// The lock a test wants, or a loud failure: these tests only ever expect to take it.
+    fn take_lock(path: &Path) -> LaunchLock {
+        match LaunchLock::take(path) {
+            LockOutcome::Taken(lock) => lock,
+            LockOutcome::Held => panic!("another run is holding the launch lock"),
+            LockOutcome::Failed(fail) => panic!("the launch lock could not be taken: {}", fail.sentence),
+        }
     }
 
     /// A folder of the test's own for one launch lock.

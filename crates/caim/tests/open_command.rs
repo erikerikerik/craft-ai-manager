@@ -111,6 +111,28 @@ fn two_caim_open_runs_at_once_start_one_manager_between_them() {
     let _ = std::fs::remove_dir_all(&folder);
 }
 
+#[test]
+fn open_fails_loudly_when_it_cannot_make_its_launch_lock() {
+    // Something is sitting where the endpoint folder belongs, so neither the lock nor the endpoint
+    // file can be made. Exiting 0 with "another `caim open` is starting" would promise a manager that
+    // nobody is starting, so this run has to fail instead.
+    let folder = std::env::temp_dir().join(format!("caim-it-{}-open-no-folder", std::process::id()));
+    let _ = std::fs::remove_dir_all(&folder);
+    std::fs::create_dir_all(&folder).expect("a folder for the test");
+    let blocker = folder.join("not-a-folder");
+    std::fs::write(&blocker, "an ordinary file, where a folder belongs").expect("a file can sit where the folder belongs");
+    let endpoint = blocker.join("endpoint.json");
+    let store = support::empty_store("open-no-folder");
+    let mut child = open_run(&endpoint, &store);
+    let status = wait(&mut child);
+    let (out, err) = read_output(&mut child);
+    assert!(!status.success(), "a launch lock that cannot be made is a failure, not a success: {status}, stdout: {out}");
+    assert!(!out.contains("being started by another"), "and it does not blame another run: {out}");
+    assert!(!err.is_empty(), "it says what went wrong: {err}");
+    assert!(!endpoint.exists(), "and no endpoint file was written");
+    let _ = std::fs::remove_dir_all(&folder);
+}
+
 /// One `caim open` pointed at one endpoint file, with its output kept rather than printed. Stdin is
 /// closed so the run never waits on the terminal of whoever is running the tests.
 fn open_run(endpoint: &std::path::Path, store: &std::path::Path) -> Child {

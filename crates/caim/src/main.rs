@@ -104,16 +104,21 @@ fn serve_and_release(fake_backend: bool, launch_lock: Option<endpoint::LaunchLoc
 ///
 /// The decision and the start are one step rather than two: a second `caim open` launched at the
 /// same moment waits on a lock file beside the endpoint file instead of starting a manager that
-/// nobody can find, and both writing the same activity log.
+/// nobody can find, and both writing the same activity log. Only a lock another run is genuinely
+/// holding counts as "somebody else is starting one"; a lock this machine cannot make at all is an
+/// error, because then no manager is coming.
 fn open() -> std::process::ExitCode {
     let endpoint_file = endpoint::endpoint_file_from_env();
     let launch_lock = match endpoint_file.as_deref().map(endpoint::launch_lock_path_for) {
         Some(path) => match endpoint::LaunchLock::take(&path) {
-            Some(lock) => Some(lock),
-            None => {
+            endpoint::LockOutcome::Taken(lock) => Some(lock),
+            endpoint::LockOutcome::Held => {
                 println!("Craft AI Manager is being started by another `caim open` right now. Nothing was started here.");
                 return std::process::ExitCode::SUCCESS;
             }
+            // No lock, and no other run holding one: the folder or the disk is the problem, and a
+            // manager started here could not publish an endpoint file anybody could read.
+            endpoint::LockOutcome::Failed(fail) => return report(fail),
         },
         // Nowhere on this platform to put an endpoint file, so nothing to lock either.
         None => None,
