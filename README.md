@@ -60,10 +60,18 @@ inherits that folder's permissions instead, so point it at a folder only you can
 `caim open` is the start-on-demand entry point (amendment 18, decision D5). It reads `endpoint.json` first: when a
 manager is answering `GET /v1/health` on the port that file names, it prints
 `Craft AI Manager is already running on 127.0.0.1:<port>. Nothing was started.` and exits 0 without binding a port.
+A manager that answers `503` because all of its connection slots are taken counts as running too: it is busy, not gone.
 With nothing answering it serves exactly what `caim serve` serves - the window comes with MG-13. PhotoCraft's
-"Open Craft AI Manager" button runs `caim open`, which is why every start records where this program lives.
+"Open Craft AI Manager" button runs `caim open`, which is why every start records where this program lives. Two
+`caim open` runs launched at the same moment decide once: the first holds `open.lock` beside the endpoint file while it
+starts a manager, and the second waits for that lock (up to 5 s) and then sees the manager the first one started.
 
-Two more files live in that same folder, and neither is deleted on exit:
+Three more files live in that same folder. `app.json` and `activity.jsonl` are never deleted on exit; `open.lock`
+exists only while a `caim open` is deciding whether to start a manager:
+
+| File | What it is |
+|---|---|
+| `open.lock` | held by one `caim open` across the decision and the start, so two runs launched together cannot both serve and race to replace `endpoint.json`. Created with `create_new`, holding a random nonce; gone as soon as the server is listening. One nobody has touched for 30 s belonged to a run that died, and the next run takes it over |
 
 | File | What it is |
 |---|---|

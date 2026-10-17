@@ -7,6 +7,7 @@
 //! folder has no such guarantee, so the file - and the temp file before it - are created with mode
 //! 0600 (the MG-01 review follow-up).
 
+use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
@@ -35,6 +36,20 @@ pub const APP_VERSION: u64 = 1;
 const HEALTH_TIMEOUT: Duration = Duration::from_millis(250);
 /// The endpoint file is JSON, and the protocol caps JSON at 64 KiB.
 const MAX_FILE_BYTES: u64 = 64 * 1024;
+/// The file beside `endpoint.json` that says one `caim open` is deciding whether to start a
+/// manager right now.
+const LAUNCH_LOCK_NAME: &str = "open.lock";
+/// How long a second `caim open` waits for the first to finish starting before it gives up. The
+/// lock is only held while a server binds its port and publishes the endpoint file, so a few
+/// seconds is a wide margin, and giving up costs a sentence rather than a manager.
+const LAUNCH_LOCK_WAIT: Duration = Duration::from_secs(5);
+/// How long between polls of a launch lock somebody else is holding.
+const LAUNCH_LOCK_POLL: Duration = Duration::from_millis(25);
+/// A launch lock older than this was left by a `caim open` that died between taking it and
+/// starting the server. It is longer than [LAUNCH_LOCK_WAIT] on purpose: a lock is only ever taken
+/// over once nobody is willing to wait for it any more, so a start that is merely slow keeps its
+/// lock.
+const LAUNCH_LOCK_STALE: Duration = Duration::from_secs(30);
 
 static WRITE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -119,6 +134,13 @@ pub fn write(path: &Path, port: u16, token: &str) -> Result<()> {
 #[must_use]
 pub fn app_path_for(endpoint: &Path) -> PathBuf {
     endpoint.with_file_name(APP_NAME)
+}
+
+/// The launch lock that belongs next to a given endpoint file. It sits beside the file the winner
+/// of the lock is about to write, so one folder holds everything about one manager.
+#[must_use]
+pub fn launch_lock_path_for(endpoint: &Path) -> PathBuf {
+    endpoint.with_file_name(LAUNCH_LOCK_NAME)
 }
 
 /// Write the app file, atomically the way [write] writes the endpoint file, and never delete it on
@@ -212,25 +234,39 @@ pub fn published_credentials(path: &Path) -> Option<(u16, String)> {
     Some((port, token.to_string()))
 }
 
-/// Whether a manager is answering on loopback at `port` with this token: `GET /v1/health`, and the
-/// answer we want is a 200.
+/// What a health probe found on the port an endpoint file names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Health {
+    /// A manager answered `/v1/health` with a 200.
+    Ready,
+    /// Something answered with a 503. That is a manager whose connection slots are all taken: the
+    /// accept loop refuses a request before it even routes it (`server.rs`, `refuse_busy`). It is
+    /// running, only busy, and starting a second manager over its endpoint file would be wrong.
+    Busy,
+    /// Nothing answered the way a manager does: a shut port, a socket that died, a reply that is
+    /// not a status line we know, or a stranger holding the port.
+    Absent,
+}
+
+/// What the manager on loopback at `port` says about itself when asked with this token: `GET
+/// /v1/health`, and the answer is one status line.
 ///
 /// This is a raw request rather than a client library on purpose. `caim open` has to answer a
 /// simple question about a machine-local port, and the whole of the answer is one status line.
 #[must_use]
-pub fn health_is_answering(port: u16, token: &str) -> bool {
+pub fn health_probe(port: u16, token: &str) -> Health {
     if token.chars().any(|ch| matches!(ch, '\r' | '\n' | '\0')) {
         // A token with a newline in it would be somebody writing headers for us.
-        return false;
+        return Health::Absent;
     }
     let address = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
-    let Ok(mut stream) = TcpStream::connect_timeout(&address, HEALTH_TIMEOUT) else { return false };
+    let Ok(mut stream) = TcpStream::connect_timeout(&address, HEALTH_TIMEOUT) else { return Health::Absent };
     if stream.set_read_timeout(Some(HEALTH_TIMEOUT)).is_err() {
-        return false;
+        return Health::Absent;
     }
     let request = format!("GET /v1/health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\nAccept: */*\r\nConnection: close\r\n\r\n");
     if stream.write_all(request.as_bytes()).and_then(|()| stream.flush()).is_err() {
-        return false;
+        return Health::Absent;
     }
     // One read can legally hand back half a status line, so keep reading until the line ends, the
     // peer hangs up, or the health check has had its say. Deciding on a fragment would start a second
@@ -255,7 +291,16 @@ pub fn health_is_answering(port: u16, token: &str) -> bool {
         }
     }
     let text = String::from_utf8_lossy(&head);
-    text.starts_with("HTTP/1.1 200") || text.starts_with("HTTP/1.0 200")
+    if text.starts_with("HTTP/1.1 200") || text.starts_with("HTTP/1.0 200") {
+        Health::Ready
+    } else if text.starts_with("HTTP/1.1 503") || text.starts_with("HTTP/1.0 503") {
+        Health::Busy
+    } else {
+        // A 401 means the port is answering but not with the token the file holds. The launch lock
+        // below closes the window where that could happen while a manager is starting, and a port
+        // that answers for nobody else is one a real manager can take over, so this stays Absent.
+        Health::Absent
+    }
 }
 
 /// What `caim open` should do about a manager (amendment 18).
@@ -269,11 +314,84 @@ pub enum Launch {
 
 /// Look at the endpoint file this run would write, and ask whether a manager is already answering
 /// there. A missing, unreadable, or dead file means start one: the file is a hint, not a promise.
+///
+/// A manager that answers 503 because every connection slot is taken is a manager that is running,
+/// so it counts as already running too.
 #[must_use]
 pub fn launch_decision(endpoint: Option<&Path>) -> Launch {
     let Some(path) = endpoint.filter(|path| path.is_file()) else { return Launch::Start };
     let Some((port, token)) = published_credentials(path) else { return Launch::Start };
-    if health_is_answering(port, &token) { Launch::AlreadyRunning { port } } else { Launch::Start }
+    match health_probe(port, &token) {
+        Health::Ready | Health::Busy => Launch::AlreadyRunning { port },
+        Health::Absent => Launch::Start,
+    }
+}
+
+/// The lock one `caim open` holds while it decides whether a manager is running and, when none
+/// is, starts one. Deciding and starting are one step, not two: without the lock, two `caim open`
+/// runs launched at the same moment can both decide to start, both serve, and race to replace
+/// `endpoint.json`. The loser keeps serving on a port no client can find, and both write the same
+/// activity log. The lock goes as soon as the server is listening, so it is held for a moment
+/// rather than for the life of the manager.
+pub struct LaunchLock {
+    path: PathBuf,
+    nonce: String,
+}
+
+impl LaunchLock {
+    /// Take the lock, or `None` when another `caim open` holds it. A held lock is waited for up to
+    /// [LAUNCH_LOCK_WAIT], which is how the second run ends up seeing the manager the first one
+    /// started instead of starting its own; a lock older than [LAUNCH_LOCK_STALE] belonged to a run
+    /// that died partway through starting, and is taken over once - see [crate::fetch::claim_stale].
+    #[must_use]
+    pub fn take(path: &Path) -> Option<LaunchLock> {
+        let nonce = crate::token::random_token().ok()?;
+        // The lock lives beside the endpoint file, so the folder comes first: a machine that has
+        // never run the manager has no folder yet, and that is not somebody else holding the lock.
+        let parent = path.parent().filter(|parent| !parent.as_os_str().is_empty())?;
+        if std::fs::create_dir_all(parent).is_err() {
+            return None;
+        }
+        let deadline = Instant::now() + LAUNCH_LOCK_WAIT;
+        loop {
+            match OpenOptions::new().write(true).create_new(true).open(path) {
+                Ok(mut file) => {
+                    if file.write_all(nonce.as_bytes()).and_then(|()| file.flush()).is_err() {
+                        let _ = std::fs::remove_file(path);
+                        return None;
+                    }
+                    return Some(LaunchLock { path: path.to_path_buf(), nonce });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                // A folder that is not there, a file we cannot read: nothing to be decided safely.
+                Err(_) => return None,
+            }
+            if crate::fetch::is_older_than(path, LAUNCH_LOCK_STALE) && crate::fetch::claim_stale(path, &nonce, LAUNCH_LOCK_STALE) {
+                continue;
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(LAUNCH_LOCK_POLL);
+        }
+    }
+}
+
+impl Drop for LaunchLock {
+    /// Release the lock the way [crate::fetch] releases an install lock, without a check-then-delete
+    /// race: move it aside to a name only this run uses, and delete it there only if it is still the
+    /// one this run wrote; if another run took it over in the meantime, put that one back.
+    fn drop(&mut self) {
+        let aside = crate::fetch::sibling(&self.path, &format!("{}.release", self.nonce));
+        if std::fs::rename(&self.path, &aside).is_err() {
+            return;
+        }
+        let ours = std::fs::read_to_string(&aside).is_ok_and(|text| text == self.nonce);
+        if !ours && std::fs::rename(&aside, &self.path).is_ok() {
+            return;
+        }
+        let _ = std::fs::remove_file(&aside);
+    }
 }
 
 /// The endpoint file as JSON, never reading past the cap so an oversized file is never parsed.
@@ -292,11 +410,13 @@ fn read_value(path: &Path) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::{
-        APP_NAME, APP_VERSION, ENDPOINT_VERSION, Launch, app_path_for, endpoint_file_from_env, health_is_answering, is_ours, launch_decision,
-        published_credentials, published_port, remove, temp_path, write, write_app,
+        APP_NAME, APP_VERSION, ENDPOINT_VERSION, Health, LAUNCH_LOCK_NAME, LAUNCH_LOCK_STALE, LAUNCH_LOCK_WAIT, Launch, LaunchLock, app_path_for,
+        endpoint_file_from_env, health_probe, is_ours, launch_decision, launch_lock_path_for, published_credentials, published_port, remove, temp_path, write,
+        write_app,
     };
     use std::io::{Read, Write};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, Instant, SystemTime};
 
     fn temp_endpoint(who: &str) -> PathBuf {
         std::env::temp_dir().join(format!("caim-endpoint-{who}-{}.json", std::process::id()))
@@ -459,8 +579,8 @@ mod tests {
             let listener = std::net::TcpListener::bind(std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0))).expect("a free port");
             listener.local_addr().expect("the address of a bound port").port()
         };
-        assert!(!health_is_answering(port, "token"), "a shut port answers nothing");
-        assert!(!health_is_answering(port, "tok\r\nen"), "a token that could write its own headers is refused");
+        assert_eq!(health_probe(port, "token"), Health::Absent, "a shut port answers nothing");
+        assert_eq!(health_probe(port, "tok\r\nen"), Health::Absent, "a token that could write its own headers is refused");
         assert_eq!(launch_decision(None), Launch::Start, "no endpoint file means start one");
         let path = temp_endpoint("dead");
         let _guard = TempFile(path.clone());
@@ -486,7 +606,95 @@ mod tests {
             let _ = client.write_all(b"00 OK\r\nContent-Length: 2\r\n\r\nok");
             let _ = client.flush();
         });
-        assert!(health_is_answering(port, "token"), "a 200 split across reads is still a manager answering");
+        assert_eq!(health_probe(port, "token"), Health::Ready, "a 200 split across reads is still a manager answering");
         server.join().expect("the fake manager finished");
+    }
+
+    #[test]
+    fn a_manager_with_no_free_connection_slot_is_still_running() {
+        // The accept loop answers 503 before it even routes a request, when every connection slot
+        // is taken. Reading that as "no manager" would start a second one over the first one's file.
+        let listener = std::net::TcpListener::bind(std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0))).expect("a free port");
+        let port = listener.local_addr().expect("the address of a bound port").port();
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let Ok((mut client, _)) = listener.accept() else { return };
+                let mut request = [0u8; 512];
+                let _ = client.read(&mut request);
+                let _ = client.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 2\r\n\r\nno");
+                let _ = client.flush();
+            }
+        });
+        assert_eq!(health_probe(port, "token"), Health::Busy, "a 503 is a manager with no free slot, not one that has gone away");
+        let path = temp_endpoint("busy");
+        let _guard = TempFile(path.clone());
+        write(&path, port, "token").expect("a file naming a busy manager can be written");
+        assert_eq!(launch_decision(Some(&path)), Launch::AlreadyRunning { port }, "and the launch decision agrees, so nothing is started");
+        server.join().expect("the fake manager finished");
+    }
+
+    #[test]
+    fn one_launch_lock_at_a_time_and_a_clean_hand_over() {
+        let folder = lock_folder("hand-over");
+        let path = launch_lock_path_for(&folder.join("endpoint.json"));
+        assert_eq!(path.file_name().expect("a file name").to_string_lossy(), LAUNCH_LOCK_NAME, "the lock sits beside the endpoint file");
+        let first = LaunchLock::take(&path).expect("the first run takes the lock");
+        // The first run lets go as soon as its server is listening, so the second run waits a
+        // moment and then decides with its eyes open rather than starting a manager of its own.
+        let holder = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(120));
+            drop(first);
+        });
+        let second = LaunchLock::take(&path).expect("the second run gets the lock once the first lets go");
+        holder.join().expect("the first run let go");
+        drop(second);
+        assert_nothing_left_behind(&folder);
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn a_launch_lock_another_run_is_holding_is_not_taken_over() {
+        // Waiting out the window and giving up is the honest answer. Taking a lock another run is
+        // holding would start a second manager, which is the very thing the lock exists to stop.
+        let folder = lock_folder("held");
+        let path = launch_lock_path_for(&folder.join("endpoint.json"));
+        let held = LaunchLock::take(&path).expect("the first run takes the lock");
+        let started = Instant::now();
+        assert!(LaunchLock::take(&path).is_none(), "a second run gives up rather than starting its own");
+        assert!(started.elapsed() >= LAUNCH_LOCK_WAIT, "it waits for the whole window before giving up");
+        drop(held);
+        assert!(LaunchLock::take(&path).is_some(), "and the lock is free again once the first run is done");
+        assert_nothing_left_behind(&folder);
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn a_launch_lock_left_by_a_dead_run_is_taken_over_once() {
+        let folder = lock_folder("dead-run");
+        let path = launch_lock_path_for(&folder.join("endpoint.json"));
+        std::fs::write(&path, "a run that died partway through starting").expect("a lock file can be left behind");
+        let file = std::fs::File::options().write(true).open(&path).expect("the lock file can be opened");
+        file.set_modified(SystemTime::now() - LAUNCH_LOCK_STALE - Duration::from_secs(1)).expect("the lock can be made old");
+        drop(file);
+        let taken = LaunchLock::take(&path).expect("a lock nobody is holding any more is taken over");
+        assert!(path.is_file(), "and it is held again");
+        drop(taken);
+        assert_nothing_left_behind(&folder);
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    /// A folder of the test's own for one launch lock.
+    fn lock_folder(who: &str) -> PathBuf {
+        let folder = std::env::temp_dir().join(format!("caim-endpoint-{}-{who}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&folder);
+        std::fs::create_dir_all(&folder).expect("a folder for the lock");
+        folder
+    }
+
+    /// A lock that has been released leaves its folder exactly as it found it.
+    fn assert_nothing_left_behind(folder: &Path) {
+        let left_behind: Vec<String> =
+            std::fs::read_dir(folder).expect("the folder is readable").flatten().map(|entry| entry.file_name().to_string_lossy().to_string()).collect();
+        assert!(left_behind.is_empty(), "a released lock leaves nothing behind: {left_behind:?}");
     }
 }

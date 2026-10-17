@@ -633,7 +633,7 @@ impl InstallLock {
                     return Ok(InstallLock { path: path.to_path_buf(), nonce, file, touched: Instant::now(), taken_over });
                 }
                 Err(error) if error.kind() == ErrorKind::AlreadyExists => {
-                    if attempt == 0 && is_stale(path) && claim_stale(path, &nonce) {
+                    if attempt == 0 && is_stale(path) && claim_stale(path, &nonce, LOCK_STALE) {
                         taken_over = true;
                         continue;
                     }
@@ -678,16 +678,17 @@ impl Drop for InstallLock {
     }
 }
 
-/// Take a stale lock out of the way so that exactly one install can claim it: rename it to a name
-/// only this install uses (of several installs racing, one rename wins and the others find nothing
-/// to move), check that what was moved really is the stale lock and not a fresh one that replaced it
-/// in the meantime, and only then delete it.
-fn claim_stale(path: &Path, nonce: &str) -> bool {
+/// Take a stale lock out of the way so that exactly one claimer can take it: rename it to a name
+/// only this claimer uses (of several racing, one rename wins and the others find nothing to move),
+/// check that what was moved really is the stale lock and not a fresh one that replaced it in the
+/// meantime, and only then delete it. [is_older_than] is asked with `limit`, because a lock held
+/// across a short step goes stale sooner than one held across a download.
+pub(crate) fn claim_stale(path: &Path, nonce: &str, limit: Duration) -> bool {
     let aside = sibling(path, &format!("{nonce}.stale"));
     if std::fs::rename(path, &aside).is_err() {
         return false;
     }
-    if !is_stale(&aside) {
+    if !is_older_than(&aside, limit) {
         // A live install's lock arrived between the check and the rename: give it back.
         if std::fs::rename(&aside, path).is_err() {
             let _ = std::fs::remove_file(&aside);
@@ -699,7 +700,7 @@ fn claim_stale(path: &Path, nonce: &str) -> bool {
 }
 
 /// `<path>.<suffix>`, next to `path`.
-fn sibling(path: &Path, suffix: &str) -> PathBuf {
+pub(crate) fn sibling(path: &Path, suffix: &str) -> PathBuf {
     let mut name = path.file_name().map(std::ffi::OsStr::to_os_string).unwrap_or_default();
     name.push(".");
     name.push(suffix);
@@ -708,11 +709,17 @@ fn sibling(path: &Path, suffix: &str) -> PathBuf {
 
 /// Has nobody touched this file for [LOCK_STALE]? A file whose age cannot be read counts as live.
 fn is_stale(path: &Path) -> bool {
+    is_older_than(path, LOCK_STALE)
+}
+
+/// Has nobody touched this file for `limit`? A file whose age cannot be read counts as live,
+/// because a lock nobody can date is safer treated as one that is still held.
+pub(crate) fn is_older_than(path: &Path, limit: Duration) -> bool {
     std::fs::metadata(path)
         .and_then(|metadata| metadata.modified())
         .ok()
         .and_then(|modified| SystemTime::now().duration_since(modified).ok())
-        .is_some_and(|age| age >= LOCK_STALE)
+        .is_some_and(|age| age >= limit)
 }
 
 /// Re-hash an installed model and rewrite `verified.json`. Startup does not do this; a person does,

@@ -60,6 +60,13 @@ fn help() {
 
 /// Run the server until something asks it to stop, then shut down cleanly.
 fn serve(fake_backend: bool) -> std::process::ExitCode {
+    serve_and_release(fake_backend, None)
+}
+
+/// [serve], handing over the launch lock this run took as `caim open`. The lock goes as soon as
+/// the server is listening and `endpoint.json` names this port, which is the moment a second
+/// `caim open` can stop waiting and see a running manager instead of starting another one.
+fn serve_and_release(fake_backend: bool, launch_lock: Option<endpoint::LaunchLock>) -> std::process::ExitCode {
     // MG-08 review round 2: the signal handler goes in before `Server::start` writes the endpoint
     // file, so a supervisor that stops the process the moment it can find the port still gets the
     // clean stop instead of the operating system's default handling.
@@ -73,6 +80,7 @@ fn serve(fake_backend: bool) -> std::process::ExitCode {
         Ok(server) => server,
         Err(fail) => return report(fail),
     };
+    drop(launch_lock);
     let endpoint_variable = endpoint::ENDPOINT_ENV;
     println!("Craft AI Manager {VERSION} listening on 127.0.0.1:{}", server.port());
     match server.endpoint_path() {
@@ -93,13 +101,29 @@ fn serve(fake_backend: bool) -> std::process::ExitCode {
 
 /// `caim open`: start the manager unless one is already answering on loopback (amendment 18).
 /// When nothing is answering, this is `caim serve` for now - MG-13 gives the manager its window.
+///
+/// The decision and the start are one step rather than two: a second `caim open` launched at the
+/// same moment waits on a lock file beside the endpoint file instead of starting a manager that
+/// nobody can find, and both writing the same activity log.
 fn open() -> std::process::ExitCode {
-    match endpoint::launch_decision(endpoint::endpoint_file_from_env().as_deref()) {
+    let endpoint_file = endpoint::endpoint_file_from_env();
+    let launch_lock = match endpoint_file.as_deref().map(endpoint::launch_lock_path_for) {
+        Some(path) => match endpoint::LaunchLock::take(&path) {
+            Some(lock) => Some(lock),
+            None => {
+                println!("Craft AI Manager is being started by another `caim open` right now. Nothing was started here.");
+                return std::process::ExitCode::SUCCESS;
+            }
+        },
+        // Nowhere on this platform to put an endpoint file, so nothing to lock either.
+        None => None,
+    };
+    match endpoint::launch_decision(endpoint_file.as_deref()) {
         Launch::AlreadyRunning { port } => {
             println!("Craft AI Manager is already running on 127.0.0.1:{port}. Nothing was started.");
             std::process::ExitCode::SUCCESS
         }
-        Launch::Start => serve(false),
+        Launch::Start => serve_and_release(false, launch_lock),
     }
 }
 
