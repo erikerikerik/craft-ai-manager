@@ -8,8 +8,10 @@
 //! 0600 (the MG-01 review follow-up).
 
 use std::io::{Read, Write};
+use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use serde::Serialize;
 use serde_json::Value;
@@ -24,6 +26,13 @@ pub const ENDPOINT_ENV: &str = "CRAFT_AI_ENDPOINT";
 const ENDPOINT_DIR: &str = "CraftAI";
 /// The file inside that folder.
 const ENDPOINT_NAME: &str = "endpoint.json";
+/// The file that says where the manager program lives (amendment 18, "Starting CAIM on demand").
+pub const APP_NAME: &str = "app.json";
+/// The version an app file declares.
+pub const APP_VERSION: u64 = 1;
+/// How long to wait for a manager to answer `/v1/health`. Loopback answers at once, so this is
+/// only a guard against a port somebody else has taken over.
+const HEALTH_TIMEOUT: Duration = Duration::from_millis(250);
 /// The endpoint file is JSON, and the protocol caps JSON at 64 KiB.
 const MAX_FILE_BYTES: u64 = 64 * 1024;
 
@@ -35,6 +44,13 @@ struct EndpointFile {
     version: u64,
     port: u32,
     token: String,
+}
+
+/// What the app file holds: the shape's version and this executable, as an absolute path.
+#[derive(Serialize)]
+struct AppFile {
+    version: u64,
+    exe: String,
 }
 
 /// The file for this platform, or None when the platform has nowhere to put one.
@@ -99,6 +115,33 @@ pub fn write(path: &Path, port: u16, token: &str) -> Result<()> {
     Ok(())
 }
 
+/// The app file that belongs next to a given endpoint file.
+#[must_use]
+pub fn app_path_for(endpoint: &Path) -> PathBuf {
+    endpoint.with_file_name(APP_NAME)
+}
+
+/// Write the app file, atomically the way [write] writes the endpoint file, and never delete it on
+/// the way out: it says where the program is, not that the program is running. PhotoCraft reads it
+/// to start the manager when nothing is answering (amendment 18).
+pub fn write_app(path: &Path, exe: &Path) -> Result<()> {
+    let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) else {
+        return Err(Fail::internal(format!("Craft AI Manager has no folder to write {} in.", path.display())));
+    };
+    std::fs::create_dir_all(parent).map_err(|error| Fail::internal(format!("Craft AI Manager could not create {}: {error}", parent.display())))?;
+    let body = serde_json::to_vec(&AppFile { version: APP_VERSION, exe: exe.display().to_string() })?;
+    let temp = temp_path(path);
+    if let Err(error) = write_whole(&temp, &body) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(Fail::internal(format!("Craft AI Manager could not write its app file at {}: {error}", path.display())));
+    }
+    if let Err(error) = std::fs::rename(&temp, path) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(Fail::internal(format!("Craft AI Manager could not put its app file at {}: {error}", path.display())));
+    }
+    Ok(())
+}
+
 /// Create, write and flush one file before it is renamed into place.
 fn write_whole(temp: &Path, body: &[u8]) -> std::io::Result<()> {
     let mut file = create_private(temp)?;
@@ -122,10 +165,12 @@ fn create_private(path: &Path) -> std::io::Result<std::fs::File> {
     std::fs::File::create(path)
 }
 
-/// A temp name in the same folder as the target, so the rename stays inside one folder.
+/// A temp name in the same folder as the target, so the rename stays inside one folder. The name
+/// hangs off the target's own name, so two files in one folder never reach for the same temp.
 fn temp_path(path: &Path) -> PathBuf {
     let counter = WRITE_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let name = format!("{ENDPOINT_NAME}.tmp-{}-{counter}", std::process::id());
+    let stem = path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_else(|| ENDPOINT_NAME.to_string());
+    let name = format!("{stem}.tmp-{}-{counter}", std::process::id());
     path.with_file_name(name)
 }
 
@@ -156,6 +201,65 @@ pub fn published_port(path: &Path) -> Option<u16> {
     u16::try_from(port).ok()
 }
 
+/// The port and token an endpoint file publishes together, or `None` when it does not publish a
+/// usable pair. A stale file naming a port nobody owns is still a pair; whether the port is alive
+/// is a separate question, answered by [health_is_answering].
+#[must_use]
+pub fn published_credentials(path: &Path) -> Option<(u16, String)> {
+    let value = read_value(path)?;
+    let port = u16::try_from(value.get("port").and_then(Value::as_u64)?).ok()?;
+    let token = value.get("token").and_then(Value::as_str).filter(|token| !token.is_empty())?;
+    Some((port, token.to_string()))
+}
+
+/// Whether a manager is answering on loopback at `port` with this token: `GET /v1/health`, and the
+/// answer we want is a 200.
+///
+/// This is a raw request rather than a client library on purpose. `caim open` has to answer a
+/// simple question about a machine-local port, and the whole of the answer is one status line.
+#[must_use]
+pub fn health_is_answering(port: u16, token: &str) -> bool {
+    if token.chars().any(|ch| matches!(ch, '\r' | '\n' | '\0')) {
+        // A token with a newline in it would be somebody writing headers for us.
+        return false;
+    }
+    let address = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+    let Ok(mut stream) = TcpStream::connect_timeout(&address, HEALTH_TIMEOUT) else { return false };
+    if stream.set_read_timeout(Some(HEALTH_TIMEOUT)).is_err() {
+        return false;
+    }
+    let request = format!("GET /v1/health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\nAccept: */*\r\nConnection: close\r\n\r\n");
+    if stream.write_all(request.as_bytes()).and_then(|()| stream.flush()).is_err() {
+        return false;
+    }
+    let mut head = [0u8; 32];
+    match stream.read(&mut head) {
+        Ok(read) => {
+            let text = String::from_utf8_lossy(&head[..read]);
+            text.starts_with("HTTP/1.1 200") || text.starts_with("HTTP/1.0 200")
+        }
+        Err(_) => false,
+    }
+}
+
+/// What `caim open` should do about a manager (amendment 18).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Launch {
+    /// One is already answering on loopback, and `port` is where.
+    AlreadyRunning { port: u16 },
+    /// Nothing is answering, so this is the run that starts one.
+    Start,
+}
+
+/// Look at the endpoint file this run would write, and ask whether a manager is already answering
+/// there. A missing, unreadable, or dead file means start one: the file is a hint, not a promise.
+#[must_use]
+pub fn launch_decision(endpoint: Option<&Path>) -> Launch {
+    let Some(path) = endpoint.filter(|path| path.is_file()) else { return Launch::Start };
+    let Some((port, token)) = published_credentials(path) else { return Launch::Start };
+    if health_is_answering(port, &token) { Launch::AlreadyRunning { port } } else { Launch::Start }
+}
+
 /// The endpoint file as JSON, never reading past the cap so an oversized file is never parsed.
 /// `None` when it is missing, too big, or not JSON.
 fn read_value(path: &Path) -> Option<Value> {
@@ -171,7 +275,10 @@ fn read_value(path: &Path) -> Option<Value> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ENDPOINT_VERSION, endpoint_file_from_env, is_ours, published_port, remove, temp_path, write};
+    use super::{
+        APP_NAME, APP_VERSION, ENDPOINT_VERSION, Launch, app_path_for, endpoint_file_from_env, health_is_answering, is_ours, launch_decision,
+        published_credentials, published_port, remove, temp_path, write, write_app,
+    };
     use std::path::PathBuf;
 
     fn temp_endpoint(who: &str) -> PathBuf {
@@ -279,5 +386,69 @@ mod tests {
         std::fs::write(&path, "not json at all").expect("a file that is not JSON can be written");
         assert_eq!(published_port(&path), None, "and so is a file that is not JSON");
         assert_eq!(published_port(&path.with_file_name("not-there.json")), None, "and a file that is not there");
+    }
+
+    #[test]
+    fn the_app_file_names_the_executable_and_survives_shutdown() {
+        let folder = std::env::temp_dir().join(format!("caim-app-it-{}-unit", std::process::id()));
+        let _ = std::fs::remove_dir_all(&folder);
+        std::fs::create_dir_all(&folder).expect("the folder is created");
+        let endpoint = folder.join("endpoint.json");
+        let app = app_path_for(&endpoint);
+        assert_eq!(app, folder.join(APP_NAME), "the app file sits next to the endpoint file");
+        write(&endpoint, 4010, "mine").expect("the endpoint file is written");
+        write_app(&app, std::path::Path::new("C:/CraftAI/caim.exe")).expect("the app file is written");
+        write_app(&app, std::path::Path::new("C:/CraftAI/next/caim.exe")).expect("and the next start replaces it");
+        let text = std::fs::read_to_string(&app).expect("the app file is readable");
+        let value: serde_json::Value = serde_json::from_str(&text).expect("the app file is JSON");
+        assert_eq!(value.get("version").and_then(serde_json::Value::as_u64), Some(APP_VERSION));
+        assert_eq!(value.get("exe").and_then(serde_json::Value::as_str), Some("C:/CraftAI/next/caim.exe"));
+        remove(&endpoint, "mine").expect("a clean shutdown takes the endpoint file");
+        assert!(!endpoint.exists(), "the endpoint file goes when the manager stops");
+        assert!(app.is_file(), "the app file stays: it says where the program is, not that the program runs");
+        let left_behind: Vec<String> =
+            std::fs::read_dir(&folder).expect("the folder is readable").flatten().map(|entry| entry.file_name().to_string_lossy().to_string()).collect();
+        assert_eq!(left_behind, vec![APP_NAME.to_string()], "no temp file is left behind: {left_behind:?}");
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn the_app_file_gets_a_temp_name_of_its_own() {
+        let path = PathBuf::from("some").join("where").join(APP_NAME);
+        let temp = temp_path(&path);
+        assert_eq!(temp.parent(), path.parent());
+        assert!(
+            temp.file_name().unwrap_or_default().to_string_lossy().starts_with("app.json.tmp-"),
+            "the temp name hangs off the file being written, not off endpoint.json"
+        );
+    }
+
+    #[test]
+    fn credentials_need_both_a_port_and_a_token() {
+        let path = temp_endpoint("credentials");
+        let _guard = TempFile(path.clone());
+        write(&path, 4011, "both").expect("the file is written");
+        assert_eq!(published_credentials(&path), Some((4011, "both".to_string())), "the pair a working manager published");
+        std::fs::write(&path, r#"{"version": 1, "port": 4011, "token": ""}"#).expect("a file naming an empty token can be written");
+        assert_eq!(published_credentials(&path), None, "an empty token is not a credential");
+        std::fs::write(&path, r#"{"version": 1, "token": "no-port"}"#).expect("a file naming no port can be written");
+        assert_eq!(published_credentials(&path), None, "and neither is a file that names no port");
+    }
+
+    #[test]
+    fn a_port_nobody_is_listening_on_is_not_a_running_manager() {
+        // Bind a port and let it go, so the port is one this test knows is shut.
+        let port = {
+            let listener = std::net::TcpListener::bind(std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0))).expect("a free port");
+            listener.local_addr().expect("the address of a bound port").port()
+        };
+        assert!(!health_is_answering(port, "token"), "a shut port answers nothing");
+        assert!(!health_is_answering(port, "tok\r\nen"), "a token that could write its own headers is refused");
+        assert_eq!(launch_decision(None), Launch::Start, "no endpoint file means start one");
+        let path = temp_endpoint("dead");
+        let _guard = TempFile(path.clone());
+        assert_eq!(launch_decision(Some(&path)), Launch::Start, "a file that is not there means start one");
+        write(&path, port, "gone").expect("a file naming a shut port can be written");
+        assert_eq!(launch_decision(Some(&path)), Launch::Start, "and so does a file naming a port nobody answers on");
     }
 }

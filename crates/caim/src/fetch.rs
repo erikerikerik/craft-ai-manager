@@ -1,8 +1,9 @@
 //! Getting a model file, and the rules that keep a bad one out of the store.
 //!
 //! SPEC v1.1 amendment 14 and PhotoCraft FEATURES row CAIM-03: download with a progress report, hash
-//! it while it streams, and refuse anything that does not match the catalog. M1 has no resume - a
-//! half-download starts again - and cancellation waits for MG-05.
+//! it while it streams, and refuse anything that does not match the catalog. Amendment 18 adds
+//! restart-safe resume: a half-download keeps its bytes and a note saying what they are meant to
+//! become, and the next install re-hashes them and asks the server for the rest.
 //!
 //! Everything here goes through the [Fetch](Fetch) trait, so the tests never touch the network: they
 //! hand over bytes and count calls. A model that is already installed makes no request at all.
@@ -31,12 +32,39 @@ const LOCK_HEARTBEAT: Duration = Duration::from_secs(5);
 /// A lock nobody has refreshed for this long was left by an install that died (Ctrl+C, a crash).
 pub const LOCK_STALE: Duration = Duration::from_secs(120);
 
-/// An open download: what the server says the length is, when it says, and the bytes.
+/// How much of the file the server sent back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Answer {
+    /// The whole file, from byte zero - either because nothing was asked for, or because the server
+    /// ignored the range and started us over.
+    Full,
+    /// The bytes from the offset that was asked for, which is a `206`.
+    Partial,
+}
+
+/// An open download: what the server says the length is, when it says, how much of it arrived, and
+/// the bytes.
 pub struct Stream {
     /// The server's own `Content-Length`, if it sent one.
     pub claimed_len: Option<u64>,
+    /// The whole file, or the part that was asked for.
+    pub answer: Answer,
     /// The body.
     pub reader: Box<dyn Read>,
+}
+
+impl Stream {
+    /// A stream holding the whole file.
+    #[must_use]
+    pub fn full(claimed_len: Option<u64>, reader: Box<dyn Read>) -> Self {
+        Self { claimed_len, answer: Answer::Full, reader }
+    }
+
+    /// A stream holding the bytes from an offset on.
+    #[must_use]
+    pub fn partial(claimed_len: Option<u64>, reader: Box<dyn Read>) -> Self {
+        Self { claimed_len, answer: Answer::Partial, reader }
+    }
 }
 
 /// How CAIM opens a URL. Kept this small so the tests can hand over a byte slice instead of a
@@ -46,6 +74,12 @@ pub struct Stream {
 pub trait Fetch {
     /// Open `url` for reading.
     fn open(&self, url: &str) -> Result<Stream>;
+
+    /// Open `url` for reading, asking for the bytes from `offset` on. An implementation that cannot
+    /// ask for a range opens the whole file, and says so with [Answer::Full].
+    fn open_range(&self, url: &str, _offset: u64) -> Result<Stream> {
+        self.open(url)
+    }
 }
 
 /// The real [Fetch](Fetch): HTTPS through `ureq` with rustls, no async runtime, redirects followed
@@ -64,35 +98,77 @@ impl HttpFetch {
     /// An agent for the catalog's URLs: TLS only, redirects allowed but never to HTTP.
     #[must_use]
     pub fn new() -> Self {
-        let config = ureq::config::Config::builder()
-            .https_only(true)
-            .max_redirects(MAX_REDIRECTS)
-            .timeout_connect(Some(CONNECT_TIMEOUT))
-            .timeout_recv_response(Some(RESPONSE_TIMEOUT))
-            .build();
-        Self { agent: ureq::Agent::new_with_config(config) }
+        Self { agent: ureq::Agent::new_with_config(agent_config(true)) }
     }
+
+    /// The same agent, but willing to talk plain HTTP. Only for a test server on loopback: every
+    /// catalog URL is HTTPS, and [HttpFetch::new] is what the program itself uses.
+    #[must_use]
+    pub fn allowing_plain_http() -> Self {
+        Self { agent: ureq::Agent::new_with_config(agent_config(false)) }
+    }
+}
+
+/// The one agent configuration, so the plain-HTTP test agent differs from the real one in nothing
+/// but `https_only`.
+fn agent_config(https_only: bool) -> ureq::config::Config {
+    ureq::config::Config::builder()
+        .https_only(https_only)
+        .max_redirects(MAX_REDIRECTS)
+        .timeout_connect(Some(CONNECT_TIMEOUT))
+        .timeout_recv_response(Some(RESPONSE_TIMEOUT))
+        .build()
 }
 
 impl Fetch for HttpFetch {
     fn open(&self, url: &str) -> Result<Stream> {
-        let response = match self.agent.get(url).call() {
+        self.open_range(url, 0)
+    }
+
+    fn open_range(&self, url: &str, offset: u64) -> Result<Stream> {
+        let request = self.agent.get(url);
+        let request = if offset == 0 { request } else { request.header("Range", format!("bytes={offset}-")) };
+        let response = match request.call() {
             Ok(response) => response,
+            Err(ureq::Error::StatusCode(status)) => return Err(resume_status_error(url, offset, status)),
             Err(error) => return Err(Fail::internal(format!("Craft AI Manager could not start the download of {url}: {error}"))),
         };
+        let answer = resume_answer(url, offset, response.status().as_u16())?;
         let body = response.into_body();
         let claimed_len = body.content_length();
-        Ok(Stream { claimed_len, reader: Box::new(body.into_reader()) })
+        Ok(Stream { claimed_len, answer, reader: Box::new(body.into_reader()) })
     }
 }
+
+/// What an answer to a download means: a `206` continues where the bytes on disk stopped, a `200`
+/// starts over from zero, and anything else is an error that keeps the part files.
+fn resume_answer(url: &str, offset: u64, status: u16) -> Result<Answer> {
+    match status {
+        206 => Ok(Answer::Partial),
+        200 => Ok(Answer::Full),
+        other => Err(resume_status_error(url, offset, other)),
+    }
+}
+
+/// The sentence for a server that answered a download, or a range of one, with a status that is not
+/// a file.
+fn resume_status_error(url: &str, offset: u64, status: u16) -> Fail {
+    let asked = if offset == 0 { "the file".to_string() } else { format!("the bytes from {offset} on") };
+    Fail::internal(format!("{url} answered {status} when Craft AI Manager asked for {asked}."))
+}
+
+/// How often the resume note is rewritten while bytes arrive (amendment 18: at least every 8 MiB).
+const META_EVERY: u64 = 8 * 1024 * 1024;
 
 /// What an install did.
 #[derive(Clone, Debug)]
 pub enum Outcome {
     /// Nothing was fetched: the file, its size and its verification were already in place.
     AlreadyInstalled,
-    /// The file came down, hashed to what the catalog promised, and was verified.
-    Downloaded { sha256: String, bytes: u64, elapsed_ms: u64 },
+    /// The file came down, hashed to what the catalog promised, and was verified. `resumed_from` is
+    /// how many bytes were already on disk when this install picked the download up, so 0 unless a
+    /// restart left something worth continuing.
+    Downloaded { sha256: String, bytes: u64, elapsed_ms: u64, resumed_from: u64 },
 }
 
 /// What a re-check found.
@@ -137,19 +213,66 @@ fn download(model: &Model, root: &Path, fetch: &dyn Fetch, progress: &mut dyn Fn
         return Ok(Outcome::AlreadyInstalled);
     }
     remove_dead_parts(&folder, model);
-    fetch_into_place(model, root, fetch, progress, &mut || lock.heartbeat())
+    fetch_into_place(model, root, fetch, progress, &mut || lock.heartbeat(), true)
 }
 
 /// Stream the file into this install's own `.part`, hashed as it arrives; refuse it if the server's
 /// length or the bytes read go past the catalog size; sync it to disk; and rename it into place and
-/// record it only when the hash matches. Any failure deletes this install's `.part` and nothing else.
-fn fetch_into_place(model: &Model, root: &Path, fetch: &dyn Fetch, progress: &mut dyn FnMut(u64, u64), alive: &mut dyn FnMut()) -> Result<Outcome> {
+/// record it only when the hash matches. A failure that means the bytes are wrong deletes this
+/// install's part files; a failure that only means the download stopped keeps them, so the next
+/// install can pick the bytes up (SPEC v1.1 amendment 18).
+///
+/// Amendment 18 writes this down as `<file>.part` plus `<file>.part.json`. The tag is kept on both
+/// names here for the reason C6 established: two installs must never write the same half-file, so
+/// this one is `<file>.<tag>.part` and its note is `<file>.<tag>.part.json`. A restart finds the
+/// pair again by [adopt_part], which renames it under the new install's own tag.
+///
+/// `resume` is only true for an install that holds the model's [InstallLock]; the tests that skip
+/// the lock on purpose pass false, so they never adopt each other's bytes.
+fn fetch_into_place(
+    model: &Model,
+    root: &Path,
+    fetch: &dyn Fetch,
+    progress: &mut dyn FnMut(u64, u64),
+    alive: &mut dyn FnMut(),
+    resume: bool,
+) -> Result<Outcome> {
     let tag = install_tag()?;
     let part = store::part_file(root, model, &tag);
+    let meta = store::part_meta_file(root, model, &tag);
     let target = store::model_file(root, model);
+    let started = Instant::now();
 
-    let stream = fetch.open(&model.url)?;
-    if let Some(claimed) = stream.claimed_len.filter(|claimed| *claimed > model.size) {
+    let (mut offset, mut hasher) = match adopt_part(root, model, &part, &meta, resume) {
+        Some((bytes, hasher)) => (bytes, hasher),
+        None => (0, Sha256::new()),
+    };
+    if offset > 0 {
+        progress(offset, model.size);
+    }
+    let stream = if offset == 0 {
+        fetch.open(&model.url)?
+    } else {
+        match fetch.open_range(&model.url, offset) {
+            Ok(stream) => stream,
+            // Whatever the server said, the bytes on disk are not the problem, so they stay here
+            // for the next try rather than being thrown away.
+            Err(fail) => {
+                return Err(Fail::internal(format!("{fail} {offset} bytes are on disk, so running the same command again picks the download up.")));
+            }
+        }
+    };
+    if offset > 0 && stream.answer == Answer::Full {
+        // The server ignored the range request: the bytes on disk cannot be trusted to be the front
+        // of this file any more, so start over.
+        offset = 0;
+        hasher = Sha256::new();
+        remove_pair(&part, &meta);
+    }
+    if let Some(claimed) = stream.claimed_len.filter(|claimed| claimed.saturating_add(offset) > model.size) {
+        if offset > 0 {
+            remove_pair(&part, &meta);
+        }
         return Err(Fail::too_large(format!(
             "{} is {} bytes in the catalog, but {} says it has {claimed}. That is not the file the catalog describes, so nothing was downloaded.",
             model.label(),
@@ -158,27 +281,29 @@ fn fetch_into_place(model: &Model, root: &Path, fetch: &dyn Fetch, progress: &mu
         )));
     }
 
-    let mut file = match OpenOptions::new().write(true).create_new(true).open(&part) {
+    let opened = if offset == 0 { OpenOptions::new().write(true).create_new(true).open(&part) } else { OpenOptions::new().append(true).open(&part) };
+    let mut file = match opened {
         Ok(file) => file,
-        Err(error) => return Err(Fail::internal(format!("Craft AI Manager could not create {}: {error}", part.display()))),
+        Err(error) => return Err(Fail::internal(format!("Craft AI Manager could not open {}: {error}", part.display()))),
     };
-    let mut reader = stream.reader;
-    let mut hasher = Sha256::new();
-    let mut buffer = vec![0u8; CHUNK];
-    let mut total: u64 = 0;
-    let started = Instant::now();
+    write_note(&meta, model, offset);
+    let mut next_note_at = offset.saturating_add(META_EVERY);
 
+    let mut reader = stream.reader;
+    let mut buffer = vec![0u8; CHUNK];
+    let mut total: u64 = offset;
     loop {
         match reader.read(&mut buffer) {
             Ok(0) => break,
             Ok(read) => {
                 let Some(chunk) = buffer.get(..read) else { break };
                 let Some(next) = total.checked_add(read as u64) else {
-                    return Err(abandon(&part, Fail::too_large(format!("{} is more bytes than this machine was asked to store.", model.label()))));
+                    return Err(abandon_pair(&part, &meta, Fail::too_large(format!("{} is more bytes than this machine was asked to store.", model.label()))));
                 };
                 if next > model.size {
-                    return Err(abandon(
+                    return Err(abandon_pair(
                         &part,
+                        &meta,
                         Fail::too_large(format!(
                             "{} is {} bytes in the catalog, and the server had sent {next} before it stopped. Nothing was saved.",
                             model.label(),
@@ -188,32 +313,37 @@ fn fetch_into_place(model: &Model, root: &Path, fetch: &dyn Fetch, progress: &mu
                 }
                 hasher.update(chunk);
                 if let Err(error) = file.write_all(chunk) {
-                    return Err(abandon(&part, Fail::internal(format!("Craft AI Manager could not write {}: {error}", part.display()))));
+                    return Err(abandon_pair(&part, &meta, Fail::internal(format!("Craft AI Manager could not write {}: {error}", part.display()))));
                 }
                 total = next;
+                if total >= next_note_at {
+                    write_note(&meta, model, total);
+                    next_note_at = total.saturating_add(META_EVERY);
+                }
                 alive();
                 progress(total, model.size);
             }
             Err(error) if error.kind() == ErrorKind::Interrupted => continue,
-            Err(error) => return Err(abandon(&part, Fail::internal(format!("Craft AI Manager lost the download of {}: {error}", model.url)))),
+            Err(error) => {
+                let _ = file.flush();
+                return Err(keep_what_arrived(&meta, model, total, &part, &format!("Craft AI Manager lost the download of {}: {error}", model.url)));
+            }
         }
     }
 
     if let Err(error) = file.flush().and_then(|()| file.sync_all()) {
-        return Err(abandon(&part, Fail::internal(format!("Craft AI Manager could not finish writing {}: {error}", part.display()))));
+        return Err(abandon_pair(&part, &meta, Fail::internal(format!("Craft AI Manager could not finish writing {}: {error}", part.display()))));
     }
     drop(file);
 
     if total != model.size {
-        return Err(abandon(
-            &part,
-            Fail::internal(format!("{} is {} bytes in the catalog, but the download was {total} bytes. Nothing was saved.", model.label(), model.size)),
-        ));
+        return Err(keep_what_arrived(&meta, model, total, &part, &format!("{} stopped short of the catalog size.", model.label())));
     }
     let actual = store::hex(&hasher.finalize());
     if actual != model.sha256 {
-        return Err(abandon(
+        return Err(abandon_pair(
             &part,
+            &meta,
             Fail::internal(format!(
                 "The file downloaded for {} has SHA-256 {actual}, not the {} the catalog expects. Nothing was saved.",
                 model.label(),
@@ -223,10 +353,11 @@ fn fetch_into_place(model: &Model, root: &Path, fetch: &dyn Fetch, progress: &mu
     }
     // The `.part` is this install's alone, so the bytes renamed here are the bytes just hashed.
     if let Err(error) = std::fs::rename(&part, &target) {
-        return Err(abandon(&part, Fail::internal(format!("Craft AI Manager could not put {} in place: {error}", target.display()))));
+        return Err(abandon_pair(&part, &meta, Fail::internal(format!("Craft AI Manager could not put {} in place: {error}", target.display()))));
     }
+    let _ = std::fs::remove_file(&meta);
     store::write_verified(root, model, &actual, total)?;
-    Ok(Outcome::Downloaded { sha256: actual, bytes: total, elapsed_ms: millis_since(started) })
+    Ok(Outcome::Downloaded { sha256: actual, bytes: total, elapsed_ms: millis_since(started), resumed_from: offset })
 }
 
 /// A short random tag that tells this install's files from any other's.
@@ -239,14 +370,135 @@ fn install_tag() -> Result<String> {
 /// file every chunk, so one nobody has written to for [LOCK_STALE] is not being downloaded any more.
 /// (If a download did stall that long and comes back, its rename finds no file and it fails
 /// cleanly; on Windows the file is still open, so the delete simply does not happen.)
+///
+/// A `.part` with a resume note next to it is not junk: it is a download the next install can pick
+/// up, so it stays for [adopt_part] and only its orphaned note is cleared away.
 fn remove_dead_parts(folder: &Path, model: &Model) {
     let Ok(entries) = std::fs::read_dir(folder) else { return };
     for entry in entries.flatten() {
         let name = entry.file_name();
-        if store::is_part_name(model, &name.to_string_lossy()) && is_stale(&entry.path()) {
-            let _ = std::fs::remove_file(entry.path());
+        let name = name.to_string_lossy();
+        let path = entry.path();
+        if !is_stale(&path) {
+            continue;
+        }
+        if store::is_part_name(model, &name) {
+            if !meta_for_part(&path).exists() {
+                let _ = std::fs::remove_file(&path);
+            }
+        } else if store::is_part_meta_name(model, &name) && !part_for_meta(&path).exists() {
+            let _ = std::fs::remove_file(&path);
         }
     }
+}
+
+/// Pick up a half-download nobody is writing to any more: move its `.part` and its note under this
+/// install's own tag, re-hash the bytes on disk so the hash can carry on where the last run left
+/// off, and hand back how many bytes there are. `None` means start from zero, which is what happens
+/// when the note does not describe this exact file - a different revision or SHA-256 in the note
+/// means delete both and start over (amendment 18).
+fn adopt_part(root: &Path, model: &Model, part: &Path, meta: &Path, resume: bool) -> Option<(u64, Sha256)> {
+    if !resume {
+        return None;
+    }
+    let Ok(entries) = std::fs::read_dir(store::model_folder(root, model)) else { return None };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if !store::is_part_meta_name(model, &name.to_string_lossy()) {
+            continue;
+        }
+        let found_meta = entry.path();
+        let found_part = part_for_meta(&found_meta);
+        // Both halves have to be old. A `.part` someone is writing to right now is not ours to take,
+        // even if a lock takeover went wrong and they think they are the only installer.
+        if !is_stale(&found_meta) || !is_stale(&found_part) {
+            continue;
+        }
+        let Some(note) = store::read_part_meta(&found_meta) else {
+            remove_pair(&found_part, &found_meta);
+            continue;
+        };
+        if note.url != model.url || note.revision != model.revision || note.sha256 != model.sha256 || note.bytes == 0 || note.bytes > model.size {
+            remove_pair(&found_part, &found_meta);
+            continue;
+        }
+        let written = std::fs::metadata(&found_part).ok().filter(|metadata| metadata.is_file()).map(|metadata| metadata.len());
+        if written != Some(note.bytes) {
+            remove_pair(&found_part, &found_meta);
+            continue;
+        }
+        if std::fs::rename(&found_part, part).is_err() || std::fs::rename(&found_meta, meta).is_err() {
+            let _ = std::fs::remove_file(part);
+            continue;
+        }
+        let mut hasher = Sha256::new();
+        if !hash_into(part, &mut hasher) {
+            remove_pair(part, meta);
+            return None;
+        }
+        return Some((note.bytes, hasher));
+    }
+    None
+}
+
+/// Feed a file's bytes to `hasher`, so a resumed download continues its SHA-256 where the last run
+/// stopped. False when the file could not be read.
+fn hash_into(path: &Path, hasher: &mut Sha256) -> bool {
+    let Ok(mut file) = std::fs::File::open(path) else { return false };
+    let mut buffer = vec![0u8; CHUNK];
+    loop {
+        match file.read(&mut buffer) {
+            Ok(0) => return true,
+            Ok(read) => {
+                let Some(chunk) = buffer.get(..read) else { return false };
+                hasher.update(chunk);
+            }
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(_) => return false,
+        }
+    }
+}
+
+/// Write the resume note: what these bytes are meant to become, and how many of them there are. Best
+/// effort - a note that cannot be written only costs the bytes after this point, never the download.
+fn write_note(meta: &Path, model: &Model, bytes: u64) {
+    let note = store::PartMeta { url: model.url.clone(), revision: model.revision.clone(), sha256: model.sha256.clone(), bytes };
+    if let Err(error) = store::write_part_meta(meta, &note) {
+        eprintln!("{}", error.sentence);
+    }
+}
+
+/// The `.part` a resume note belongs to.
+fn part_for_meta(meta: &Path) -> PathBuf {
+    renamed(meta, store::PART_META_SUFFIX, store::PART_SUFFIX)
+}
+
+/// The resume note that belongs to a `.part`.
+fn meta_for_part(part: &Path) -> PathBuf {
+    renamed(part, store::PART_SUFFIX, store::PART_META_SUFFIX)
+}
+
+/// The same path with one ending swapped for another.
+fn renamed(path: &Path, from: &str, to: &str) -> PathBuf {
+    let name = path.file_name().map(|name| name.to_string_lossy().to_string()).unwrap_or_default();
+    path.with_file_name(name.strip_suffix(from).map(|stem| format!("{stem}{to}")).unwrap_or(name))
+}
+
+/// Delete a half-download and its note.
+fn remove_pair(part: &Path, meta: &Path) {
+    let _ = std::fs::remove_file(part);
+    let _ = std::fs::remove_file(meta);
+}
+
+/// The download stopped, and the bytes are not the problem: keep the part and its note, and say what
+/// is waiting for the next try. Nothing is kept when nothing arrived.
+fn keep_what_arrived(meta: &Path, model: &Model, total: u64, part: &Path, why: &str) -> Fail {
+    if total == 0 {
+        remove_pair(part, meta);
+        return Fail::internal(format!("{why} Nothing arrived, so nothing was saved."));
+    }
+    write_note(meta, model, total);
+    Fail::internal(format!("{why} {total} bytes are on disk, so running the same command again picks the download up."))
 }
 
 /// The lock an install holds while it downloads: a file created with `create_new`, holding a random
@@ -384,9 +636,10 @@ pub fn verify(model: &Model, root: &Path) -> Result<Checked> {
     Ok(Checked { sha256: actual, bytes: metadata.len(), elapsed_ms })
 }
 
-/// Delete this install's own half-written file and hand back the error that explains why.
-fn abandon(part: &Path, fail: Fail) -> Fail {
-    let _ = std::fs::remove_file(part);
+/// Delete this install's own half-written file and its note, and hand back the error that explains
+/// why: the bytes are wrong, so they are not worth resuming.
+fn abandon_pair(part: &Path, meta: &Path, fail: Fail) -> Fail {
+    remove_pair(part, meta);
     fail
 }
 
@@ -406,9 +659,12 @@ mod tests {
     use std::cell::RefCell;
 
     use crate::error::Status;
-    use crate::fetch::{LOCK_STALE, Outcome, fetch_into_place, install, verify};
-    use crate::store::{is_installed, is_part_name, lock_file, model_file, model_folder, part_file, read_verified, sha256_hex, write_acknowledgement};
-    use crate::testkit::{FakeFetch, Scratch, SlowFetch, test_model};
+    use crate::fetch::{Answer, LOCK_STALE, Outcome, fetch_into_place, install, resume_answer, verify};
+    use crate::store::{
+        is_installed, is_part_meta_name, is_part_name, lock_file, model_file, model_folder, part_file, part_meta_file, read_verified, sha256_hex,
+        write_acknowledgement,
+    };
+    use crate::testkit::{FakeFetch, RangeFetch, Scratch, SlowFetch, test_model};
     use std::time::Duration;
 
     const FIXTURE: &[u8] = b"the bytes a small model would be made of";
@@ -419,7 +675,10 @@ mod tests {
     /// Every `.part`, lock or lock-aside file still in the model's folder.
     fn leftovers(scratch: &Scratch, entry: &crate::catalog::Model) -> Vec<String> {
         let Ok(list) = std::fs::read_dir(model_folder(&scratch.path, entry)) else { return Vec::new() };
-        list.flatten().map(|item| item.file_name().to_string_lossy().to_string()).filter(|name| is_part_name(entry, name) || name.contains(".lock")).collect()
+        list.flatten()
+            .map(|item| item.file_name().to_string_lossy().to_string())
+            .filter(|name| is_part_name(entry, name) || is_part_meta_name(entry, name) || name.contains(".lock") || name.contains(".tmp-"))
+            .collect()
     }
 
     /// Make a file look as if nobody has touched it for longer than [LOCK_STALE].
@@ -444,8 +703,9 @@ mod tests {
         let fetcher = FakeFetch::new(FIXTURE);
         let outcome = install_into(&scratch, &entry, &fetcher).expect("the fixture installs");
         let sha256 = match outcome {
-            Outcome::Downloaded { sha256, bytes, elapsed_ms } => {
+            Outcome::Downloaded { sha256, bytes, elapsed_ms, resumed_from } => {
                 assert_eq!(bytes, entry.size, "the whole file arrived");
+                assert_eq!(resumed_from, 0, "a first install has nothing to resume");
                 assert!(elapsed_ms < 60_000, "a 40 byte fixture is quick: {elapsed_ms} ms");
                 sha256
             }
@@ -478,16 +738,150 @@ mod tests {
     }
 
     #[test]
-    fn a_download_that_stops_short_is_refused() {
+    fn a_download_that_stops_short_keeps_what_arrived() {
+        // Amendment 18: bytes that stopped short are not wrong, only unfinished, so they stay.
         let scratch = Scratch::new("fetch-short");
         let entry = test_model(FIXTURE, None);
         let fetcher = FakeFetch::new(&FIXTURE[..FIXTURE.len() - 7]);
         let fail = install_into(&scratch, &entry, &fetcher).expect_err("the download stopped before the catalog size");
         assert!(fail.sentence.contains("bytes"), "the sentence talks about sizes: {fail}");
-        assert!(leftovers(&scratch, &entry).is_empty(), "the half-written file is deleted");
+        assert!(fail.sentence.contains("picks the download up"), "and says what to do next: {fail}");
         assert!(!is_installed(&scratch.path, &entry));
+        let left = leftovers(&scratch, &entry);
+        assert_eq!(left.len(), 2, "the half-written file and its note are both kept: {left:?}");
+        for path in left.iter().map(|name| model_folder(&scratch.path, &entry).join(name)) {
+            age(&path);
+        }
+        install_into(&scratch, &entry, &FakeFetch::new(FIXTURE)).expect("the next install carries on from those bytes");
+        assert_eq!(std::fs::read(model_file(&scratch.path, &entry)).expect("the model file"), FIXTURE);
+        assert!(leftovers(&scratch, &entry).is_empty(), "and nothing is left behind");
     }
 
+    #[test]
+    fn a_range_answer_says_whether_to_carry_on_or_start_over() {
+        assert_eq!(resume_answer("https://example.invalid/f.onnx", 20, 206).expect("a 206 is an answer"), Answer::Partial);
+        assert_eq!(resume_answer("https://example.invalid/f.onnx", 20, 200).expect("a 200 is an answer too"), Answer::Full);
+        let fail = resume_answer("https://example.invalid/f.onnx", 20, 416).expect_err("anything else is an error");
+        assert!(fail.sentence.contains("416"), "the sentence names the status: {fail}");
+        assert!(fail.sentence.contains("bytes from 20 on"), "and what was asked for: {fail}");
+    }
+
+    /// Leave a half-download behind the way a run that died leaves one: the first `taken` bytes in a
+    /// `.part`, and a note saying what they are meant to become. Both paths come back so the caller
+    /// can decide whether they look old enough to pick up.
+    fn leave_half(scratch: &Scratch, entry: &crate::catalog::Model, taken: usize, revision: &str, sha256: &str) -> [std::path::PathBuf; 2] {
+        let folder = model_folder(&scratch.path, entry);
+        std::fs::create_dir_all(&folder).expect("the model folder can be made");
+        let part = part_file(&scratch.path, entry, "dead0000");
+        let note = part_meta_file(&scratch.path, entry, "dead0000");
+        std::fs::write(&part, &FIXTURE[..taken]).expect("the half file can be written");
+        let meta = crate::store::PartMeta { url: entry.url.clone(), revision: revision.to_string(), sha256: sha256.to_string(), bytes: taken as u64 };
+        crate::store::write_part_meta(&note, &meta).expect("the note can be written");
+        [part, note]
+    }
+
+    /// Make a half-download look old enough that the next install may pick it up.
+    fn age_pair(pair: &[std::path::PathBuf; 2]) {
+        for path in pair {
+            age(path);
+        }
+    }
+
+    #[test]
+    fn a_half_download_continues_where_it_stopped() {
+        let scratch = Scratch::new("fetch-resume");
+        let entry = test_model(FIXTURE, None);
+        let half = (FIXTURE.len() / 2) as u64;
+        age_pair(&leave_half(&scratch, &entry, FIXTURE.len() / 2, &entry.revision, &entry.sha256));
+        let fetcher = RangeFetch::new(FIXTURE);
+        let mut seen = Vec::new();
+        let outcome = install(&entry, &scratch.path, &fetcher, &mut |read, total| seen.push((read, total))).expect("the install picks the download up");
+        let resumed_from = match outcome {
+            Outcome::Downloaded { bytes, resumed_from, .. } => {
+                assert_eq!(bytes, entry.size, "the whole file arrived");
+                resumed_from
+            }
+            Outcome::AlreadyInstalled => panic!("a half file is not an installed model"),
+        };
+        assert_eq!(resumed_from, half, "the bytes on disk were counted, not fetched again");
+        assert_eq!(fetcher.asked(), vec![half], "only the missing bytes were asked for");
+        assert_eq!(seen.first(), Some(&(half, entry.size)), "the progress report starts at the resumed offset");
+        assert_eq!(std::fs::read(model_file(&scratch.path, &entry)).expect("the model file"), FIXTURE, "and the file is whole");
+        assert!(is_installed(&scratch.path, &entry));
+        assert!(leftovers(&scratch, &entry).is_empty(), "the note went away with the finished file");
+    }
+
+    #[test]
+    fn a_server_that_ignores_the_range_starts_the_download_over() {
+        let scratch = Scratch::new("fetch-resume-full");
+        let entry = test_model(FIXTURE, None);
+        let half = (FIXTURE.len() / 2) as u64;
+        age_pair(&leave_half(&scratch, &entry, FIXTURE.len() / 2, &entry.revision, &entry.sha256));
+        let fetcher = RangeFetch::ignoring_range(FIXTURE);
+        let outcome = install(&entry, &scratch.path, &fetcher, &mut no_progress).expect("a server that sends the whole file still installs it");
+        match outcome {
+            Outcome::Downloaded { bytes, resumed_from, .. } => {
+                assert_eq!(bytes, entry.size, "the whole file arrived");
+                assert_eq!(resumed_from, 0, "the bytes on disk were thrown away, not continued");
+            }
+            Outcome::AlreadyInstalled => panic!("a half file is not an installed model"),
+        }
+        assert_eq!(fetcher.asked(), vec![half], "the range was asked for once, and ignored");
+        assert_eq!(std::fs::read(model_file(&scratch.path, &entry)).expect("the model file"), FIXTURE);
+        assert!(leftovers(&scratch, &entry).is_empty(), "the half file that could not be trusted is gone");
+    }
+
+    #[test]
+    fn a_note_for_another_revision_or_hash_starts_the_download_over() {
+        for (who, revision, sha256) in [
+            ("revision", "another-revision", None),
+            ("hash", "a3ee2fca54baebec351b8fa7786154ffa7555aa6", Some("0000000000000000000000000000000000000000000000000000000000000000")),
+        ] {
+            let scratch = Scratch::new(&format!("fetch-resume-{who}"));
+            let entry = test_model(FIXTURE, None);
+            age_pair(&leave_half(&scratch, &entry, FIXTURE.len() / 2, revision, sha256.unwrap_or(entry.sha256.as_str())));
+            let fetcher = RangeFetch::new(FIXTURE);
+            install(&entry, &scratch.path, &fetcher, &mut no_progress).expect("the install starts over");
+            assert_eq!(fetcher.asked(), vec![0], "{who}: the bytes on disk were not trusted");
+            assert_eq!(std::fs::read(model_file(&scratch.path, &entry)).expect("the model file"), FIXTURE, "{who}");
+            assert!(leftovers(&scratch, &entry).is_empty(), "{who}: the wrong half file and its note are deleted");
+        }
+    }
+
+    #[test]
+    fn a_refused_range_keeps_the_bytes_for_the_next_try() {
+        let scratch = Scratch::new("fetch-resume-refused");
+        let entry = test_model(FIXTURE, None);
+        let half = (FIXTURE.len() / 2) as u64;
+        age_pair(&leave_half(&scratch, &entry, FIXTURE.len() / 2, &entry.revision, &entry.sha256));
+        let fetcher = RangeFetch::new(FIXTURE).refusing(416);
+        let fail = install(&entry, &scratch.path, &fetcher, &mut no_progress).expect_err("the server refused the range request");
+        assert!(fail.sentence.contains("picks the download up"), "the sentence says the bytes are kept for the next try: {fail}");
+        assert_eq!(fetcher.asked(), vec![half]);
+        let left = leftovers(&scratch, &entry);
+        assert_eq!(left.len(), 2, "both files are still there: {left:?}");
+        for name in &left {
+            age(&model_folder(&scratch.path, &entry).join(name));
+        }
+        install(&entry, &scratch.path, &RangeFetch::new(FIXTURE), &mut no_progress).expect("the next try carries on from them");
+        assert!(is_installed(&scratch.path, &entry));
+        assert!(leftovers(&scratch, &entry).is_empty(), "and nothing is left behind");
+    }
+
+    #[test]
+    fn a_half_file_someone_is_writing_to_is_not_picked_up() {
+        // C6 again: two installs must never share bytes, so a half file that is still being written
+        // to is not this install's to continue, however good its note looks.
+        let scratch = Scratch::new("fetch-resume-live");
+        let entry = test_model(FIXTURE, None);
+        let pair = leave_half(&scratch, &entry, FIXTURE.len() / 2, &entry.revision, &entry.sha256);
+        let fetcher = RangeFetch::new(FIXTURE);
+        install(&entry, &scratch.path, &fetcher, &mut no_progress).expect("the install starts its own download");
+        assert_eq!(fetcher.asked(), vec![0], "the other install's bytes were not adopted");
+        assert_eq!(std::fs::read(model_file(&scratch.path, &entry)).expect("the model file"), FIXTURE);
+        assert_eq!(std::fs::read(&pair[0]).expect("the other install's file can be read"), &FIXTURE[..FIXTURE.len() / 2], "and it is untouched");
+        assert_eq!(leftovers(&scratch, &entry).len(), 2, "the other install's pair is left alone");
+    }
     #[test]
     fn a_server_claiming_more_than_the_catalog_promises_is_refused() {
         let scratch = Scratch::new("fetch-claimed");
@@ -710,7 +1104,7 @@ mod tests {
             let good = patterned(0);
             let entry = test_model(&good, None);
             std::fs::create_dir_all(model_folder(&scratch.path, &entry)).expect("the model folder");
-            race(&scratch, &entry, &good, round, &|fetch| fetch_into_place(&entry, &scratch.path, fetch, &mut no_progress, &mut || {}));
+            race(&scratch, &entry, &good, round, &|fetch| fetch_into_place(&entry, &scratch.path, fetch, &mut no_progress, &mut || {}, false));
         }
     }
 

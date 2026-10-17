@@ -2,11 +2,13 @@
 //! through while it runs. Amendment 11 fixes the states (`queued`, `running`, `done`, `failed`,
 //! `cancelled`), the queue cap of eight, and the ten minutes a finished result is kept for.
 
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use crate::activity;
 use crate::backend::{self, Filled};
 use crate::error::{Fail, Result};
 use crate::image::{self, Frame};
@@ -107,6 +109,8 @@ pub struct Provenance {
 /// One job, from the moment it is accepted until its result has been read or has expired.
 struct Entry {
     id: String,
+    /// The task the job asked for, kept for the activity log.
+    task: String,
     state: State,
     progress: f64,
     message: String,
@@ -128,6 +132,8 @@ struct Shared {
     jobs: Vec<Entry>,
     next_id: u64,
     pending: usize,
+    /// Where finished jobs are logged, or `None` when this run has nowhere to log.
+    activity: Option<PathBuf>,
 }
 
 /// A queue slot is reserved before HTTP buffers a body; all failure paths release it.
@@ -213,7 +219,7 @@ impl Runner {
 
     pub(crate) fn with_memory_limit(backend: Backend, max_queue: usize, memory_limit: usize) -> Result<Runner> {
         let (queue_tx, queue_rx) = std::sync::mpsc::sync_channel::<String>(MAX_RECORDS);
-        let shared = Arc::new(Mutex::new(Shared { jobs: Vec::new(), next_id: 0, pending: 0 }));
+        let shared = Arc::new(Mutex::new(Shared { jobs: Vec::new(), next_id: 0, pending: 0, activity: None }));
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let worker_shared = Arc::clone(&shared);
         let worker_stop = Arc::clone(&stop);
@@ -223,6 +229,12 @@ impl Runner {
             .spawn(move || worker(worker_shared, queue_rx, worker_stop, backend))
             .map_err(|error| Fail::internal(format!("Craft AI Manager could not start its job worker: {error}")))?;
         Ok(Runner { shared, queue_tx, worker: Mutex::new(Some(handle)), stop, max_queue, budget: Budget::new(memory_limit) })
+    }
+
+    /// Point the queue at an activity log. Amendment 18 puts it next to `endpoint.json`, and a
+    /// run with no endpoint file has no log: nothing about a job changes either way.
+    pub(crate) fn set_activity_log(&self, path: Option<PathBuf>) {
+        lock(&self.shared).activity = path;
     }
 
     pub(crate) fn admit(&self, body_bytes: usize) -> Result<Admission> {
@@ -248,10 +260,10 @@ impl Runner {
     pub fn submit(&self, frame: Frame, mask: Vec<u8>) -> Result<String> {
         let mut admission = self.admit(0)?;
         admission.reserve_work(frame.width, frame.height)?;
-        self.submit_admitted(frame, mask, admission)
+        self.submit_admitted(crate::protocol::TASK_FILL, frame, mask, admission)
     }
 
-    pub(crate) fn submit_admitted(&self, frame: Frame, mask: Vec<u8>, mut admission: Admission) -> Result<String> {
+    pub(crate) fn submit_admitted(&self, task: &str, frame: Frame, mask: Vec<u8>, mut admission: Admission) -> Result<String> {
         admission.body = None;
         let id = {
             let mut shared = lock(&self.shared);
@@ -265,6 +277,7 @@ impl Runner {
             let id = format!("job-{}", shared.next_id);
             shared.jobs.push(Entry {
                 id: id.clone(),
+                task: task.to_string(),
                 state: State::Queued,
                 progress: 0.0,
                 message: "Waiting for Craft AI Manager.".to_string(),
@@ -307,6 +320,10 @@ impl Runner {
             entry.state = State::Cancelled;
             entry.message = CANCELLED_MESSAGE.to_string();
             entry.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            let record = activity_record(entry);
+            let path = shared.activity.clone();
+            drop(shared);
+            log_activity(path.as_deref(), &record);
         }
         Ok(())
     }
@@ -374,6 +391,8 @@ impl Runner {
     pub(crate) fn request_stop(&self) {
         let mut shared = lock(&self.shared);
         self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let path = shared.activity.clone();
+        let mut logged = Vec::new();
         for entry in &mut shared.jobs {
             if !entry.state.is_finished() {
                 if entry.state == State::Queued {
@@ -384,7 +403,12 @@ impl Runner {
                 entry.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
                 entry.state = State::Cancelled;
                 entry.message = CANCELLED_MESSAGE.to_string();
+                logged.push(activity_record(entry));
             }
+        }
+        drop(shared);
+        for record in &logged {
+            log_activity(path.as_deref(), record);
         }
     }
 
@@ -482,26 +506,33 @@ fn finish(shared: &Arc<Mutex<Shared>>, id: &str, cancel: &std::sync::atomic::Ato
     let Some(entry) = find_mut(&mut shared.jobs, id) else { return };
     entry.finished_at = Some(Instant::now());
     if entry.state == State::Cancelled {
+        // A cancelled job already has its line in the activity log, written where it was cancelled.
+        // Writing it again would count the same job twice.
         entry.memory = None;
         entry.message = CANCELLED_MESSAGE.to_string();
         return;
     }
     match ready {
         Ok((png, provenance)) => {
-            if let Some(memory) = entry.memory.as_mut() {
-                // This only shrinks the conservative working-space reservation.
-                if let Err(fail) = memory.resize(png.capacity()) {
+            // This only shrinks the conservative working-space reservation.
+            let resized = match entry.memory.as_mut() {
+                Some(memory) => memory.resize(png.capacity()),
+                None => Ok(()),
+            };
+            match resized {
+                Err(fail) => {
                     entry.memory = None;
                     entry.state = State::Failed;
                     entry.message = fail.sentence;
-                    return;
+                }
+                Ok(()) => {
+                    entry.state = State::Done;
+                    entry.progress = 1.0;
+                    entry.message = "Done.".to_string();
+                    entry.png = Some(png);
+                    entry.provenance = Some(provenance);
                 }
             }
-            entry.state = State::Done;
-            entry.progress = 1.0;
-            entry.message = "Done.".to_string();
-            entry.png = Some(png);
-            entry.provenance = Some(provenance);
         }
         Err(fail) => {
             entry.memory = None;
@@ -513,6 +544,36 @@ fn finish(shared: &Arc<Mutex<Shared>>, id: &str, cancel: &std::sync::atomic::Ato
                 entry.message = fail.sentence;
             }
         }
+    }
+    let record = activity_record(entry);
+    let path = shared.activity.clone();
+    drop(shared);
+    log_activity(path.as_deref(), &record);
+}
+
+/// The line the activity log gets for a finished job (amendment 18, "Activity log"). The fields
+/// MG-10 and MG-11 will fill in are `None` today, which is what the amendment asks for.
+fn activity_record(entry: &Entry) -> activity::Record {
+    let provenance = entry.provenance.as_ref();
+    activity::Record {
+        time: activity::now_stamp(),
+        task: Some(entry.task.clone()),
+        model: provenance.map(|source| source.model.clone()),
+        version: None,
+        device: provenance.map(|source| source.device.clone()),
+        device_requested: None,
+        fallback_reason: None,
+        elapsed_ms: provenance.map(|source| source.elapsed_ms),
+        state: entry.state.wire().to_string(),
+    }
+}
+
+/// Write one finished job, and never let the log change what a job reported: amendment 18 says a
+/// failed write is a sentence on stderr and nothing else.
+fn log_activity(path: Option<&Path>, record: &activity::Record) {
+    let Some(path) = path else { return };
+    if let Err(fail) = activity::append(path, record) {
+        eprintln!("{}", fail.sentence);
     }
 }
 
@@ -559,6 +620,7 @@ mod tests {
             let mut shared = super::lock(&runner.shared);
             shared.jobs.push(super::Entry {
                 id: format!("finished-{n}"),
+                task: crate::protocol::TASK_FILL.into(),
                 state: super::State::Cancelled,
                 progress: 0.0,
                 message: "Cancelled.".into(),
@@ -630,7 +692,7 @@ mod tests {
         let mut admission = runner.admit(20).expect("upload begins");
         admission.reserve_work(2, 2).expect("working space");
         runner.stop();
-        assert!(runner.submit_admitted(frame(), mask(), admission).is_err());
+        assert!(runner.submit_admitted(crate::protocol::TASK_FILL, frame(), mask(), admission).is_err());
         let shared = lock(&runner.shared);
         assert_eq!(shared.pending, 0);
         assert!(shared.jobs.is_empty());

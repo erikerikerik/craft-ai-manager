@@ -6,7 +6,7 @@ use std::cell::Cell;
 use std::path::PathBuf;
 
 use crate::catalog::{Model, OverrideNote};
-use crate::error::Result;
+use crate::error::{Fail, Result};
 use crate::fetch::{Fetch, Stream};
 use crate::store;
 
@@ -80,7 +80,64 @@ impl FakeFetch {
 impl Fetch for FakeFetch {
     fn open(&self, _url: &str) -> Result<Stream> {
         self.calls.set(self.calls.get() + 1);
-        Ok(Stream { claimed_len: self.claimed, reader: Box::new(std::io::Cursor::new(self.bytes.clone())) })
+        Ok(Stream::full(self.claimed, Box::new(std::io::Cursor::new(self.bytes.clone()))))
+    }
+}
+
+/// A [Fetch](Fetch) that can serve part of a file, so restart-safe resume can be tested without a
+/// network. It remembers the offsets it was asked for, which is how a test can see that only the
+/// missing bytes were requested.
+pub(crate) struct RangeFetch {
+    pub(crate) bytes: Vec<u8>,
+    /// Whether a range request gets the tail (`true`) or the whole file again (`false`).
+    pub(crate) supports_range: bool,
+    /// A status to answer a range request with instead of bytes, which is what a broken server does.
+    pub(crate) refused: Option<u16>,
+    /// The offsets it was asked for, in the order it was asked.
+    pub(crate) offsets: std::cell::RefCell<Vec<u64>>,
+}
+
+impl RangeFetch {
+    /// A server that answers a range request with the bytes from that offset on.
+    pub(crate) fn new(bytes: &[u8]) -> Self {
+        Self { bytes: bytes.to_vec(), supports_range: true, refused: None, offsets: std::cell::RefCell::new(Vec::new()) }
+    }
+
+    /// A server that ignores `Range` and sends the whole file again, which is what makes a download
+    /// start over.
+    pub(crate) fn ignoring_range(bytes: &[u8]) -> Self {
+        Self { supports_range: false, ..Self::new(bytes) }
+    }
+
+    /// A server that answers a range request with `status` and no bytes.
+    pub(crate) fn refusing(mut self, status: u16) -> Self {
+        self.refused = Some(status);
+        self
+    }
+
+    /// The offsets this server was asked for, oldest first.
+    pub(crate) fn asked(&self) -> Vec<u64> {
+        self.offsets.borrow().clone()
+    }
+}
+
+impl Fetch for RangeFetch {
+    fn open(&self, url: &str) -> Result<Stream> {
+        self.open_range(url, 0)
+    }
+
+    fn open_range(&self, url: &str, offset: u64) -> Result<Stream> {
+        self.offsets.borrow_mut().push(offset);
+        if offset > 0 {
+            if let Some(status) = self.refused {
+                return Err(Fail::internal(format!("{url} answered {status} to the range request.")));
+            }
+            if self.supports_range {
+                let tail = self.bytes.get(offset as usize..).map(<[u8]>::to_vec).unwrap_or_default();
+                return Ok(Stream::partial(Some(tail.len() as u64), Box::new(std::io::Cursor::new(tail))));
+            }
+        }
+        Ok(Stream::full(Some(self.bytes.len() as u64), Box::new(std::io::Cursor::new(self.bytes.clone()))))
     }
 }
 
@@ -94,7 +151,7 @@ pub(crate) struct SlowFetch {
 
 impl Fetch for SlowFetch {
     fn open(&self, _url: &str) -> Result<Stream> {
-        Ok(Stream { claimed_len: None, reader: Box::new(SlowReader { bytes: self.bytes.clone(), at: 0, chunk: self.chunk, delay: self.delay }) })
+        Ok(Stream::full(None, Box::new(SlowReader { bytes: self.bytes.clone(), at: 0, chunk: self.chunk, delay: self.delay })))
     }
 }
 

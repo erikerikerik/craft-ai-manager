@@ -27,6 +27,7 @@ colour fill - is still there behind `--fake-backend`; since BF-01 it follows the
 ```text
 caim                        # the same as: caim serve
 caim serve --fake-backend   # jobs run on the built-in mean-colour fill
+caim open                     # start the manager, or say that one is already running
 caim models list            # what the catalog offers, what is installed, and what it costs on disk
 caim models install <id>    # download one model, hashing it while it arrives
 caim models verify <id>     # re-hash an installed model against the catalog
@@ -55,6 +56,25 @@ file inherits the per-user permissions `%LOCALAPPDATA%` already carries, so the 
 your own account; on Linux and macOS the file is created with mode `0600`, so it is readable only by your own account
 there too, even in the moment between the temp file and the rename. If `CRAFT_AI_ENDPOINT` points somewhere else, the file
 inherits that folder's permissions instead, so point it at a folder only you can read.
+
+`caim open` is the start-on-demand entry point (amendment 18, decision D5). It reads `endpoint.json` first: when a
+manager is answering `GET /v1/health` on the port that file names, it prints
+`Craft AI Manager is already running on 127.0.0.1:<port>. Nothing was started.` and exits 0 without binding a port.
+With nothing answering it serves exactly what `caim serve` serves - the window comes with MG-13. PhotoCraft's
+"Open Craft AI Manager" button runs `caim open`, which is why every start records where this program lives.
+
+Two more files live in that same folder, and neither is deleted on exit:
+
+| File | What it is |
+|---|---|
+| `app.json` | `{"version": 1, "exe": "<absolute path of this executable>"}`, rewritten atomically on every start of `serve` and `open`, so another app can find the manager and start it |
+| `activity.jsonl` | one JSON line per finished job - `done`, `failed` or `cancelled` - with `time`, `task`, `model`, `version`, `device`, `device_requested`, `fallback_reason`, `elapsed_ms` and `state`; the newest 1,000 lines are kept, the file being rewritten once it passes 1,100 |
+
+`app.json` is written just after the endpoint file. Failing to write it is a sentence on stderr, not a failed start:
+the manager is still serving, it just cannot be found by path. Log fields CAIM has no value for yet - the model
+version, the requested device, the fallback reason - are written as `null`, so the file keeps its shape when MG-10
+and MG-11 fill them in. A line that cannot be written is a sentence on stderr and never fails the job it describes;
+the log is a convenience, not a dependency.
 
 The server answers only `127.0.0.1`, only with the right `Authorization: Bearer <token>` header, and only when
 `Host:` is exactly `127.0.0.1:<port>` - which is what stops a page in your browser, or a DNS rebinding, from reaching
@@ -188,7 +208,7 @@ is one where a link sits in place of the models folder or of a model's own folde
 link are never counted, because they are not in the models folder.
 
 `caim models remove <id>` deletes `<id>\<version>\`: the model file, `verified.json`, `acknowledged.json`, and any
-`.part` or `.lock` an interrupted install left behind. When that was the model's last version, the now empty `<id>`
+`.part`, its `.part.json` note or `.lock` an interrupted install left behind. When that was the model's last version, the now empty `<id>`
 folder goes with it. It asks no questions, because the command is already explicit. It refuses while a manager is
 running: the endpoint file names a port, and a connection to that port answers, so the model may be in use. A file left
 behind by a manager that died does not refuse, because the port is asked as well. What it deletes is always
@@ -196,19 +216,35 @@ behind by a manager that died does not refuse, because the port is asked as well
 same question again before it touches the disk, and a link in place of the models folder or of either model folder is
 refused rather than followed.
 
-A download goes to `<file>.part` in the same folder and is hashed as it streams. A server whose `Content-Length`, or
-whose bytes read, go past the catalog's `size` is refused; a hash or size mismatch deletes the `.part` file and names
-the expected and the actual value. Redirects are followed - Hugging Face hands the download to a CDN - but never down
-to plain HTTP. A model that is already installed makes no request at all. There is no resume yet (CAIM-03 puts resume
-in S2) and cancellation waits for MG-05; while a download runs the CLI prints a percentage.
+A download goes to a `.part` file in the same folder as the model and is hashed as it streams. A server whose
+`Content-Length`, or whose bytes read, go past the catalog's `size` is refused; a hash or size mismatch deletes the
+part and names the expected and the actual value. Redirects are followed - Hugging Face hands the download to a CDN -
+but never down to plain HTTP. A model that is already installed makes no request at all, and while a download runs
+the CLI prints a percentage.
 
-Each install writes its own `<file>.<random>.part`, created exclusively, and renames into place only the bytes it
-hashed itself, so two installs at once can never put a wrong file under the verified name. On top of that, one install
-of a model downloads at a time: it holds `<file>.lock` (created exclusively, touched every few seconds while the
-download runs), and a second install is told another one is running. A lock nobody has touched for two minutes was
-left by an install that died; the next install moves it aside under a name of its own (if several try at once, one
-rename wins) and takes over. `.part` files nobody has written to for two minutes are cleared the same way. The file is
-synced to disk before it is renamed into place.
+**Restart-safe resume (CAIM-03, MG-12).** While a download runs it keeps a note beside its bytes:
+`<file>.<random>.part` and `<file>.<random>.part.json`, the note holding the url, the pinned revision, the expected
+SHA-256 and the bytes written so far, rewritten atomically every 8 MiB. The next `caim models install` of the same
+model re-hashes those bytes - a partial file is never trusted for its hash alone - and asks for the rest with
+`Range: bytes=<n>-`. A `206` continues where it stopped, and the percentage starts at the resumed offset; a `200`
+means the server ignored the range, so the download starts over from zero; any other status is an error that leaves
+the bytes for the next try. A note naming another revision or another SHA-256 than the catalog asks for describes a
+different file, so both files are deleted and the download starts over. The finished hash still has to match the
+catalog: a mismatch deletes both files and the install fails. A download that stops short - a `Content-Length` that
+runs out, or a read error halfway through - keeps what arrived and says so, and the install line names how many of
+the bytes were already on disk.
+
+Each install writes its own `<file>.<random>.part` and its own `<file>.<random>.part.json`, created exclusively, and
+renames into place only the bytes it hashed itself, so two installs at once can never put a wrong file under the
+verified name. That is why the pair carries a random tag rather than the bare `<file>.part` amendment 18 names:
+two installs of one model would otherwise overwrite each other's bytes and each other's note. On top of that, one
+install of a model downloads at a time: it holds `<file>.lock` (created exclusively, touched every few seconds while
+the download runs), and a second install is told another one is running. A lock nobody has touched for two minutes
+was left by an install that died; the next install moves it aside under a name of its own (if several try at once,
+one rename wins) and takes over. A `.part` nobody has written to for two minutes is cleared the same way, with one
+exception: a `.part` whose note is still there and just as old is a half download that the next install can pick up,
+so that pair stays until resume adopts it or the rules above reject it. A `.part` with no note, and a note with no
+`.part`, are both dead and go. The file is synced to disk before it is renamed into place.
 
 **The licence gate.** An entry is not offered - and the test over the embedded catalog fails in CI - when a field is
 missing or empty, when anything says `UNCLEAR`, when the URL is not HTTPS, when `sha256` is not 64 lowercase hex, when

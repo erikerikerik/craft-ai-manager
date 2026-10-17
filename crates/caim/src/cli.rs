@@ -1,6 +1,6 @@
 //! The command line: `caim` with no arguments serves, `caim serve --fake-backend` serves with the
-//! fake backend, `caim models ...` looks after the model store, and `--version` / `--help` keep
-//! working without starting anything.
+//! fake backend, `caim open` starts the manager unless one is already answering, `caim models ...`
+//! looks after the model store, and `--version` / `--help` keep working without starting anything.
 
 use crate::error::{Fail, Result, quoted};
 
@@ -16,6 +16,9 @@ pub enum Action {
         /// Use the built-in fake backend, which fills a mask with the mean colour of the image.
         fake_backend: bool,
     },
+    /// Start the manager unless one is already answering (amendment 18). For now this serves; the
+    /// window arrives in MG-13.
+    Open,
     /// Print one line per catalog entry: what it is, its licences, and whether it is installed.
     ModelsList,
     /// Download one model, unless it is already installed.
@@ -40,7 +43,7 @@ pub enum Action {
 }
 
 /// The usage lines, printed by `--help` and when the arguments do not parse.
-pub const USAGE: &str = "usage: caim [serve] [--fake-backend]\n       caim models list\n       caim models install <id> [--accept-note]\n       caim models verify <id>\n       caim models remove <id>\n       caim models where\n       caim --version | caim --help";
+pub const USAGE: &str = "usage: caim [serve] [--fake-backend]\n       caim open\n       caim models list\n       caim models install <id> [--accept-note]\n       caim models verify <id>\n       caim models remove <id>\n       caim models where\n       caim --version | caim --help";
 
 /// Map the arguments after the program name to an [Action](crate::Action). Serving is the default, so
 /// the only positional words are the optional `serve` and the `models` commands. The error is a
@@ -69,6 +72,7 @@ pub fn classify(args: &[String]) -> Result<Action> {
     }
     let action = match words.as_slice() {
         [] | ["serve"] => Action::Serve { fake_backend },
+        ["open"] => Action::Open,
         ["models"] => return Err(Fail::bad_request("Craft AI Manager needs a models command: list, install, verify, remove or where.")),
         ["models", "list"] => Action::ModelsList,
         ["models", "install"] => return Err(Fail::bad_request("Craft AI Manager needs a model id: caim models install <id>.")),
@@ -112,6 +116,14 @@ mod tests {
         assert!(matches!(classify(&args(&["--fake-backend"])), Ok(Action::Serve { fake_backend: true })));
         assert!(matches!(classify(&args(&["serve", "--fake-backend"])), Ok(Action::Serve { fake_backend: true })));
         assert!(matches!(classify(&args(&["--fake-backend", "serve"])), Ok(Action::Serve { fake_backend: true })));
+    }
+
+    #[test]
+    fn open_is_a_command_of_its_own_and_takes_nothing_with_it() {
+        assert!(matches!(classify(&args(&["open"])), Ok(Action::Open)), "caim open starts the manager, or says one is running");
+        let fail = classify(&args(&["open", "--fake-backend"])).expect_err("the fake backend belongs to serve");
+        assert_eq!(fail.status, Status::BadRequest);
+        assert!(USAGE.contains("caim open"), "the usage line mentions it");
     }
 
     #[test]

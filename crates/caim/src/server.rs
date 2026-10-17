@@ -21,6 +21,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::VERSION;
+use crate::activity;
 use crate::endpoint::{self, ENDPOINT_ENV};
 use crate::error::{Fail, Result, Status, quoted};
 use crate::http::{self, Clock, Head, Response, read_head, write_error};
@@ -168,11 +169,27 @@ impl Server {
         handle.attach(&runner);
         let stop_state = Arc::clone(&handle.state);
         let endpoint_path = options.endpoint_file.clone().or_else(endpoint::endpoint_file_from_env);
+        // Amendment 18: every finished job leaves a line in `activity.jsonl`, next to the endpoint
+        // file this run writes. A run with no endpoint file has no log, and nothing else changes.
+        runner.set_activity_log(activity::activity_path_for(endpoint_path.as_deref()));
         if let Some(path) = endpoint_path.as_ref()
             && let Err(error) = endpoint::write(path, port, &token)
         {
             runner.stop();
             return Err(error);
+        }
+        // Amendment 18: `app.json` says where this program lives, so PhotoCraft can start the
+        // manager when nothing is answering. Failing to write it is not a failed start - the
+        // manager is still serving - but it has to be said out loud.
+        if let Some(path) = endpoint_path.as_ref() {
+            match std::env::current_exe() {
+                Ok(exe) => {
+                    if let Err(error) = endpoint::write_app(&endpoint::app_path_for(path), &exe) {
+                        eprintln!("{}", error.sentence);
+                    }
+                }
+                Err(error) => eprintln!("Craft AI Manager could not find its own program file: {error}"),
+            }
         }
         let context = Arc::new(Context {
             port,
@@ -664,7 +681,7 @@ fn submit(stream: &mut Connection, context: &Context, head: &Head, unread: &mut 
     let frame = image::decode_image(parts.image, width, height, usize::from(request.channels), request.bit_depth)?;
     let mask = image::decode_mask(parts.mask, width, height)?;
     drop(body);
-    let id = context.runner.submit_admitted(frame, mask, admission)?;
+    let id = context.runner.submit_admitted(&request.task, frame, mask, admission)?;
     send(stream, context, Status::Accepted, Some(JSON), &protocol::job_id(&id))
 }
 

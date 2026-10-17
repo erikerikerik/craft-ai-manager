@@ -123,10 +123,14 @@ impl TestServer {
         TestServer::options(who, ServeOptions { models_root: Some(root.to_path_buf()), ..ServeOptions::default() })
     }
 
-    /// Any options at all, with the endpoint file taken care of.
+    /// Any options at all, with the endpoint file taken care of. The file sits in a folder of its
+    /// own, because a start writes `app.json` and `activity.jsonl` beside it (amendment 18) and two
+    /// test binaries sharing one folder would read each other's files.
     pub fn options(who: &str, options: ServeOptions) -> TestServer {
-        let endpoint = std::env::temp_dir().join(format!("caim-it-{}-{who}.json", std::process::id()));
-        let _ = std::fs::remove_file(&endpoint);
+        let folder = std::env::temp_dir().join(format!("caim-it-{}-{who}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&folder);
+        std::fs::create_dir_all(&folder).expect("a folder for the endpoint file");
+        let endpoint = folder.join("endpoint.json");
         let server = Server::start(ServeOptions { endpoint_file: Some(endpoint.clone()), ..options }).expect("the server starts");
         TestServer { server, endpoint }
     }

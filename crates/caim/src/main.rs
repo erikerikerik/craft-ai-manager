@@ -1,6 +1,7 @@
 //! The `caim` binary: `caim serve` (also the default) runs the loopback server, `--fake-backend`
-//! runs jobs on the built-in fake fill, `caim models ...` looks after the model store, and
-//! `--version` / `--help` answer without starting anything.
+//! runs jobs on the built-in fake fill, `caim open` starts the manager unless one is already
+//! answering, `caim models ...` looks after the model store, and `--version` / `--help` answer
+//! without starting anything.
 
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
@@ -8,6 +9,7 @@
 use std::io::IsTerminal;
 use std::io::Write;
 
+use craft_ai_manager::endpoint::{self, Launch};
 use craft_ai_manager::error::{Fail, Status};
 use craft_ai_manager::models;
 use craft_ai_manager::server::StopHandle;
@@ -30,6 +32,7 @@ fn main() -> std::process::ExitCode {
             std::process::ExitCode::SUCCESS
         }
         Ok(Action::Serve { fake_backend }) => serve(fake_backend),
+        Ok(Action::Open) => open(),
         Ok(Action::ModelsList) => models_list(),
         Ok(Action::ModelsInstall { id, accept_note }) => models_install(&id, accept_note),
         Ok(Action::ModelsVerify { id }) => models_verify(&id),
@@ -42,6 +45,7 @@ fn main() -> std::process::ExitCode {
 fn help() {
     println!("{USAGE}");
     println!("  serve             run the loopback server (this is also the default)");
+    println!("  open              start the manager, or say that one is already running");
     println!("  --fake-backend    run jobs on the built-in mean-colour fill, to try the protocol out");
     println!("  models list       one line per catalog entry: task, size, licences, and whether it is installed");
     println!("  models install    download one model, hashing it while it arrives");
@@ -69,7 +73,7 @@ fn serve(fake_backend: bool) -> std::process::ExitCode {
         Ok(server) => server,
         Err(fail) => return report(fail),
     };
-    let endpoint_variable = craft_ai_manager::endpoint::ENDPOINT_ENV;
+    let endpoint_variable = endpoint::ENDPOINT_ENV;
     println!("Craft AI Manager {VERSION} listening on 127.0.0.1:{}", server.port());
     match server.endpoint_path() {
         Some(path) => println!("endpoint file: {}", path.display()),
@@ -84,6 +88,18 @@ fn serve(fake_backend: bool) -> std::process::ExitCode {
     match server.shutdown() {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(fail) => report(fail),
+    }
+}
+
+/// `caim open`: start the manager unless one is already answering on loopback (amendment 18).
+/// When nothing is answering, this is `caim serve` for now - MG-13 gives the manager its window.
+fn open() -> std::process::ExitCode {
+    match endpoint::launch_decision(endpoint::endpoint_file_from_env().as_deref()) {
+        Launch::AlreadyRunning { port } => {
+            println!("Craft AI Manager is already running on 127.0.0.1:{port}. Nothing was started.");
+            std::process::ExitCode::SUCCESS
+        }
+        Launch::Start => serve(false),
     }
 }
 
