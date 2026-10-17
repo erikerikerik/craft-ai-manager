@@ -9,8 +9,9 @@
 //! never re-hashes a 200 MB file; `caim models verify <id>` does, and that is also what rewrites
 //! `verified.json` after the fact.
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -29,7 +30,9 @@ const VERIFIED_NAME: &str = "verified.json";
 /// Written when the user accepts a flagged model's note.
 const ACKNOWLEDGED_NAME: &str = "acknowledged.json";
 /// A download in progress, in the same folder as the file it will become.
-const PART_SUFFIX: &str = ".part";
+pub const PART_SUFFIX: &str = ".part";
+/// What a download in progress has written so far, and what it was meant to become.
+pub const PART_META_SUFFIX: &str = ".part.json";
 /// Held by the one install that may write the `.part` file.
 const LOCK_SUFFIX: &str = ".lock";
 /// How much is hashed at a time, so a 200 MB file never sits in memory.
@@ -87,6 +90,21 @@ pub fn is_part_name(model: &Model, name: &str) -> bool {
     name.strip_prefix(model.file.as_str()).is_some_and(|rest| rest.ends_with(PART_SUFFIX) && (rest == PART_SUFFIX || rest.starts_with('.')))
 }
 
+/// One install's resume note for its `.part`, `<file>.<tag>.part.json`: what the bytes so far are
+/// meant to become, and how many of them there are. SPEC v1.1 amendment 18 calls this `<file>.part.json`;
+/// the tag is here for the same reason it is on the `.part` - two installs never share a file (C6).
+#[must_use]
+pub fn part_meta_file(root: &Path, model: &Model, tag: &str) -> PathBuf {
+    let name = format!("{}.{tag}{PART_META_SUFFIX}", model.file);
+    model_folder(root, model).join(name)
+}
+
+/// Is `name` a resume note for one of this model's `.part` files, whoever wrote it?
+#[must_use]
+pub fn is_part_meta_name(model: &Model, name: &str) -> bool {
+    name.strip_prefix(model.file.as_str()).is_some_and(|rest| rest.ends_with(PART_META_SUFFIX) && rest.starts_with('.'))
+}
+
 /// The lock an install holds while it owns the `.part` file, so two installs never share one.
 #[must_use]
 pub fn lock_file(root: &Path, model: &Model) -> PathBuf {
@@ -118,6 +136,63 @@ pub struct Verified {
     /// Seconds since the epoch, or 0 when the clock is unusable.
     pub verified_at_unix: u64,
 }
+
+/// What a `<file>.<tag>.part.json` holds: enough to check, after a restart, that the bytes already
+/// on disk belong to the same file the next install is asking for.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PartMeta {
+    /// The URL the bytes came from.
+    pub url: String,
+    /// The catalog revision they came from.
+    pub revision: String,
+    /// The hash the finished file has to have.
+    pub sha256: String,
+    /// How many bytes were written when the note was last flushed.
+    pub bytes: u64,
+}
+
+/// Write a resume note so a restart can pick the download up. Written to a temporary name and
+/// renamed, so a note is never half-written: a half-written note would be read as no note at all.
+pub fn write_part_meta(path: &Path, meta: &PartMeta) -> Result<()> {
+    let body = serde_json::to_vec_pretty(meta).map_err(|error| Fail::internal(format!("Craft AI Manager could not write its resume note: {error}")))?;
+    let counter = PART_META_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let temp = sibling_name(path, &format!("tmp-{}-{counter}", std::process::id()));
+    let wrote = (|| -> Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)
+            .map_err(|error| Fail::internal(format!("Craft AI Manager could not create {}: {error}", temp.display())))?;
+        file.write_all(&body)
+            .and_then(|()| file.flush())
+            .map_err(|error| Fail::internal(format!("Craft AI Manager could not write {}: {error}", temp.display())))?;
+        std::fs::rename(&temp, path).map_err(|error| Fail::internal(format!("Craft AI Manager could not put {} in place: {error}", path.display())))
+    })();
+    if wrote.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    wrote
+}
+
+/// Read a resume note, if it is there, readable and whole. `None` means "start over".
+#[must_use]
+pub fn read_part_meta(path: &Path) -> Option<PartMeta> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut body = Vec::new();
+    file.take(64 * 1024).read_to_end(&mut body).ok()?;
+    serde_json::from_slice(&body).ok()
+}
+
+/// `<path>.<suffix>`, next to `path`.
+fn sibling_name(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.file_name().map(std::ffi::OsStr::to_os_string).unwrap_or_default();
+    name.push(".");
+    name.push(suffix);
+    path.with_file_name(name)
+}
+
+/// Keeps the temporary names of resume notes apart inside one process.
+static PART_META_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// What `acknowledged.json` holds (SPEC v1.1 amendment 14: one acknowledgment per flagged model).
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -318,8 +393,9 @@ mod tests {
     use crate::testkit::{Scratch, test_model};
 
     use super::{
-        Acknowledgement, MODELS_DIR, VERIFIED_NAME, folder_usage, hash_file, is_acknowledged, is_installed, model_file, model_folder, models_dir_in, part_file,
-        read_verified, remove_verified, sha256_hex, verified_file, write_acknowledgement, write_verified,
+        Acknowledgement, MODELS_DIR, PartMeta, VERIFIED_NAME, folder_usage, hash_file, is_acknowledged, is_installed, is_part_meta_name, model_file,
+        model_folder, models_dir_in, part_file, part_meta_file, read_part_meta, read_verified, remove_verified, sha256_hex, verified_file,
+        write_acknowledgement, write_part_meta, write_verified,
     };
 
     const FIXTURE: &[u8] = b"the bytes a small model would be made of";
@@ -445,6 +521,41 @@ mod tests {
         assert!(!super::is_part_name(&entry, "lama_fp32.onnx") && !super::is_part_name(&entry, "lama_fp32.onnx.lock"));
         assert!(!super::is_part_name(&entry, "other.onnx.a1b2.part") && !super::is_part_name(&entry, "lama_fp32.onnxx.part"));
         assert_eq!(verified_file(&scratch.path, &entry).parent(), file.parent());
+    }
+
+    #[test]
+    fn a_resume_note_names_the_part_it_belongs_to() {
+        let scratch = Scratch::new("store-part-meta");
+        let entry = test_model(FIXTURE, None);
+        let part = part_file(&scratch.path, &entry, "a1b2");
+        let note = part_meta_file(&scratch.path, &entry, "a1b2");
+        assert_eq!(note.parent(), part.parent(), "the note sits next to the part it describes");
+        assert_eq!(note.to_string_lossy().as_ref(), format!("{}.json", part.to_string_lossy()), "and its name is the part's plus .json");
+        assert!(is_part_meta_name(&entry, "lama_fp32.onnx.a1b2.part.json") && is_part_meta_name(&entry, "lama_fp32.onnx.part.json"));
+        assert!(!is_part_meta_name(&entry, "lama_fp32.onnx.a1b2.part"), "a .part is not a note");
+        assert!(!is_part_meta_name(&entry, "lama_fp32.onnx.json") && !is_part_meta_name(&entry, "other.onnx.a1b2.part.json"));
+        assert!(!super::is_part_name(&entry, "lama_fp32.onnx.a1b2.part.json"), "and a note is not a .part");
+    }
+
+    #[test]
+    fn a_resume_note_is_read_back_whole_or_not_at_all() {
+        let scratch = Scratch::new("store-note-round-trip");
+        let entry = test_model(FIXTURE, None);
+        let note = part_meta_file(&scratch.path, &entry, "a1b2");
+        std::fs::create_dir_all(note.parent().expect("the note is in a folder")).expect("the model folder can be made");
+        assert_eq!(read_part_meta(&note), None, "no file is no note");
+        let meta = PartMeta { url: entry.url.clone(), revision: entry.revision.clone(), sha256: entry.sha256.clone(), bytes: 4_194_304 };
+        write_part_meta(&note, &meta).expect("the note can be written");
+        assert_eq!(read_part_meta(&note), Some(meta.clone()), "and reads back as it was written");
+        let meta2 = PartMeta { bytes: 8_388_608, ..meta };
+        write_part_meta(&note, &meta2).expect("the note can be written again");
+        assert_eq!(read_part_meta(&note), Some(meta2), "the newer one wins");
+        std::fs::write(&note, b"{\"url\": \"https://exam").expect("a half-written note can be put there");
+        assert_eq!(read_part_meta(&note), None, "and a half-written note is no note");
+        let folder = note.parent().expect("the note is in a folder");
+        let left =
+            std::fs::read_dir(folder).expect("the folder can be read").flatten().filter(|item| item.file_name().to_string_lossy().contains(".tmp-")).count();
+        assert_eq!(left, 0, "a written note leaves no temporary file behind");
     }
 
     #[test]

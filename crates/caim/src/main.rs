@@ -1,6 +1,7 @@
 //! The `caim` binary: `caim serve` (also the default) runs the loopback server, `--fake-backend`
-//! runs jobs on the built-in fake fill, `caim models ...` looks after the model store, and
-//! `--version` / `--help` answer without starting anything.
+//! runs jobs on the built-in fake fill, `caim open` starts the manager unless one is already
+//! answering, `caim models ...` looks after the model store, and `--version` / `--help` answer
+//! without starting anything.
 
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
@@ -8,6 +9,7 @@
 use std::io::IsTerminal;
 use std::io::Write;
 
+use craft_ai_manager::endpoint::{self, Launch};
 use craft_ai_manager::error::{Fail, Status};
 use craft_ai_manager::models;
 use craft_ai_manager::server::StopHandle;
@@ -30,6 +32,7 @@ fn main() -> std::process::ExitCode {
             std::process::ExitCode::SUCCESS
         }
         Ok(Action::Serve { fake_backend }) => serve(fake_backend),
+        Ok(Action::Open) => open(),
         Ok(Action::ModelsList) => models_list(),
         Ok(Action::ModelsInstall { id, accept_note }) => models_install(&id, accept_note),
         Ok(Action::ModelsVerify { id }) => models_verify(&id),
@@ -42,6 +45,7 @@ fn main() -> std::process::ExitCode {
 fn help() {
     println!("{USAGE}");
     println!("  serve             run the loopback server (this is also the default)");
+    println!("  open              start the manager, or say that one is already running");
     println!("  --fake-backend    run jobs on the built-in mean-colour fill, to try the protocol out");
     println!("  models list       one line per catalog entry: task, size, licences, and whether it is installed");
     println!("  models install    download one model, hashing it while it arrives");
@@ -56,6 +60,13 @@ fn help() {
 
 /// Run the server until something asks it to stop, then shut down cleanly.
 fn serve(fake_backend: bool) -> std::process::ExitCode {
+    serve_and_release(fake_backend, None)
+}
+
+/// [serve], handing over the launch lock this run took as `caim open`. The lock goes as soon as
+/// the server is listening and `endpoint.json` names this port, which is the moment a second
+/// `caim open` can stop waiting and see a running manager instead of starting another one.
+fn serve_and_release(fake_backend: bool, launch_lock: Option<endpoint::LaunchLock>) -> std::process::ExitCode {
     // MG-08 review round 2: the signal handler goes in before `Server::start` writes the endpoint
     // file, so a supervisor that stops the process the moment it can find the port still gets the
     // clean stop instead of the operating system's default handling.
@@ -69,7 +80,8 @@ fn serve(fake_backend: bool) -> std::process::ExitCode {
         Ok(server) => server,
         Err(fail) => return report(fail),
     };
-    let endpoint_variable = craft_ai_manager::endpoint::ENDPOINT_ENV;
+    drop(launch_lock);
+    let endpoint_variable = endpoint::ENDPOINT_ENV;
     println!("Craft AI Manager {VERSION} listening on 127.0.0.1:{}", server.port());
     match server.endpoint_path() {
         Some(path) => println!("endpoint file: {}", path.display()),
@@ -84,6 +96,39 @@ fn serve(fake_backend: bool) -> std::process::ExitCode {
     match server.shutdown() {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(fail) => report(fail),
+    }
+}
+
+/// `caim open`: start the manager unless one is already answering on loopback (amendment 18).
+/// When nothing is answering, this is `caim serve` for now - MG-13 gives the manager its window.
+///
+/// The decision and the start are one step rather than two: a second `caim open` launched at the
+/// same moment waits on a lock file beside the endpoint file instead of starting a manager that
+/// nobody can find, and both writing the same activity log. Only a lock another run is genuinely
+/// holding counts as "somebody else is starting one"; a lock this machine cannot make at all is an
+/// error, because then no manager is coming.
+fn open() -> std::process::ExitCode {
+    let endpoint_file = endpoint::endpoint_file_from_env();
+    let launch_lock = match endpoint_file.as_deref().map(endpoint::launch_lock_path_for) {
+        Some(path) => match endpoint::LaunchLock::take(&path) {
+            endpoint::LockOutcome::Taken(lock) => Some(lock),
+            endpoint::LockOutcome::Held => {
+                println!("Craft AI Manager is being started by another `caim open` right now. Nothing was started here.");
+                return std::process::ExitCode::SUCCESS;
+            }
+            // No lock, and no other run holding one: the folder or the disk is the problem, and a
+            // manager started here could not publish an endpoint file anybody could read.
+            endpoint::LockOutcome::Failed(fail) => return report(fail),
+        },
+        // Nowhere on this platform to put an endpoint file, so nothing to lock either.
+        None => None,
+    };
+    match endpoint::launch_decision(endpoint_file.as_deref()) {
+        Launch::AlreadyRunning { port } => {
+            println!("Craft AI Manager is already running on 127.0.0.1:{port}. Nothing was started.");
+            std::process::ExitCode::SUCCESS
+        }
+        Launch::Start => serve_and_release(false, launch_lock),
     }
 }
 

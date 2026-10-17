@@ -32,14 +32,30 @@ fn read(path: &Path) -> Value {
     serde_json::from_str(&text).expect("the endpoint file is JSON")
 }
 
-/// Anything the run left in its folder besides the endpoint file itself.
+/// Anything the run left in its folder besides the endpoint file itself. `app.json` and
+/// `activity.jsonl` belong in that folder and stay there (amendment 18), so they are not leftovers.
 fn leftovers(path: &Path) -> Vec<String> {
     std::fs::read_dir(path.parent().expect("the endpoint file has a folder"))
         .expect("the folder is readable")
         .flatten()
         .map(|entry| entry.file_name().to_string_lossy().to_string())
-        .filter(|name| name != "endpoint.json")
+        .filter(|name| name != "endpoint.json" && name != "app.json" && name != "activity.jsonl")
         .collect()
+}
+
+#[test]
+fn the_app_file_names_the_program_and_survives_a_clean_shutdown() {
+    let path = endpoint_in("app");
+    let mut server = start(&path);
+    let app = path.parent().expect("the endpoint file has a folder").join("app.json");
+    let value = read(&app);
+    assert_eq!(value.get("version").and_then(Value::as_u64), Some(1), "the app file says which shape it is");
+    let exe = value.get("exe").and_then(Value::as_str).expect("the app file names a program");
+    assert!(Path::new(exe).is_absolute(), "the path is absolute, as amendment 18 asks: {exe}");
+    assert!(std::fs::metadata(exe).is_ok(), "and the program it names is really there: {exe}");
+    server.shutdown().expect("a clean shutdown");
+    assert!(std::fs::metadata(&path).is_err(), "the endpoint file goes when the run ends");
+    assert!(std::fs::metadata(&app).is_ok(), "the app file stays, so the next start can be asked for");
 }
 
 #[test]
