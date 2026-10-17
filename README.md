@@ -237,7 +237,9 @@ the bytes were already on disk.
 The note counts the bytes it was written alongside, so a run killed between two checkpoints normally leaves more
 bytes in the `.part` than the note counts. Those extra bytes are not covered by any note, so they are cut off and the
 recorded prefix is what resumes. A `.part` shorter than its note is missing bytes the note vouches for, so that pair
-is deleted and the download starts over.
+is deleted and the download starts over. When the note counts the whole file - a run that died just after its last
+checkpoint - those bytes are hashed and put in place where they are, because asking the server for
+`Range: bytes=<size>-` would only be refused.
 
 Each install writes its own `<file>.<random>.part` and its own `<file>.<random>.part.json`, created exclusively, and
 renames into place only the bytes it hashed itself, so two installs at once can never put a wrong file under the
@@ -251,7 +253,9 @@ exception: a `.part` whose note is still there and just as old is a half downloa
 so that pair stays until resume adopts it or the rules above reject it. An install that created the lock file itself
 knows no other installer exists, so it adopts such a pair however young it is - running the same command again picks
 the bytes up straight away. Only an install that took the lock over insists both halves are old, because the install
-that left them might only be stalled. A `.part` with no note, and a note with no
+that left them might only be stalled, and a takeover never writes into the bytes it found: it copies the recorded
+prefix into a `.part` of its own, because the stalled install may still hold the old file open and renaming it would
+leave this install verifying a file somebody else is still appending to. A `.part` with no note, and a note with no
 `.part`, are both dead and go. The file is synced to disk before it is renamed into place.
 
 **The licence gate.** An entry is not offered - and the test over the embedded catalog fails in CI - when a field is

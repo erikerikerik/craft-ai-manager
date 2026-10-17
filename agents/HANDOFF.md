@@ -1,5 +1,15 @@
 # HANDOFF: Craft AI Manager
 
+## 2026-10-17: Codex-Strata (autopilot) - MG-12 review round 2 (one P1, two P2)
+
+- Same branch `ai/mg-12-resume-launch` and **PR #7**; this is the second and last fix round the protocol allows. Receipt: `agents/receipts/MG-12.md`, section "Review round 2".
+- **P1 - a lock takeover could verify a file another install was still writing** (`crates/caim/src/fetch.rs:470`). `adopt_part` renamed the abandoned `.part`, and on Unix a rename moves the same inode: an install stuck in a network read past `LOCK_STALE` keeps appending to the file the takeover then hashes and renames into place, so `verified.json` could describe bytes somebody else changed. A takeover now copies the recorded prefix into a `.part` of its own and hashes it in the same pass (`copy_prefix_and_hash`, `crates/caim/src/fetch.rs:510`), then deletes the old pair; only a lock this install created itself still renames, because then no other installer exists.
+- **P2 - a part whose note already counted the whole file asked for a range that can only be refused** (`crates/caim/src/fetch.rs:270`). A note written at the final checkpoint left a complete `.part`, the next install asked for `Range: bytes=<size>-`, a compliant server answers 416, the pair was kept, and every retry repeated it. Those bytes are hashed and put in place where they are and the server is not contacted; both paths end in one `finalize_part` (`crates/caim/src/fetch.rs:371`).
+- **P2 - a health answer split across reads made `caim open` start a second manager** (`crates/caim/src/endpoint.rs:235`). One `read` can return half a status line, so `HTTP/1.1 2` read as "nothing answering" and `caim open` would bind the port and overwrite the live manager's `endpoint.json`. It now reads until the status line ends, the peer hangs up, or the 250 ms budget is spent.
+- Three new tests, 250 passed / 0 failed / 2 ignored. The takeover test holds the old `.part` open and writes through that handle the moment a range is asked for; it was run against the pre-fix code and fails there, which is what makes it worth having.
+- Gates: `cargo fmt --check` 0, `cargo clippy --all-targets -- -D warnings` 0, `cargo test` 250 / 0 / 2, guards 9 of 9 in 79.4 s (`E:\CraftML\work\logs\guards-20261017-0011.txt`). CI on the round-1 head `9cd3309` was green on all four jobs (ubuntu 36 s, windows 1m43s, deny 40s, msrv 33s).
+- **Next:** the third review of PR #7. If it is clean and CI is green on the new head, `gh pr ready 7` and `gh pr merge 7 --merge`; if it finds anything, the protocol says stop and report - that is round 3, and only two fix rounds are allowed. Then the PhotoCraft docs PR that closes the MG-12 row (PR #22 moved it to `review`).
+
 ## 2026-10-17 (early): Codex-Strata (autopilot) - MG-12 review round 1 (one P1, two P2)
 
 - Same branch `ai/mg-12-resume-launch` and **PR #7**; this round answers the independent review of `517c40b`. Receipt: `agents/receipts/MG-12.md`, section "Review round 1".

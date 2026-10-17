@@ -11,7 +11,7 @@ use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use serde_json::Value;
@@ -232,14 +232,30 @@ pub fn health_is_answering(port: u16, token: &str) -> bool {
     if stream.write_all(request.as_bytes()).and_then(|()| stream.flush()).is_err() {
         return false;
     }
-    let mut head = [0u8; 32];
-    match stream.read(&mut head) {
-        Ok(read) => {
-            let text = String::from_utf8_lossy(&head[..read]);
-            text.starts_with("HTTP/1.1 200") || text.starts_with("HTTP/1.0 200")
+    // One read can legally hand back half a status line, so keep reading until the line ends, the
+    // peer hangs up, or the health check has had its say. Deciding on a fragment would start a second
+    // manager on top of the one that is running and overwrite its endpoint file.
+    let deadline = Instant::now() + HEALTH_TIMEOUT;
+    let mut head: Vec<u8> = Vec::new();
+    let mut buffer = [0u8; 32];
+    loop {
+        match stream.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => {
+                if let Some(chunk) = buffer.get(..read) {
+                    head.extend_from_slice(chunk);
+                }
+            }
+            // Out of time or a dead socket: decide on whatever arrived.
+            Err(_) => break,
         }
-        Err(_) => false,
+        let line_is_over = head.windows(2).any(|pair| pair[0] == b'\r' && pair[1] == b'\n');
+        if line_is_over || head.len() >= 32 || Instant::now() >= deadline {
+            break;
+        }
     }
+    let text = String::from_utf8_lossy(&head);
+    text.starts_with("HTTP/1.1 200") || text.starts_with("HTTP/1.0 200")
 }
 
 /// What `caim open` should do about a manager (amendment 18).
@@ -279,6 +295,7 @@ mod tests {
         APP_NAME, APP_VERSION, ENDPOINT_VERSION, Launch, app_path_for, endpoint_file_from_env, health_is_answering, is_ours, launch_decision,
         published_credentials, published_port, remove, temp_path, write, write_app,
     };
+    use std::io::{Read, Write};
     use std::path::PathBuf;
 
     fn temp_endpoint(who: &str) -> PathBuf {
@@ -450,5 +467,26 @@ mod tests {
         assert_eq!(launch_decision(Some(&path)), Launch::Start, "a file that is not there means start one");
         write(&path, port, "gone").expect("a file naming a shut port can be written");
         assert_eq!(launch_decision(Some(&path)), Launch::Start, "and so does a file naming a port nobody answers on");
+    }
+
+    #[test]
+    fn a_health_answer_that_arrives_in_pieces_is_still_one_manager() {
+        // A single read can legally hand back half a status line. Deciding on that fragment would
+        // start a second manager on top of the one that is answering, and overwrite its file.
+        let listener = std::net::TcpListener::bind(std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0))).expect("a free port");
+        let port = listener.local_addr().expect("the address of a bound port").port();
+        let server = std::thread::spawn(move || {
+            let Ok((mut client, _)) = listener.accept() else { return };
+            let mut request = [0u8; 512];
+            let _ = client.read(&mut request);
+            // The status line arrives in two writes, with a pause between them.
+            let _ = client.write_all(b"HTTP/1.1 2");
+            let _ = client.flush();
+            std::thread::sleep(std::time::Duration::from_millis(60));
+            let _ = client.write_all(b"00 OK\r\nContent-Length: 2\r\n\r\nok");
+            let _ = client.flush();
+        });
+        assert!(health_is_answering(port, "token"), "a 200 split across reads is still a manager answering");
+        server.join().expect("the fake manager finished");
     }
 }

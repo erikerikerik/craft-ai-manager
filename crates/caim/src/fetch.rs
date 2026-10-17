@@ -258,7 +258,6 @@ fn fetch_into_place(
     let tag = install_tag()?;
     let part = store::part_file(root, model, &tag);
     let meta = store::part_meta_file(root, model, &tag);
-    let target = store::model_file(root, model);
     let started = Instant::now();
 
     let (mut offset, mut hasher) = match adopt_part(root, model, &part, &meta, resume) {
@@ -267,6 +266,12 @@ fn fetch_into_place(
     };
     if offset > 0 {
         progress(offset, model.size);
+    }
+    if offset > 0 && offset == model.size {
+        // The note counts the whole file: the last run died after its final checkpoint, or lost its
+        // connection exactly at the catalog size. Asking the server for `bytes=<size>-` would answer
+        // 416 and every retry would repeat it, so these bytes are finished here instead.
+        return finalize_part(model, root, &part, &meta, hasher, offset, started);
     }
     let stream = if offset == 0 {
         fetch.open(&model.url)?
@@ -357,11 +362,19 @@ fn fetch_into_place(
     if total != model.size {
         return Err(keep_what_arrived(&meta, model, total, &part, &format!("{} stopped short of the catalog size.", model.label())));
     }
+    finalize_part(model, root, &part, &meta, hasher, offset, started)
+}
+
+/// The bytes are all there: hash what this install collected and put the file in place only when the
+/// hash matches the catalog. Both a download that just arrived and a resumed part that was already
+/// whole when this install found it end here, and in both cases `total` is the catalog size.
+fn finalize_part(model: &Model, root: &Path, part: &Path, meta: &Path, hasher: Sha256, resumed_from: u64, started: Instant) -> Result<Outcome> {
+    let total = model.size;
     let actual = store::hex(&hasher.finalize());
     if actual != model.sha256 {
         return Err(abandon_pair(
-            &part,
-            &meta,
+            part,
+            meta,
             Fail::internal(format!(
                 "The file downloaded for {} has SHA-256 {actual}, not the {} the catalog expects. Nothing was saved.",
                 model.label(),
@@ -369,13 +382,14 @@ fn fetch_into_place(
             )),
         ));
     }
+    let target = store::model_file(root, model);
     // The `.part` is this install's alone, so the bytes renamed here are the bytes just hashed.
-    if let Err(error) = std::fs::rename(&part, &target) {
-        return Err(abandon_pair(&part, &meta, Fail::internal(format!("Craft AI Manager could not put {} in place: {error}", target.display()))));
+    if let Err(error) = std::fs::rename(part, &target) {
+        return Err(abandon_pair(part, meta, Fail::internal(format!("Craft AI Manager could not put {} in place: {error}", target.display()))));
     }
-    let _ = std::fs::remove_file(&meta);
+    let _ = std::fs::remove_file(meta);
     store::write_verified(root, model, &actual, total)?;
-    Ok(Outcome::Downloaded { sha256: actual, bytes: total, elapsed_ms: millis_since(started), resumed_from: offset })
+    Ok(Outcome::Downloaded { sha256: actual, bytes: total, elapsed_ms: millis_since(started), resumed_from })
 }
 
 /// A short random tag that tells this install's files from any other's.
@@ -410,9 +424,10 @@ fn remove_dead_parts(folder: &Path, model: &Model) {
     }
 }
 
-/// Pick up a half-download nobody is writing to any more: move its `.part` and its note under this
-/// install's own tag, re-hash the bytes on disk so the hash can carry on where the last run left
-/// off, and hand back how many bytes there are. `None` means start from zero, which is what happens
+/// Pick up a half-download nobody is writing to any more: put its bytes under this install's own tag
+/// (renamed when this install created the lock, copied when it took the lock over - see
+/// [copy_prefix_and_hash]), re-hash them so the hash can carry on where the last run left off, and
+/// hand back how many bytes there are. `None` means start from zero, which is what happens
 /// when the note does not describe this exact file - a different revision or SHA-256 in the note
 /// means delete both and start over (amendment 18).
 fn adopt_part(root: &Path, model: &Model, part: &Path, meta: &Path, resume: Resume) -> Option<(u64, Sha256)> {
@@ -452,6 +467,22 @@ fn adopt_part(root: &Path, model: &Model, part: &Path, meta: &Path, resume: Resu
             remove_pair(&found_part, &found_meta);
             continue;
         }
+        if resume == Resume::TakenOver {
+            // The install that held the lock might only be stalled, and renaming its `.part` would
+            // leave it writing into the very file this install is about to verify - on Unix the
+            // rename keeps the same inode. So the recorded prefix is copied instead: those bytes
+            // were written at least [LOCK_STALE] ago, and the copy is this install's alone.
+            let Some(hasher) = copy_prefix_and_hash(&found_part, part, note.bytes) else {
+                remove_pair(part, meta);
+                continue;
+            };
+            // The old pair is no longer this install's business. An owner still holding the file open
+            // keeps its own copy, which is the point.
+            let _ = std::fs::remove_file(&found_part);
+            let _ = std::fs::remove_file(&found_meta);
+            write_note(meta, model, note.bytes);
+            return Some((note.bytes, hasher));
+        }
         if written > note.bytes && !truncate_to(&found_part, note.bytes) {
             remove_pair(&found_part, &found_meta);
             continue;
@@ -470,6 +501,37 @@ fn adopt_part(root: &Path, model: &Model, part: &Path, meta: &Path, resume: Resu
         return Some((note.bytes, hasher));
     }
     None
+}
+
+/// Copy the first `bytes` of another install's `.part` into this install's own `.part`, hashing them
+/// on the way, so a lock takeover never ends up writing into - or verifying - a file some other
+/// process may still be appending to. `None` when either file could not be used, and whatever was
+/// copied then gets no further use.
+fn copy_prefix_and_hash(from: &Path, to: &Path, bytes: u64) -> Option<Sha256> {
+    let mut reader = std::fs::File::open(from).ok()?;
+    let mut writer = OpenOptions::new().write(true).create_new(true).open(to).ok()?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; CHUNK];
+    let mut copied: u64 = 0;
+    while copied < bytes {
+        let room = usize::try_from(bytes - copied).unwrap_or(buffer.len()).min(buffer.len());
+        match reader.read(&mut buffer[..room]) {
+            // Fewer bytes than the note counts are here now than were there when the note was
+            // written, so nothing on disk can be trusted.
+            Ok(0) => return None,
+            Ok(read) => {
+                let chunk = buffer.get(..read)?;
+                hasher.update(chunk);
+                writer.write_all(chunk).ok()?;
+                copied += read as u64;
+            }
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(_) => return None,
+        }
+    }
+    writer.flush().ok()?;
+    writer.sync_all().ok()?;
+    Some(hasher)
 }
 
 /// Feed a file's bytes to `hasher`, so a resumed download continues its SHA-256 where the last run
@@ -710,12 +772,13 @@ mod tests {
     use std::cell::RefCell;
 
     use crate::error::Status;
-    use crate::fetch::{Answer, LOCK_STALE, Outcome, Resume, fetch_into_place, install, resume_answer, verify};
+    use crate::fetch::{Answer, Fetch, LOCK_STALE, Outcome, Resume, Stream, fetch_into_place, install, resume_answer, verify};
     use crate::store::{
         is_installed, is_part_meta_name, is_part_name, lock_file, model_file, model_folder, part_file, part_meta_file, read_verified, sha256_hex,
         write_acknowledgement,
     };
     use crate::testkit::{FakeFetch, RangeFetch, Scratch, SlowFetch, test_model};
+    use std::io::Write;
     use std::time::Duration;
 
     const FIXTURE: &[u8] = b"the bytes a small model would be made of";
@@ -996,6 +1059,83 @@ mod tests {
         assert!(leftovers(&scratch, &entry).is_empty(), "the pair that could not be trusted is gone");
     }
 
+    #[test]
+    fn a_part_whose_note_counts_the_whole_file_is_finished_without_asking_the_server() {
+        // The last run died after its final checkpoint, so the note counts every byte. Asking the
+        // server for `bytes=<size>-` would answer 416 and every retry would repeat it, so the bytes
+        // on disk are hashed and put in place here instead.
+        let scratch = Scratch::new("fetch-resume-whole");
+        let entry = test_model(FIXTURE, None);
+        leave_half(&scratch, &entry, FIXTURE.len(), &entry.revision, &entry.sha256);
+        let fetcher = RangeFetch::new(FIXTURE);
+        let outcome = install(&entry, &scratch.path, &fetcher, &mut no_progress).expect("the whole file on disk is finished locally");
+        match outcome {
+            Outcome::Downloaded { bytes, resumed_from, .. } => {
+                assert_eq!(bytes, entry.size, "the whole file is what got installed");
+                assert_eq!(resumed_from, entry.size, "every byte of it was already on disk");
+            }
+            Outcome::AlreadyInstalled => panic!("a part file is not an installed model"),
+        }
+        assert!(fetcher.asked().is_empty(), "the server was never asked for anything: {:?}", fetcher.asked());
+        assert_eq!(std::fs::read(model_file(&scratch.path, &entry)).expect("the model file"), FIXTURE);
+        assert!(is_installed(&scratch.path, &entry));
+        assert!(leftovers(&scratch, &entry).is_empty(), "the finished part left nothing behind");
+    }
+
+    /// A range fetcher standing in for a stalled install that wakes up: the moment a range is asked
+    /// for, the install that left the pair behind writes again through the handle it still holds on
+    /// its own `.part`. Those bytes must never reach the file this install is verifying.
+    struct WakingOwner {
+        inner: RangeFetch,
+        handle: RefCell<std::fs::File>,
+        extra: &'static [u8],
+    }
+
+    impl Fetch for WakingOwner {
+        fn open(&self, url: &str) -> crate::error::Result<Stream> {
+            self.inner.open(url)
+        }
+
+        fn open_range(&self, url: &str, offset: u64) -> crate::error::Result<Stream> {
+            if let Ok(mut file) = self.handle.try_borrow_mut() {
+                let _ = file.write_all(self.extra);
+                let _ = file.flush();
+            }
+            self.inner.open_range(url, offset)
+        }
+    }
+
+    #[test]
+    fn a_takeover_copies_the_bytes_it_resumes_from_rather_than_writing_into_them() {
+        // A lock can be taken over from an install that is only stalled, and that install may still
+        // hold its `.part` open. Renaming it would leave this install verifying a file somebody else
+        // is appending to, so the recorded prefix is copied into a file this install owns outright.
+        let scratch = Scratch::new("fetch-resume-copied");
+        let entry = test_model(FIXTURE, None);
+        let taken = FIXTURE.len() / 2;
+        let half = taken as u64;
+        let pair = leave_half(&scratch, &entry, taken, &entry.revision, &entry.sha256);
+        age_pair(&pair);
+        std::fs::write(lock_file(&scratch.path, &entry), "someone-else").expect("the lock left by the stalled install is written");
+        age(&lock_file(&scratch.path, &entry));
+        let handle = std::fs::OpenOptions::new().append(true).open(&pair[0]).expect("the stalled install still holds its own file open");
+        let fetcher = WakingOwner { inner: RangeFetch::new(FIXTURE), handle: RefCell::new(handle), extra: b" still writing" };
+        let outcome = install(&entry, &scratch.path, &fetcher, &mut no_progress).expect("the takeover carries on from a copy of the bytes");
+        match outcome {
+            Outcome::Downloaded { bytes, resumed_from, .. } => {
+                assert_eq!(bytes, entry.size, "the whole file arrived");
+                assert_eq!(resumed_from, half, "the bytes the note counted were carried on from");
+            }
+            Outcome::AlreadyInstalled => panic!("a half file is not an installed model"),
+        }
+        assert_eq!(fetcher.inner.asked(), vec![half], "only the missing bytes were asked for");
+        assert_eq!(
+            std::fs::read(model_file(&scratch.path, &entry)).expect("the model file"),
+            FIXTURE,
+            "what the stalled owner wrote afterwards is not in the installed file"
+        );
+        assert!(is_installed(&scratch.path, &entry));
+    }
     #[test]
     fn a_server_claiming_more_than_the_catalog_promises_is_refused() {
         let scratch = Scratch::new("fetch-claimed");
