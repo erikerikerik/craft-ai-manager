@@ -12,6 +12,7 @@ use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
@@ -31,6 +32,13 @@ const MAX_LINE_BYTES: usize = 8 * 1024;
 const MAX_READ_BYTES: u64 = 8 * 1024 * 1024;
 
 static WRITE_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+/// One finished job at a time. Connection threads finish different jobs at the same moment, and
+/// appending a line and trimming the file has to be one transaction: two writers could otherwise
+/// interleave their writes into one invalid line, and two trims could each rewrite from their own
+/// snapshot and drop a record the other had just added. (Writers in another process are not
+/// serialized: one manager owns this file.)
+static LOG_LOCK: Mutex<()> = Mutex::new(());
 
 /// One finished job, as one line of the log.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -63,18 +71,17 @@ pub fn activity_path_for(endpoint: Option<&Path>) -> Option<PathBuf> {
     Some(folder.join(ACTIVITY_NAME))
 }
 
-/// Append one finished job, then trim the file if it has outgrown its keep.
+/// Append one finished job, then trim the file if it has outgrown its keep. The whole append and
+/// trim runs under [LOG_LOCK], and the line goes out in one write, so two jobs finishing at the same
+/// moment cannot split each other's line or drop each other's record.
 pub fn append(path: &Path, record: &Record) -> Result<()> {
+    let _log = LOG_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let Some(folder) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) else {
         return Err(Fail::internal(format!("Craft AI Manager has no folder to write {} in.", path.display())));
     };
     std::fs::create_dir_all(folder).map_err(|error| Fail::internal(format!("Craft AI Manager could not create {}: {error}", folder.display())))?;
-    let line = serde_json::to_string(record)?;
-    let written = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .and_then(|mut file| file.write_all(line.as_bytes()).and_then(|()| file.write_all(b"\n")).and_then(|()| file.flush()));
+    let line = format!("{}\n", serde_json::to_string(record)?);
+    let written = OpenOptions::new().create(true).append(true).open(path).and_then(|mut file| file.write_all(line.as_bytes()).and_then(|()| file.flush()));
     if let Err(error) = written {
         return Err(Fail::internal(format!("Craft AI Manager could not write its activity log at {}: {error}", path.display())));
     }
@@ -270,6 +277,33 @@ mod tests {
         assert_eq!(kept.len(), TRIM_AT.saturating_sub(1), "nothing is dropped below the trim point");
         let after = std::fs::metadata(&path).expect("the log is there").len();
         assert!(after > before && after <= before + 512, "the append is one write, not a rewrite of {before} bytes");
+    }
+
+    #[test]
+    fn jobs_finishing_at_the_same_time_each_keep_one_whole_line() {
+        // Connection threads finish different jobs at the same moment, so the append and its trim run
+        // one at a time: every job keeps exactly one line, and no line is a mix of two.
+        let path = folder("threads").join(ACTIVITY_NAME);
+        let mut workers = Vec::new();
+        for worker in 0..4 {
+            let path = path.clone();
+            workers.push(std::thread::spawn(move || {
+                for number in 0..5 {
+                    let mut entry = record("done");
+                    entry.model = Some(format!("worker-{worker}-{number}"));
+                    append(&path, &entry).expect("a line goes in");
+                }
+            }));
+        }
+        for worker in workers {
+            let _ = worker.join();
+        }
+        let written = lines(&path);
+        assert_eq!(written.len(), 20, "every finished job kept one line");
+        for line in &written {
+            let entry: Record = serde_json::from_str(line).expect("every line is whole JSON");
+            assert!(entry.model.unwrap_or_default().starts_with("worker-"), "and no line is a mix of two: {line}");
+        }
     }
 
     #[test]

@@ -13,10 +13,22 @@ fn log_path(endpoint: &Path) -> PathBuf {
     endpoint.parent().expect("the endpoint file has a folder").join("activity.jsonl")
 }
 
-/// The log as parsed lines.
-fn lines(path: &Path) -> Vec<Value> {
-    let text = std::fs::read_to_string(path).expect("the log is readable");
-    text.lines().map(|line| serde_json::from_str(line).expect("the log is one JSON object per line")).collect()
+/// The log as parsed lines, once it holds at least `expected` of them. A job's new state goes
+/// public a moment before its line reaches the log (`crates/caim/src/job.rs:550` drops the queue
+/// lock before writing, so the disk never holds up the queue), and the log is a convenience rather
+/// than a dependency, so a reader has to wait for it rather than assume it is there.
+fn wait_for_lines(path: &Path, expected: usize) -> Vec<Value> {
+    let deadline = Instant::now() + support::WAIT;
+    loop {
+        if let Ok(text) = std::fs::read_to_string(path) {
+            let written: Vec<Value> = text.lines().map(|line| serde_json::from_str(line).expect("the log is one JSON object per line")).collect();
+            if written.len() >= expected {
+                return written;
+            }
+        }
+        assert!(Instant::now() < deadline, "the log at {} never reached {expected} lines", path.display());
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 #[test]
@@ -24,7 +36,7 @@ fn a_finished_job_leaves_one_line_with_the_fields_that_exist_today() {
     let server = support::TestServer::fake("activity-done");
     let id = server.submit_id(&support::fill_job(4, 2, 8, 3), &support::sample_image(), &support::sample_mask());
     server.wait_for_state(&id, "done");
-    let written = lines(&log_path(&server.endpoint));
+    let written = wait_for_lines(&log_path(&server.endpoint), 1);
     assert_eq!(written.len(), 1, "one line for one finished job");
     let line = written.first().expect("a line");
     assert_eq!(line.get("state").and_then(Value::as_str), Some("done"));
@@ -47,7 +59,7 @@ fn a_cancelled_job_leaves_one_cancelled_line_rather_than_two() {
     server.wait_for_state(&id, "running");
     assert_eq!(server.delete(&format!("/v1/jobs/{id}")).status, 204, "the job is cancelled");
     server.wait_for_state(&id, "cancelled");
-    let written = lines(&log_path(&server.endpoint));
+    let written = wait_for_lines(&log_path(&server.endpoint), 1);
     assert_eq!(written.len(), 1, "the DELETE writes the line, and the worker does not write another: {written:?}");
     assert_eq!(written.first().expect("a line").get("state").and_then(Value::as_str), Some("cancelled"));
     assert_eq!(written.first().expect("a line").get("model").and_then(Value::as_str), None, "a job that never ran names no model");
@@ -62,7 +74,7 @@ fn a_clean_stop_logs_every_job_it_had_to_cancel() {
     assert_eq!(server.poll(&second).get("state").and_then(Value::as_str), Some("queued"), "the second job is still waiting when the stop arrives");
     let endpoint = server.endpoint.clone();
     let _ = server.shutdown();
-    let written = lines(&log_path(&endpoint));
+    let written = wait_for_lines(&log_path(&endpoint), 2);
     assert_eq!(written.len(), 2, "the running job and the queued job each get a line: {written:?}");
     assert!(written.iter().all(|line| line.get("state").and_then(Value::as_str) == Some("cancelled")), "both were cancelled by the stop");
 }

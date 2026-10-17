@@ -234,6 +234,11 @@ catalog: a mismatch deletes both files and the install fails. A download that st
 runs out, or a read error halfway through - keeps what arrived and says so, and the install line names how many of
 the bytes were already on disk.
 
+The note counts the bytes it was written alongside, so a run killed between two checkpoints normally leaves more
+bytes in the `.part` than the note counts. Those extra bytes are not covered by any note, so they are cut off and the
+recorded prefix is what resumes. A `.part` shorter than its note is missing bytes the note vouches for, so that pair
+is deleted and the download starts over.
+
 Each install writes its own `<file>.<random>.part` and its own `<file>.<random>.part.json`, created exclusively, and
 renames into place only the bytes it hashed itself, so two installs at once can never put a wrong file under the
 verified name. That is why the pair carries a random tag rather than the bare `<file>.part` amendment 18 names:
@@ -243,7 +248,10 @@ the download runs), and a second install is told another one is running. A lock 
 was left by an install that died; the next install moves it aside under a name of its own (if several try at once,
 one rename wins) and takes over. A `.part` nobody has written to for two minutes is cleared the same way, with one
 exception: a `.part` whose note is still there and just as old is a half download that the next install can pick up,
-so that pair stays until resume adopts it or the rules above reject it. A `.part` with no note, and a note with no
+so that pair stays until resume adopts it or the rules above reject it. An install that created the lock file itself
+knows no other installer exists, so it adopts such a pair however young it is - running the same command again picks
+the bytes up straight away. Only an install that took the lock over insists both halves are old, because the install
+that left them might only be stalled. A `.part` with no note, and a note with no
 `.part`, are both dead and go. The file is synced to disk before it is renamed into place.
 
 **The licence gate.** An entry is not offered - and the test over the embedded catalog fails in CI - when a field is
