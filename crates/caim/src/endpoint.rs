@@ -37,6 +37,9 @@ const HEALTH_TIMEOUT: Duration = Duration::from_millis(250);
 /// The words every Craft AI Manager error body carries (`crate::http::error_body`), which is what
 /// tells a busy manager's 503 from another local service's.
 const CAIM_ERROR_MARK: &str = "Craft AI Manager";
+/// The words only a Craft AI Manager health answer carries (`crate::protocol::health`), which is
+/// what tells a running manager's 200 from another local service that answers every path the same.
+const CAIM_HEALTH_MARK: &str = "\"app\":\"caim/";
 /// How much of a health reply is read before deciding. A real one is a status line, three headers
 /// and one short JSON body; past this is somebody else's page.
 const MAX_PROBE_BYTES: usize = 2048;
@@ -243,7 +246,8 @@ pub fn published_credentials(path: &Path) -> Option<(u16, String)> {
 /// What a health probe found on the port an endpoint file names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Health {
-    /// A manager answered `/v1/health` with a 200.
+    /// A manager answered `/v1/health` with a 200 carrying this program's own health body. A 200
+    /// from anything else is `Absent`.
     Ready,
     /// Something answered with a 503 that carries this program's own error sentence. That is a
     /// manager whose connection slots are all taken: the accept loop refuses a request before it
@@ -259,8 +263,8 @@ pub enum Health {
 /// /v1/health`, and nearly all of the answer is one status line.
 ///
 /// This is a raw request rather than a client library on purpose. `caim open` has to answer a
-/// simple question about a machine-local port. Only a 503 needs more than its status line, because
-/// 503 is the ordinary way for any local service to say it cannot take a request.
+/// simple question about a machine-local port. A 200 and a 503 both need more than the status line,
+/// because any local service can answer both of them to a path it has never heard of.
 #[must_use]
 pub fn health_probe(port: u16, token: &str) -> Health {
     if token.chars().any(|ch| matches!(ch, '\r' | '\n' | '\0')) {
@@ -302,14 +306,19 @@ pub fn health_probe(port: u16, token: &str) -> Health {
         if !so_far.contains("\r\n") {
             continue;
         }
-        // A 200, a 401 and anything else are decided by the status line alone: only this program
-        // answers /v1/health that way to the token the endpoint file holds.
-        if !status_line_says(&so_far, "503") {
+        // A 401 and anything else are decided by the status line alone: only this program answers
+        // /v1/health that way to the token the endpoint file holds. A 200 and a 503 are different:
+        // any local service can answer both of them to a path it has never heard of.
+        let mark = if status_line_says(&so_far, "503") {
+            CAIM_ERROR_MARK
+        } else if status_line_says(&so_far, "200") {
+            CAIM_HEALTH_MARK
+        } else {
             break;
-        }
-        // A 503 is this program's busy answer as soon as its own sentence is in the body. One more
-        // read covers a body that arrives after the headers; then the reply is somebody else's.
-        if so_far.contains(CAIM_ERROR_MARK) {
+        };
+        // The answer is this program's as soon as its own words are in the body. One more read
+        // covers a body that arrives after the headers; then the reply is somebody else's.
+        if so_far.contains(mark) {
             break;
         }
         if so_far.contains("\r\n\r\n") {
@@ -321,7 +330,19 @@ pub fn health_probe(port: u16, token: &str) -> Health {
     }
     let text = String::from_utf8_lossy(&head);
     if status_line_says(&text, "200") {
-        Health::Ready
+        if text.contains(CAIM_HEALTH_MARK) {
+            Health::Ready
+        } else if text.contains("\r\n\r\n") {
+            // A whole 200 from something that is not this program: a server that answers every path
+            // the same way has taken the port a crashed manager left behind. Nothing is running, so
+            // a manager may start.
+            Health::Absent
+        } else {
+            // The reply stopped before its headers were over. A manager writes its headers and body
+            // in one pass, so a half answer is far more likely a slow manager than a stranger, and
+            // starting a second manager over a live one is the worse mistake - round 2's P1.
+            Health::Ready
+        }
     } else if status_line_says(&text, "503") {
         if text.contains(CAIM_ERROR_MARK) {
             Health::Busy
@@ -361,9 +382,9 @@ pub enum Launch {
 /// Look at the endpoint file this run would write, and ask whether a manager is already answering
 /// there. A missing, unreadable, or dead file means start one: the file is a hint, not a promise.
 ///
-/// A manager that answers 503 with its own busy sentence because every connection slot is taken is
-/// a manager that is running, so it counts as already running too. A 503 from anything else on that
-/// port is a stranger that took the port a dead manager left, and it does not stop a start.
+/// A manager that answers 503 with its own busy sentence, or 200 with its own health body, is a
+/// manager that is running, so it counts as already running. A 200 or a 503 from anything else on
+/// that port is a stranger that took the port a dead manager left, and it does not stop a start.
 #[must_use]
 pub fn launch_decision(endpoint: Option<&Path>) -> Launch {
     let Some(path) = endpoint.filter(|path| path.is_file()) else { return Launch::Start };
@@ -671,11 +692,15 @@ mod tests {
             let Ok((mut client, _)) = listener.accept() else { return };
             let mut request = [0u8; 512];
             let _ = client.read(&mut request);
+            let body = crate::protocol::health(&format!("caim/{}", crate::VERSION));
+            let head = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+            let (first, rest) = head.split_at(9);
             // The status line arrives in two writes, with a pause between them.
-            let _ = client.write_all(b"HTTP/1.1 2");
+            let _ = client.write_all(first.as_bytes());
             let _ = client.flush();
             std::thread::sleep(std::time::Duration::from_millis(60));
-            let _ = client.write_all(b"00 OK\r\nContent-Length: 2\r\n\r\nok");
+            let _ = client.write_all(rest.as_bytes());
+            let _ = client.write_all(&body);
             let _ = client.flush();
         });
         assert_eq!(health_probe(port, "token"), Health::Ready, "a 200 split across reads is still a manager answering");
@@ -735,6 +760,50 @@ mod tests {
         write(&path, port, "token").expect("a file naming a stranger port can be written");
         assert_eq!(launch_decision(Some(&path)), Launch::Start, "so a manager may start and take the port back");
         server.join().expect("the fake stranger finished");
+    }
+
+    #[test]
+    fn a_stranger_answer_200_on_the_port_is_not_the_running_manager() {
+        // The same crashed manager and the same taken port, but this stranger answers every path with
+        // a page. Its 200 is not a health answer, so a status-line check would report a manager that
+        // is not there and start nothing.
+        let listener = std::net::TcpListener::bind(std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0))).expect("a free port");
+        let port = listener.local_addr().expect("the address of a bound port").port();
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let Ok((mut client, _)) = listener.accept() else { return };
+                let mut request = [0u8; 512];
+                let _ = client.read(&mut request);
+                let body = "<html><head><title>It works</title></head><body>every path answers 200 here</body></html>";
+                let reply = format!("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                let _ = client.write_all(reply.as_bytes());
+                let _ = client.flush();
+            }
+        });
+        assert_eq!(health_probe(port, "token"), Health::Absent, "a 200 that is not our health answer is a stranger on the port, not a manager");
+        let path = temp_endpoint("stranger-200");
+        let _guard = TempFile(path.clone());
+        write(&path, port, "token").expect("a file naming a stranger port can be written");
+        assert_eq!(launch_decision(Some(&path)), Launch::Start, "so a manager may start and take the port back");
+        server.join().expect("the fake stranger finished");
+    }
+
+    #[test]
+    fn a_cut_off_200_answer_does_not_start_a_second_manager() {
+        // The mirror of the cut-off 503: a reply that never finishes its headers is far more likely a
+        // slow manager than a stranger, and the worse mistake is starting a second one over a live one.
+        let listener = std::net::TcpListener::bind(std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0))).expect("a free port");
+        let port = listener.local_addr().expect("the address of a bound port").port();
+        let server = std::thread::spawn(move || {
+            let Ok((mut client, _)) = listener.accept() else { return };
+            let mut request = [0u8; 512];
+            let _ = client.read(&mut request);
+            let _ = client.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n");
+            let _ = client.flush();
+            std::thread::sleep(std::time::Duration::from_millis(400));
+        });
+        assert_eq!(health_probe(port, "token"), Health::Ready, "a 200 whose body never arrived is still a manager that is running");
+        server.join().expect("the fake manager finished");
     }
 
     #[test]
