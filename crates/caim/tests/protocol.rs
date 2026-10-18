@@ -8,7 +8,7 @@ use craft_ai_manager::{catalog, protocol, store};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use support::{BOUNDARY, decode_png, fill_job, job_json, job_parts, multipart, png_gray, png_rgb, sample_image, sample_mask};
+use support::{BOUNDARY, MASK_TASK, decode_png, fill_job, full_mask, job_json, job_parts, mask_job, multipart, png_gray, png_rgb, sample_image, sample_mask};
 
 /// The task MG-01 knows, as a value the tests compare against.
 const TASK: &str = "fill_masked_area";
@@ -67,10 +67,21 @@ fn the_happy_path_fills_the_masked_area() {
 
     let tasks = server.get("/v1/tasks").json();
     let list = tasks.get("tasks").and_then(Value::as_array).expect("a task list");
-    assert_eq!(list.len(), 1, "the fake backend offers one task");
-    assert_eq!(list.first().and_then(|task| task.get("id")).and_then(Value::as_str), Some(TASK));
-    assert_eq!(list.first().and_then(|task| task.get("needs_prompt")).and_then(Value::as_bool), Some(false));
+    assert_eq!(
+        list.iter().map(|task| task.get("id").and_then(Value::as_str)).collect::<Vec<Option<&str>>>(),
+        vec![Some(TASK), Some(MASK_TASK)],
+        "Fill first, then Select Subject: {list:?}"
+    );
+    for task in list {
+        assert_eq!(task.get("needs_prompt").and_then(Value::as_bool), Some(false), "neither task takes a prompt: {task}");
+        assert_eq!(task.get("ready").and_then(Value::as_bool), Some(true), "the fake backend can run both: {task}");
+    }
     assert_eq!(list.first().and_then(|task| task.get("max_pixels")).and_then(Value::as_u64), Some(64_000_000));
+    assert_eq!(list.first().and_then(|task| task.get("output")).and_then(Value::as_str), Some("image"), "a fill answer is a picture");
+    assert_eq!(list.first().and_then(|task| task.get("model")).and_then(Value::as_str), Some("fake-fill"), "the model name is informational");
+    assert_eq!(list.get(1).and_then(|task| task.get("max_pixels")).and_then(Value::as_u64), Some(1_048_576), "Select Subject has its own, smaller cap");
+    assert_eq!(list.get(1).and_then(|task| task.get("output")).and_then(Value::as_str), Some("mask"), "a mask answer is a matte");
+    assert_eq!(list.get(1).and_then(|task| task.get("model")).and_then(Value::as_str), Some("fake-mask"), "the model name is informational");
 
     let image = sample_image();
     let id = server.submit_id(&fill_job(4, 2, 8, 3), &image, &sample_mask());
@@ -86,6 +97,17 @@ fn the_happy_path_fills_the_masked_area() {
     assert_eq!(provenance.get("provider").and_then(Value::as_str), Some("local"));
     assert_eq!(provenance.get("image_size"), Some(&json!([4, 2])));
     assert!(provenance.get("elapsed_ms").and_then(Value::as_u64).is_some(), "the elapsed time is reported");
+    // Amendment 18: the account of what ran. The five M1 keys above keep their names, so an
+    // M1-shaped peer reads the same answer it always did (B20).
+    assert_eq!(provenance.get("kind").and_then(Value::as_str), Some("image"), "a fill answer is a picture");
+    assert_eq!(provenance.get("device_requested").and_then(Value::as_str), Some("auto"), "the client asked for whatever is available");
+    assert_eq!(provenance.get("device_name").and_then(Value::as_str), Some("CPU"), "the hardware is named in plain words");
+    assert_eq!(provenance.get("fallback_reason"), Some(&Value::Null), "the requested backend ran, so nothing fell back");
+    assert_eq!(provenance.get("load_ms").and_then(Value::as_u64), Some(0), "the fake backend has no session to load");
+    assert!(provenance.get("run_ms").and_then(Value::as_u64).is_some(), "the run is timed on its own");
+    for key in ["model_version", "model_sha256", "diagnostics"] {
+        assert_eq!(provenance.get(key), None, "a fake run has nothing to say about {key}, so the key is left out");
+    }
 
     let png = server.get(&format!("/v1/jobs/{id}/result.png"));
     assert_eq!(png.status, 200);
@@ -322,18 +344,32 @@ fn a_broken_request_gets_a_400_and_the_server_keeps_serving() {
 fn without_the_fake_backend_there_is_nothing_to_run() {
     let server = support::TestServer::no_model("no-backend");
     let tasks = server.get("/v1/tasks").json();
-    assert_eq!(tasks.get("tasks"), Some(&json!([])), "no tasks, so PhotoCraft greys the menu out");
+    let list = tasks.get("tasks").and_then(Value::as_array).expect("a task list").clone();
+    assert_eq!(list.len(), 2, "amendment 18: both tasks stay listed, so PhotoCraft can grey them out");
+    assert!(list.iter().all(|task| task.get("ready").and_then(Value::as_bool) == Some(false)), "nothing is installed: {list:?}");
+    assert_eq!(
+        list.iter().map(|task| task.get("model").and_then(Value::as_str)).collect::<Vec<Option<&str>>>(),
+        vec![Some("lama"), Some("birefnet-lite")],
+        "the real model ids, not fake ones"
+    );
     let reply = server.submit(&fill_job(4, 2, 8, 3), &sample_image(), &sample_mask());
     assert_eq!(reply.status, 400, "a job has nowhere to go: {}", reply.text());
     assert_eq!(reply.sentence(), "No model is installed for fill_masked_area yet", "the sentence amendment 11 spells out");
+    let mask = server.submit(&mask_job(4, 2, 8, 3), &sample_image(), &full_mask(4, 2));
+    assert_eq!(mask.status, 400, "neither does a Select Subject job: {}", mask.text());
+    assert_eq!(mask.sentence(), "The Select Subject model isn't installed.", "amendment 18 gives the mask task its own sentence");
     assert_eq!(server.get("/v1/health").status, 200, "health does not need a model");
 }
 
-/// Put the LaMa entry of the real catalog into `root` with the size the catalog promises but
-/// none of the bytes: a sparse file is instant, and MG-02's "installed" check only looks at the
-/// size and the record, so this is enough to decide what the task list answers (MG-04 item 2).
-fn install_lama(root: &Path, acknowledge: bool) {
-    let model = catalog::load().expect("the catalog is part of the binary").into_iter().find(|model| model.id == "lama").expect("lama is in the catalog");
+/// Put one entry of the real catalog into `root` with the size the catalog promises but none of the
+/// bytes: a sparse file is instant, and MG-02's "installed" check only looks at the size and the
+/// record, so this is enough to decide what the task list answers (MG-04 item 2, MG-10).
+fn install(root: &Path, id: &str, acknowledge: bool) {
+    let model = catalog::load()
+        .expect("the catalog is part of the binary")
+        .into_iter()
+        .find(|model| model.id == id)
+        .unwrap_or_else(|| panic!("{id} is in the catalog"));
     std::fs::create_dir_all(store::model_folder(root, &model)).expect("the model folder");
     let file = std::fs::File::create(store::model_file(root, &model)).expect("the model file");
     file.set_len(model.size).expect("a file the size the catalog promises");
@@ -346,23 +382,127 @@ fn install_lama(root: &Path, acknowledge: bool) {
 #[test]
 fn a_model_that_is_installed_and_acknowledged_is_offered_without_loading_it() {
     let root: PathBuf = support::empty_store("lama-offered");
-    install_lama(&root, true);
+    install(&root, "lama", true);
     let server = support::TestServer::lama_store("lama-offered", &root);
     let tasks = server.get("/v1/tasks").json();
     assert_eq!(
         tasks.get("tasks"),
-        Some(&json!([{ "id": TASK, "needs_prompt": false, "max_pixels": protocol::MAX_PIXELS }])),
-        "LaMa is installed, so the task is on the menu"
+        Some(&json!([
+            { "id": TASK, "needs_prompt": false, "max_pixels": protocol::MAX_PIXELS, "output": "image", "ready": true, "model": "lama" },
+            { "id": MASK_TASK, "needs_prompt": false, "max_pixels": 1_048_576, "output": "mask", "ready": false, "model": "birefnet-lite" }
+        ])),
+        "LaMa is installed, so Fill is ready; Select Subject is listed but greyed out"
     );
     assert_eq!(server.get("/v1/health").status, 200, "the session is still lazy, so the start stayed fast");
 }
 
 #[test]
+fn the_mask_model_makes_only_the_mask_task_ready() {
+    let root: PathBuf = support::empty_store("birefnet-offered");
+    install(&root, "birefnet-lite", true);
+    let server = support::TestServer::lama_store("birefnet-offered", &root);
+    assert_eq!(
+        server.get("/v1/tasks").json().get("tasks"),
+        Some(&json!([
+            { "id": TASK, "needs_prompt": false, "max_pixels": protocol::MAX_PIXELS, "output": "image", "ready": false, "model": "lama" },
+            { "id": MASK_TASK, "needs_prompt": false, "max_pixels": 1_048_576, "output": "mask", "ready": true, "model": "birefnet-lite" }
+        ])),
+        "one model, one task: BiRefNet turns Select Subject on and nothing else"
+    );
+}
+
+#[test]
+fn a_task_that_is_not_ready_is_refused_with_its_own_sentence() {
+    let root: PathBuf = support::empty_store("mask-not-ready");
+    install(&root, "lama", true);
+    let server = support::TestServer::lama_store("mask-not-ready", &root);
+    let reply = server.submit(&mask_job(4, 2, 8, 3), &sample_image(), &full_mask(4, 2));
+    assert_eq!(reply.status, 400, "Select Subject has no model behind it: {}", reply.text());
+    assert_eq!(reply.sentence(), "The Select Subject model isn't installed.", "amendment 18 names the feature, never the model");
+    assert_eq!(server.get("/v1/health").status, 200, "the missing model does not take the server down");
+}
+
+#[test]
 fn a_model_that_is_installed_but_not_acknowledged_is_not_offered() {
     let root: PathBuf = support::empty_store("lama-unacked");
-    install_lama(&root, false);
+    install(&root, "lama", false);
     let server = support::TestServer::lama_store("lama-unacked", &root);
-    assert_eq!(server.get("/v1/tasks").json().get("tasks"), Some(&json!([])), "the override note has to be accepted first");
+    let list = server.get("/v1/tasks").json().get("tasks").and_then(Value::as_array).expect("a task list").clone();
+    assert!(list.iter().all(|task| task.get("ready").and_then(Value::as_bool) == Some(false)), "the override note has to be accepted first: {list:?}");
     let reply = server.submit(&fill_job(4, 2, 8, 3), &sample_image(), &sample_mask());
     assert_eq!(reply.status, 400, "and a job is still refused: {}", reply.text());
+    assert_eq!(reply.sentence(), "No model is installed for fill_masked_area yet", "the not-ready sentence, unchanged from MG-01");
+}
+
+#[test]
+fn the_fake_backend_finds_the_subject() {
+    let server = support::TestServer::fake("mask-happy");
+    // 8x8 rather than the 4x2 sample: the fake subject is an ellipse, and a 4x2 image is small
+    // enough that every pixel lands inside the solid part or outside the whole shape.
+    let samples: Vec<u16> = (0u16..192).map(|index| index % 256).collect();
+    let image = png_rgb(8, 8, 8, &samples);
+    let id = server.submit_id(&mask_job(8, 8, 8, 3), &image, &full_mask(8, 8));
+    let done = server.wait_for_state(&id, "done");
+    assert_eq!(done.get("progress").and_then(Value::as_f64), Some(1.0), "progress ends at one");
+    assert!(!done.get("message").and_then(Value::as_str).unwrap_or_default().is_empty(), "the poll says something");
+
+    let provenance = server.get(&format!("/v1/jobs/{id}/result")).json();
+    assert_eq!(provenance.get("model").and_then(Value::as_str), Some("fake-mask"), "a fake result says so");
+    assert_eq!(provenance.get("kind").and_then(Value::as_str), Some("mask"), "the answer is a matte, not a picture");
+    assert_eq!(provenance.get("device").and_then(Value::as_str), Some("cpu"), "the backend that ran");
+    assert_eq!(provenance.get("device_requested").and_then(Value::as_str), Some("auto"));
+    assert_eq!(provenance.get("fallback_reason"), Some(&Value::Null), "nothing fell back");
+    assert_eq!(provenance.get("image_size"), Some(&json!([8, 8])), "the matte is the size that was sent");
+
+    let png = server.get(&format!("/v1/jobs/{id}/result.png"));
+    assert_eq!(png.status, 200);
+    assert_eq!(png.header("content-type"), Some("image/png"));
+    let matte = decode_png(&png.body);
+    assert_eq!((matte.width, matte.height), (8, 8), "the matte is the size that was sent");
+    assert_eq!((matte.channels, matte.bit_depth), (1, 8), "8-bit grayscale, whatever went in");
+    // The fake subject is a centred soft ellipse: solid in the middle, nothing in the corners, and
+    // something in between along its edge, so PhotoCraft's tests can see a soft selection.
+    assert_eq!(matte.sample(27, 0), 255, "the middle of the image is the subject");
+    assert_eq!(matte.sample(0, 0), 0, "the corner is background");
+    let soft = (0..64).filter(|pixel| (1..255).contains(&matte.sample(*pixel, 0))).count();
+    assert!(soft > 0, "the edge is soft rather than a hard cut");
+
+    // Amendment 18: the shape of the answer does not depend on the shape that went in.
+    let deep: Vec<u16> = (0u16..192).map(|index| index.saturating_mul(257)).collect();
+    let second = server.submit_id(&mask_job(8, 8, 16, 3), &png_rgb(8, 8, 16, &deep), &full_mask(8, 8));
+    server.wait_for_state(&second, "done");
+    let deep_matte = decode_png(&server.get(&format!("/v1/jobs/{second}/result.png")).body);
+    assert_eq!(
+        (deep_matte.width, deep_matte.height, deep_matte.channels, deep_matte.bit_depth),
+        (8, 8, 1, 8),
+        "a 16-bit image still answers as an 8-bit matte"
+    );
+}
+
+#[test]
+fn the_fill_result_png_bytes_do_not_change() {
+    // B20: amendment 18 adds fields, it does not change a Fill answer. These are the bytes the M1
+    // code wrote for this job, hashed on commit e8a8cda (the merge of MG-08).
+    const M1_FILL_PNG_SHA256: &str = "d92ac809c11c2a5ac468a73fb2ad1b685f352ea73c948d1c59ff1657702c8de7";
+    let server = support::TestServer::fake("b20");
+    let id = server.submit_id(&fill_job(4, 2, 8, 3), &sample_image(), &sample_mask());
+    server.wait_for_state(&id, "done");
+    let png = server.get(&format!("/v1/jobs/{id}/result.png"));
+    assert_eq!(png.status, 200, "the result is there: {}", png.text());
+    assert_eq!(store::sha256_hex(&png.body), M1_FILL_PNG_SHA256, "the same PNG, byte for byte");
+
+    // And the M1 keys of the provenance JSON still answer exactly as they did. An M1-shaped peer
+    // ignores the rest, because every new field is optional.
+    let provenance = server.get(&format!("/v1/jobs/{id}/result")).json();
+    assert!(provenance.get("elapsed_ms").and_then(Value::as_u64).is_some(), "elapsed_ms is still a number of milliseconds");
+    assert_eq!(
+        json!({
+            "model": provenance.get("model").and_then(Value::as_str),
+            "device": provenance.get("device").and_then(Value::as_str),
+            "provider": provenance.get("provider").and_then(Value::as_str),
+            "image_size": provenance.get("image_size")
+        }),
+        json!({ "model": "fake-fill", "device": "cpu", "provider": "local", "image_size": [4, 2] }),
+        "the M1 keys, unchanged"
+    );
 }

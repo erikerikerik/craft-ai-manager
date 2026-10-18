@@ -19,6 +19,8 @@ pub const WAIT: Duration = Duration::from_secs(20);
 pub const BOUNDARY: &str = "caim-integration-boundary";
 /// The only task MG-01 knows.
 pub const TASK: &str = "fill_masked_area";
+/// The task MG-10 adds.
+pub const MASK_TASK: &str = "subject_mask";
 
 /// One reply, read to the end of the connection (the server always closes).
 pub struct Reply {
@@ -271,6 +273,12 @@ pub fn fill_job(width: u32, height: u32, bit_depth: u8, channels: u8) -> String 
     job_json(TASK, width, height, [0, 0, width as i32, height as i32], bit_depth, channels)
 }
 
+/// The job part a Select Subject submit would send: the whole image is the region again, because
+/// the question is about the image rather than about a place in it.
+pub fn mask_job(width: u32, height: u32, bit_depth: u8, channels: u8) -> String {
+    job_json(MASK_TASK, width, height, [0, 0, width as i32, height as i32], bit_depth, channels)
+}
+
 /// An RGB PNG, 8- or 16-bit, from interleaved samples.
 pub fn png_rgb(width: u32, height: u32, bit_depth: u8, samples: &[u16]) -> Vec<u8> {
     let raw: Vec<u8> = if bit_depth == 8 {
@@ -348,4 +356,10 @@ pub fn sample_image() -> Vec<u8> {
 /// A 4x2 mask that covers only the first pixel.
 pub fn sample_mask() -> Vec<u8> {
     png_gray(4, 2, &[255, 0, 0, 0, 0, 0, 0, 0])
+}
+
+/// A mask that is all 255. Amendment 18: a Select Subject job sends one, because the whole image is
+/// the question and the mask part still has to be there.
+pub fn full_mask(width: u32, height: u32) -> Vec<u8> {
+    png_gray(width, height, &vec![255u8; usize::try_from(width).expect("a test-sized width") * usize::try_from(height).expect("a test-sized height")])
 }

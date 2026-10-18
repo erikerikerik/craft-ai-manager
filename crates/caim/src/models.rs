@@ -20,20 +20,35 @@ pub fn models_root() -> Result<PathBuf> {
 
 /// The catalog entry for one model id. More than one version of the same id is an error rather than
 /// a silent choice; MG-02 has one entry per model.
+///
+/// A name that is not in the catalog is retried as a prefix, so `caim models install birefnet` finds
+/// `birefnet-lite`. A prefix that fits more than one entry is an error that names the candidates
+/// rather than guessing (MG-10).
 pub fn find(id: &str) -> Result<Model> {
     let models = catalog::load()?;
     let named: Vec<&Model> = models.iter().filter(|model| model.id == id).collect();
     match named.as_slice() {
-        [] => {
-            let catalog = models.iter().map(|model| model.id.clone()).collect::<Vec<String>>().join(", ");
-            Err(Fail::not_found(format!("Craft AI Manager has no model called {}. The catalog has: {catalog}.", quoted(id))))
-        }
         [one] => Ok((*one).clone()),
+        [] => find_by_prefix(&models, id),
         many => Err(Fail::internal(format!(
             "The catalog holds {} versions of {}. Craft AI Manager does not choose between them yet, so make the id unique.",
             many.len(),
             quoted(id)
         ))),
+    }
+}
+
+/// The same lookup, but the given name only has to be the start of exactly one catalog id.
+fn find_by_prefix(models: &[Model], id: &str) -> Result<Model> {
+    let catalog = models.iter().map(|model| model.id.clone()).collect::<Vec<String>>().join(", ");
+    let starts: Vec<&Model> = models.iter().filter(|model| model.id.starts_with(id)).collect();
+    match starts.as_slice() {
+        [one] => Ok((*one).clone()),
+        [] => Err(Fail::not_found(format!("Craft AI Manager has no model called {}. The catalog has: {catalog}.", quoted(id)))),
+        many => {
+            let candidates = many.iter().map(|model| model.id.clone()).collect::<Vec<String>>().join(", ");
+            Err(Fail::not_found(format!("Craft AI Manager has no model called {id}, and {} could mean {candidates}. Name one of them.", quoted(id))))
+        }
     }
 }
 
@@ -272,7 +287,7 @@ fn where_line(root: &Path, from_env: bool) -> String {
 mod tests {
     use crate::catalog::{Model, OverrideNote};
     use crate::error::Status;
-    use crate::models::{find, install_model, list_lines, live_server_port, remove_model, verify_model, where_line};
+    use crate::models::{find, find_by_prefix, install_model, list_lines, live_server_port, remove_model, verify_model, where_line};
     use crate::store::{acknowledged_file, folder_usage, is_acknowledged, is_installed, model_file, model_folder, verified_file};
     use crate::testkit::{FakeFetch, Scratch, test_model};
 
@@ -303,6 +318,22 @@ mod tests {
         let fail = find("sdxl").expect_err("that model is not in the catalog");
         assert_eq!(fail.status, Status::NotFound);
         assert!(fail.sentence.contains("lama"), "the sentence names what is available: {fail}");
+    }
+
+    #[test]
+    fn a_short_name_finds_the_one_model_it_is_the_start_of() {
+        let birefnet = find("birefnet").expect("birefnet-lite is the only catalog id that starts with birefnet");
+        assert_eq!(birefnet.id, "birefnet-lite");
+        assert_eq!(birefnet.task, "subject_mask");
+    }
+
+    #[test]
+    fn an_ambiguous_short_name_names_the_candidates_instead_of_guessing() {
+        let models = vec![test_model(FIXTURE, None), Model { id: "lama-xl".to_string(), ..test_model(FIXTURE, None) }];
+        let fail = find_by_prefix(&models, "lama").expect_err("two catalog ids start with lama");
+        assert_eq!(fail.status, Status::NotFound);
+        assert!(fail.sentence.contains("lama-xl"), "the sentence names both candidates: {fail}");
+        assert!(fail.sentence.contains("lama,"), "the sentence names both candidates: {fail}");
     }
 
     #[test]
