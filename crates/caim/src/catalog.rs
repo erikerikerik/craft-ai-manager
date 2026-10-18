@@ -11,6 +11,7 @@
 //! anyone's machine.
 
 use serde::Deserialize;
+use std::collections::BTreeMap;
 
 use crate::error::{Fail, Result};
 
@@ -35,11 +36,37 @@ const DENYLIST_PHRASES: [&str; 3] = ["openrail", "non commercial", "noncommercia
 
 /// The fields every entry must fill in. The override is checked separately: it is what lets a
 /// denylisted licence through, and a half-written one does not count.
-const REQUIRED_FIELDS: [&str; 12] =
-    ["id", "version", "task", "file", "url", "revision", "sha256", "size", "licence_code", "licence_weights", "licence_training_data", "provenance"];
+const REQUIRED_FIELDS: [&str; 15] = [
+    "id",
+    "version",
+    "task",
+    "file",
+    "url",
+    "revision",
+    "sha256",
+    "size",
+    "max_pixels",
+    "memory_mib",
+    "backends",
+    "licence_code",
+    "licence_weights",
+    "licence_training_data",
+    "provenance",
+];
 
 /// The three licence fields amendment 13 asks for.
 const LICENCE_FIELDS: [&str; 3] = ["licence_code", "licence_weights", "licence_training_data"];
+
+/// The runtime backends amendment 18 knows about. `directml` is listed because a Windows laptop is
+/// the other machine PhotoCraft runs on, but MG-10 ships no DirectML runner: an entry may say it is
+/// untested, and the resolver refuses to pick anything that is not `supported`.
+const KNOWN_BACKENDS: [&str; 4] = ["cpu", "cuda", "coreml", "directml"];
+
+/// The four ways an entry may describe a backend. Only `supported` is ever chosen on its own.
+const BACKEND_STATES: [&str; 4] = ["supported", "experimental", "untested", "unsupported"];
+
+/// The backend Craft AI Manager always has, so every entry has to say something about it.
+const HOME_BACKEND: &str = "cpu";
 
 /// One `[[model]]` block exactly as written, with every field optional so the gate can tell
 /// "missing" from "empty" from "present".
@@ -53,6 +80,12 @@ pub struct RawEntry {
     pub revision: Option<String>,
     pub sha256: Option<String>,
     pub size: Option<u64>,
+    /// The pixel cap for the task this entry serves (amendment 18).
+    pub max_pixels: Option<u64>,
+    /// The working memory one job on this model needs, in MiB (amendment 18).
+    pub memory_mib: Option<u64>,
+    /// Which runtime backends this entry is known to run on (amendment 18).
+    pub backends: Option<BTreeMap<String, String>>,
     pub licence_code: Option<String>,
     pub licence_weights: Option<String>,
     pub licence_training_data: Option<String>,
@@ -101,6 +134,12 @@ pub struct Model {
     pub revision: String,
     pub sha256: String,
     pub size: u64,
+    /// The pixel cap for the task this entry serves (amendment 18).
+    pub max_pixels: u64,
+    /// The working memory one job on this model needs, in MiB (amendment 18).
+    pub memory_mib: u64,
+    /// Which runtime backends this entry is known to run on, as the manifest wrote them.
+    pub backends: BTreeMap<String, String>,
     pub licence_code: String,
     pub licence_weights: String,
     pub licence_training_data: String,
@@ -144,6 +183,9 @@ impl Model {
             revision: text(entry, "revision").unwrap_or_default(),
             sha256: text(entry, "sha256").unwrap_or_default(),
             size: entry.size.unwrap_or(0),
+            max_pixels: entry.max_pixels.unwrap_or(0),
+            memory_mib: entry.memory_mib.unwrap_or(0),
+            backends: entry.backends.clone().unwrap_or_default(),
             licence_code: text(entry, "licence_code").unwrap_or_default(),
             licence_weights: text(entry, "licence_weights").unwrap_or_default(),
             licence_training_data: text(entry, "licence_training_data").unwrap_or_default(),
@@ -248,6 +290,12 @@ fn text(entry: &RawEntry, field: &str) -> Option<String> {
         "licence_training_data" => entry.licence_training_data.clone(),
         "provenance" => entry.provenance.clone(),
         "size" => entry.size.map(|value| value.to_string()),
+        "max_pixels" => entry.max_pixels.map(|value| value.to_string()),
+        "memory_mib" => entry.memory_mib.map(|value| value.to_string()),
+        // One line for the whole table, so the same loop can call it missing, empty or UNCLEAR.
+        "backends" => {
+            entry.backends.as_ref().map(|backends| backends.iter().map(|(backend, state)| format!("{backend}={state}")).collect::<Vec<String>>().join(", "))
+        }
         _ => None,
     }
 }
@@ -287,6 +335,38 @@ fn field_problems(entry: &RawEntry, label: &str) -> Vec<String> {
             && !is_name(&value)
         {
             problems.push(format!("{label} has a \"{field}\" that cannot be used as a folder or file name: \"{value}\"."));
+        }
+    }
+    problems.extend(manifest_problems(entry, label));
+    problems
+}
+
+/// The amendment 18 fields that are not about licences: a pixel cap and a memory budget that mean
+/// something, and a `backends` table that names the CPU and spells every backend it mentions one of
+/// the four ways the resolver reads.
+fn manifest_problems(entry: &RawEntry, label: &str) -> Vec<String> {
+    let mut problems = Vec::new();
+    if entry.max_pixels == Some(0) {
+        problems.push(format!("{label} has a \"max_pixels\" of 0, which would leave it no image to work with."));
+    }
+    if entry.memory_mib == Some(0) {
+        problems.push(format!("{label} has a \"memory_mib\" of 0, which would leave a job nowhere to run."));
+    }
+    let Some(backends) = entry.backends.as_ref() else {
+        return problems;
+    };
+    for (backend, state) in backends {
+        if !KNOWN_BACKENDS.contains(&backend.as_str()) {
+            problems.push(format!("{label} lists the backend \"{backend}\". Craft AI Manager knows {}.", KNOWN_BACKENDS.join(", ")));
+        }
+        if !BACKEND_STATES.contains(&state.as_str()) {
+            problems.push(format!("{label} says \"{backend} = {state}\". A backend is supported, experimental, untested or unsupported."));
+        }
+    }
+    if !backends.contains_key(HOME_BACKEND) {
+        // An empty table is already reported as an empty field; saying it twice would be noise.
+        if !backends.is_empty() {
+            problems.push(format!("{label} says nothing about \"{HOME_BACKEND}\", which is the backend Craft AI Manager always has."));
         }
     }
     problems
@@ -377,14 +457,17 @@ url = 'https://example.invalid/lama_fp32.onnx'
 revision = 'a3ee2fca54baebec351b8fa7786154ffa7555aa6'
 sha256 = '1faef5301d78db7dda502fe59966957ec4b79dd64e16f03ed96913c7a4eb68d6'
 size = 208044816
+max_pixels = 64000000
+memory_mib = 1500
+backends = { cpu = 'supported' }
 licence_code = 'Apache-2.0'
 licence_weights = 'Apache-2.0'
 licence_training_data = 'Apache-2.0'
 provenance = 'Built by hand for a test.'
 "#;
 
-    /// The twelve lines every entry has to fill in, in the order the gate checks them.
-    const FIELD_LINES: [&str; 12] = [
+    /// The fifteen lines every entry has to fill in, in the order the gate checks them.
+    const FIELD_LINES: [&str; 15] = [
         "id = 'lama'",
         "version = '1'",
         "task = 'fill_masked_area'",
@@ -393,6 +476,9 @@ provenance = 'Built by hand for a test.'
         "revision = 'a3ee2fca54baebec351b8fa7786154ffa7555aa6'",
         "sha256 = '1faef5301d78db7dda502fe59966957ec4b79dd64e16f03ed96913c7a4eb68d6'",
         "size = 208044816",
+        "max_pixels = 64000000",
+        "memory_mib = 1500",
+        "backends = { cpu = 'supported' }",
         "licence_code = 'Apache-2.0'",
         "licence_weights = 'Apache-2.0'",
         "licence_training_data = 'Apache-2.0'",
@@ -401,6 +487,8 @@ provenance = 'Built by hand for a test.'
 
     const SHA_LINE: &str = "sha256 = '1faef5301d78db7dda502fe59966957ec4b79dd64e16f03ed96913c7a4eb68d6'";
     const TRAINING_LINE: &str = "licence_training_data = 'Apache-2.0'";
+    /// The amendment 18 table, as the fixture writes it.
+    const BACKENDS_LINE: &str = "backends = { cpu = 'supported' }";
 
     /// A complete override, which is what lets a denylisted licence through.
     const OVERRIDE: &str =
@@ -425,7 +513,7 @@ provenance = 'Built by hand for a test.'
     #[test]
     fn the_embedded_entry_is_the_lama_from_the_photo_craft_note() {
         let models = load().expect("the shipped catalog is usable");
-        assert_eq!(models.len(), 1, "MG-02 ships exactly one model");
+        assert_eq!(models.len(), 2, "MG-02 shipped one model; MG-10 adds the mask model");
         let lama = &models[0];
         assert_eq!(lama.id, "lama");
         assert_eq!(lama.version, "1");
@@ -439,6 +527,9 @@ provenance = 'Built by hand for a test.'
         );
         assert_eq!(lama.sha256, "1faef5301d78db7dda502fe59966957ec4b79dd64e16f03ed96913c7a4eb68d6");
         assert_eq!(lama.size, 208_044_816);
+        assert_eq!(lama.max_pixels, 64_000_000, "amendment 18: the entry carries its own pixel cap");
+        assert_eq!(lama.memory_mib, 1_500, "and a working-memory figure, stated rather than measured");
+        assert_eq!(lama.backends.get("cpu").map(String::as_str), Some("supported"), "the CPU is its home backend: {:?}", lama.backends);
         assert_eq!(lama.licence_code, "Apache-2.0");
         assert_eq!(lama.licence_weights, "Apache-2.0");
         assert_eq!(lama.licence_training_data, "research-only");
@@ -448,6 +539,38 @@ provenance = 'Built by hand for a test.'
         assert_eq!(note.date, "2026-10-13");
         assert!(note.reason.contains("D2"), "{note:?}");
         assert!(note.note.contains("Places365"), "the user-facing sentence names the training data: {note:?}");
+    }
+
+    #[test]
+    fn the_embedded_mask_entry_is_the_birefnet_from_the_rs_01_note() {
+        let models = load().expect("the shipped catalog is usable");
+        let mask = models.iter().find(|model| model.task == "subject_mask").expect("MG-10 adds a subject_mask entry");
+        assert_eq!(mask.id, "birefnet-lite");
+        assert_eq!(mask.version, "1");
+        assert_eq!(mask.file, "birefnet_lite.onnx");
+        assert_eq!(mask.sha256, "5600024376f572a557870a5eb0afb1e5961636bef4e1e22132025467d0f03333");
+        assert_eq!(mask.size, 224_005_088);
+        assert_eq!(mask.revision, "de15b22ba131738a16dff04aab8bdf8dc32e3ac1");
+        assert_ne!(mask.revision, "main", "D12: pinned to a commit of that repo, never to a moving branch");
+        assert!(
+            mask.url.starts_with("https://huggingface.co/onnx-community/BiRefNet_lite-ONNX/resolve/de15b22ba131738a16dff04aab8bdf8dc32e3ac1/"),
+            "pinned to a revision: {}",
+            mask.url
+        );
+        assert_eq!(mask.max_pixels, 1_048_576, "the mask task has its own, smaller cap");
+        assert_eq!(mask.memory_mib, 6_600, "RS-01 measured 6.40 GiB with the CPU memory arena off");
+        assert_eq!(mask.backends.get("cpu").map(String::as_str), Some("supported"), "{:?}", mask.backends);
+        assert_eq!(mask.backends.get("cuda").map(String::as_str), Some("untested"), "MG-11 measures the GPU later: {:?}", mask.backends);
+        assert_eq!(mask.licence_code, "MIT");
+        assert_eq!(mask.licence_weights, "MIT");
+        assert_eq!(mask.licence_training_data, "research-only");
+        assert!(!mask.provenance.is_empty(), "and it says where the model came from");
+        let note = mask.note.as_ref().expect("D11 leaves a complete override");
+        assert_eq!(note.by, "Erik");
+        assert_eq!(note.date, "2026-10-17");
+        assert!(note.reason.contains("D11/D12"), "{note:?}");
+        assert!(note.note.contains("Non-commercial"), "the sentence says what the user may not do: {note:?}");
+        assert!(note.note.contains("DIS5K"), "and it names the training data: {note:?}");
     }
 
     #[test]
@@ -471,6 +594,39 @@ provenance = 'Built by hand for a test.'
         assert_eq!(found.len(), 1, "{found:?}");
         assert!(found[0].contains("has an empty"), "{found:?}");
         assert!(found[0].contains("provenance"), "{found:?}");
+    }
+
+    #[test]
+    fn a_zero_pixel_cap_or_memory_budget_is_refused() {
+        // Amendment 18: both numbers drive a real decision, so a zero has to fail the gate rather
+        // than quietly let every image through or reserve nothing for the job.
+        let found = problems(&swap("max_pixels = 64000000", "max_pixels = 0"));
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].contains("max_pixels"), "{found:?}");
+        let found = problems(&swap("memory_mib = 1500", "memory_mib = 0"));
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].contains("memory_mib"), "{found:?}");
+    }
+
+    #[test]
+    fn the_backends_table_is_checked_key_by_key() {
+        // The resolver only ever picks a backend the entry names, so a table that forgets the CPU,
+        // invents a backend, or writes a state in prose would strand every job.
+        let found = problems(&swap(BACKENDS_LINE, "backends = { cuda = 'untested' }"));
+        assert_eq!(found.len(), 1, "the missing cpu is the only problem: {found:?}");
+        assert!(found[0].contains("cpu"), "{found:?}");
+
+        let found = problems(&swap(BACKENDS_LINE, "backends = { cpu = 'yes please' }"));
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].contains("supported, experimental, untested or unsupported"), "{found:?}");
+
+        let found = problems(&swap(BACKENDS_LINE, "backends = { cpu = 'supported', vulkan = 'supported' }"));
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].contains("vulkan"), "{found:?}");
+
+        let found = problems(&swap(BACKENDS_LINE, "backends = {}"));
+        assert_eq!(found.len(), 1, "an empty table is one problem, not two: {found:?}");
+        assert!(found[0].contains("empty \"backends\""), "{found:?}");
     }
 
     #[test]

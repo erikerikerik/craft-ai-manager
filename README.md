@@ -15,18 +15,22 @@ patterns). The work list is that repo's `agents/TASKS.md`, the `MG-*` rows.
 commercial use needs a licence from Erik Kristianson. See `LICENSE.md`.
 
 
-**Status: pre-alpha, one real model.** MG-01 built the server: `caim serve` binds `127.0.0.1` on a free port,
+**Status: pre-alpha, two real models.** MG-01 built the server: `caim serve` binds `127.0.0.1` on a free port,
 publishes the endpoint file, and speaks the whole job protocol of SPEC amendment 11. MG-02 built the model store: a
 catalog compiled into the binary (`crates/caim/catalog/models.toml`), the licence gate that decides what CAIM may offer,
 SHA-256-checked downloads, and the `caim models ...` commands. MG-04 runs the first model for real: `fill_masked_area`
 puts `lama_fp32.onnx` through ONNX Runtime on the CPU (`crates/caim/src/lama.rs`). The built-in fake backend - a mean
 colour fill - is still there behind `--fake-backend`; since BF-01 it follows the same full-strength rule as LaMa (below).
+MG-10 added the second model and the second task: `subject_mask` puts `birefnet_lite.onnx` through the same runtime and
+answers with an 8-bit soft-edge matte (`crates/caim/src/birefnet.rs`), and `crates/caim/src/routing.rs` is now the one
+place that maps a task to the model that serves it. The fake backend gained a matching mask mode - a centred soft
+ellipse - so PhotoCraft's mask tests can run with no model installed.
 
 ## Running it
 
 ```text
 caim                        # the same as: caim serve
-caim serve --fake-backend   # jobs run on the built-in mean-colour fill
+caim serve --fake-backend   # jobs run on the built-in fill (fill) and ellipse (mask)
 caim models list            # what the catalog offers, what is installed, and what it costs on disk
 caim models install <id>    # download one model, hashing it while it arrives
 caim models verify <id>     # re-hash an installed model against the catalog
@@ -76,8 +80,11 @@ and the fill **at full strength** wherever the mask is above 0, with alpha there
 coverage: PhotoCraft does, when it uses the mask's coverage as the alpha of the "Generative Fill" layer. If both sides
 blended, a 50% feathered pixel would get 25% of the fill. The fake backend follows the same rule.
 
-With no backend at all - no `--fake-backend`, and no installed and acknowledged LaMa - the manager lists no tasks and
-answers a job with "No model is installed for fill_masked_area yet", which is how PhotoCraft knows to grey the menu out.
+With no backend at all - no `--fake-backend`, and no installed and acknowledged model - the manager still lists both
+tasks in `/v1/tasks`, each with `"ready": false`, so PhotoCraft can grey the menu out and name the feature rather than
+hide it. A job for a task that is not ready is refused with one plain sentence for that feature: "No model is installed
+for fill_masked_area yet" for Fill (unchanged since MG-01), and "The Select Subject model isn't installed." for Select
+Subject.
 
 
 ### Running it with a real model
@@ -104,13 +111,19 @@ resizing RGB data and pooling masks.
 
 ```text
 caim models install lama --accept-note   # once: 200 MB, hashed while it arrives
+caim models install birefnet --accept-note   # once: 224 MB, the Select Subject model
 caim serve                               # jobs now run on LaMa, on the CPU
 ```
 
-`caim serve` without `--fake-backend` offers `fill_masked_area` in `/v1/tasks` only when LaMa is **installed** - the
-file is there, its size is what the catalog says, and a `verified.json` names the catalog's SHA-256 - **and**
-acknowledged, because LaMa carries the Places365 note. Starting the server never re-hashes the 200 MB file; it reads
-the record. Anything else keeps the no-backend answer above.
+`caim serve` without `--fake-backend` marks a task `ready` in `/v1/tasks` only when the model behind it is **installed**
+- the file is there, its size is what the catalog says, and a `verified.json` names the catalog's SHA-256 - **and**
+acknowledged, because both models carry a training-data note. Starting the server never re-hashes a 200 MB file; it
+reads the record. A task whose model is missing stays listed with `"ready": false`. `caim models install birefnet`
+resolves the short name: it is the only start of a catalog id, so it means `birefnet-lite`.
+
+Which model serves which task is decided in one place, `crates/caim/src/routing.rs`, from the catalog alone. PhotoCraft
+asks for a task and never names a model, so a future swap - a general BiRefNet, a CUDA session - changes nothing on the
+client side.
 
 The ONNX session is loaded lazily, on the first job that needs one, and kept for every job after it. The first job pays the
 model load - 7.5 s of a 9.0 s debug-build job, against 1.2 s for the next one - so only the first job is slow.
@@ -134,8 +147,44 @@ so. A queued job's image and mask are freed the moment it is cancelled.
 resizes that to 512x512, runs, and resizes the answer back. A hole much wider than 512 px is downscaled to fit and
 comes back softer than the rest of the image. That is accepted for M1; tiling windows across a large hole is CAIM-13.
 
-The result of a job reports the real provenance: `model` `lama`, `device` `cpu`, `provider` `local`, and the
-milliseconds the run took.
+### Select Subject (`subject_mask`)
+
+The second task, added by MG-10: find the main subject of the whole image and answer with a matte. The job is the same
+three parts in the same order as a Fill job, except that `mask` is all 255 - "look everywhere" - and `image` is the whole
+picture, which PhotoCraft has already downscaled to the task's `max_pixels` (1,048,576, a megapixel). A mask task is
+never refused because of the size of the *document*, because that downscaling is PhotoCraft's job; the size actually
+sent is still capped, so a big image cannot walk in through the mask path and outrun the memory budget.
+
+`result.png` for a mask task is **8-bit grayscale at `image_size`**: 255 is the subject, 0 is the background, and the
+values in between are the soft edge - the hair and the anti-aliased boundary. Nothing is thresholded on the way out;
+PhotoCraft scales the matte up (bilinear) to the region it asked about and uses it as selection coverage or as a layer
+mask. A threshold is used only inside the tests, to score the answer.
+
+BiRefNet takes one fixed 1024x1024 window: the whole image is stretched to it (the aspect ratio is not kept), the graph
+answers 1024x1024 logits, `sigmoid * 255` turns them into a matte, and that is resized back to the size the job sent.
+The stages are the same as LaMa's, with their own `message`:
+
+| stage | `progress` | what is happening |
+|---|---|---|
+| prepare | 0 to 0.2 | stretch to 1024x1024 and normalise |
+| load model | 0.25 | the first job only |
+| run | 0.3 to 0.9 | the graph: about 8.5 s of a debug-build job on a desktop CPU |
+| finish | 0.9 to 1.0 | `sigmoid * 255` and resize back to `image_size` |
+
+The session is created with ONNX Runtime's CPU memory arena switched **off** (decision D12): RS-01 measured a 12.08 GiB
+peak with it on and 6.40 GiB with it off, for about 4% more run time. The catalog's `memory_mib = 6600` comes from that
+lower figure. Measured here, debug build, Ryzen 9 7950X: 3.7 s to load the session, 9.8 s for the first job, 8.5 s warm;
+a release build is roughly half that (RS-01: 3.6-3.8 s load, 4.06-4.29 s warm).
+
+### What a result says about itself
+
+The result of a job reports the real provenance. The five keys MG-01 shipped keep their names and their meaning -
+`model` (`lama`, `birefnet-lite`, `fake-fill` or `fake-mask`), `device` (the backend that ran, `cpu` today), `provider`
+`local`, `elapsed_ms` (the total) and `image_size` - so an old client reads exactly what it always did. Amendment 18
+adds the rest of the account: `kind` (`image` or `mask`), `model_version` and `model_sha256` (which catalog entry, which
+bytes), `device_requested` (`auto` until a device setting exists), `device_name` (`CPU`), `fallback_reason` (`null` when
+the requested backend ran), `load_ms` and `run_ms`. `diagnostics`, the runtime's own error text, is for the log only. A
+field with nothing to say is left out rather than sent empty, which is why a fake run has no `model_version`.
 
 ### Stopping it
 
@@ -153,8 +202,11 @@ CAIM owns the model files; PhotoCraft never holds a copy. What exists is a catal
 `crates/caim/catalog/models.toml`, one `[[model]]` block per model version with the SPEC amendment 14 manifest fields:
 `id`, `version`, `task`, `file`, `url` (HTTPS, pinned to a revision), `revision`, `sha256`, `size`, the three licences
 (`licence_code`, `licence_weights`, `licence_training_data` - amendment 13 counts the training data), `provenance`, and
-an optional `[model.override]` table (`by`, `date`, `reason`, `note`). The one entry today is LaMa; its facts and licence
-note are in `docs/models/lama.md`.
+an optional `[model.override]` table (`by`, `date`, `reason`, `note`). Amendment 18 adds three more: `max_pixels` (the
+cap for the task the entry serves), `memory_mib` (the working memory a job needs) and `backends` (which runtime backends
+it is known to run on: `supported`, `experimental`, `untested`, `unsupported` - Auto only ever picks a `supported` one).
+The two entries today are LaMa and BiRefNet-lite; LaMa's facts are in `docs/models/lama.md`, BiRefNet's licence reading
+and prior art are in `ATTRIBUTION.md`, and both carry an override because of their training data.
 
 ```text
 caim models list                        # task, size, licences, and whether it is installed
@@ -164,6 +216,9 @@ caim models verify lama                 # re-hash the file on disk (startup does
 caim models remove lama                 # delete lama's installed files (refused while a manager answers)
 caim models where                       # the models folder this run uses, and what named it
 ```
+
+An id may be shortened to any prefix that names exactly one model: `caim models install birefnet` means
+`birefnet-lite`. A prefix that could mean two models is refused with both names rather than guessed at.
 
 Models live in the same data directory as `endpoint.json`:
 
@@ -219,6 +274,8 @@ list: GPL, LGPL, AGPL, anything with `NC` as a licence token such as `CC-BY-NC-4
 `--accept-note` records `acknowledged.json` (id, version, the note's SHA-256, the time) next to the model and goes
 ahead. Change the note and it needs acknowledging again. LaMa is flagged for its Places365 training data, which is
 licensed for non-commercial research (decision D2 in the PhotoCraft task list).
+BiRefNet-lite is flagged the same way: its weights are MIT, but it was trained on DIS5K, which prohibits commercial use,
+and on four datasets with no published licence, so its override says "non-commercial use only" (decisions D11 and D12).
 
 ### Exit codes
 

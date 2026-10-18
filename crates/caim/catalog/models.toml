@@ -2,9 +2,14 @@
 # the binary with include_str!. Every field is required: the licence gate in src/catalog.rs fails the
 # tests when one is missing, empty, UNCLEAR, non-HTTPS, or denylisted without a complete override.
 # Amendment 13: the training data counts, not just the code and the weights.
+# Amendment 18: max_pixels is the cap for the task the entry serves, memory_mib is the working
+# memory a job needs, and backends says which runtime backends the entry is known to run on
+# (supported, experimental, untested, unsupported). Auto only ever picks a supported one.
 #
 # Licences here were read from agents/models/lama.md in the PhotoCraft fork (task MG-03), which is
-# copied into docs/models/lama.md in this repo.
+# copied into docs/models/lama.md in this repo. The BiRefNet licences and the training-data finding
+# were read from agents/models/birefnet.md in the same fork (task RS-01), and Erik's override is
+# decision D11/D12 (Oct 17, 2026).
 
 [[model]]
 id = "lama"
@@ -18,6 +23,12 @@ size = 208044816
 licence_code = "Apache-2.0"
 licence_weights = "Apache-2.0"
 licence_training_data = "research-only"
+max_pixels = 64000000
+# A stated figure, not a measurement: MG-04 timed LaMa but never sampled its memory. 208 MB of
+# weights plus the activations of one 512x512 crop, rounded up. MG-11 measures it on the 4090 and
+# on a laptop; nothing acts on this number until then except amendment 18's memory check.
+memory_mib = 1500
+backends = { cpu = "supported", cuda = "untested", coreml = "untested" }
 provenance = "An ONNX port (Hugging Face Carve/LaMa-ONNX) of advimman's big-lama, trained on Places365; downloaded and checked on the CraftML PC on Oct 13, 2026 (docs/models/lama.md)."
 
 # Erik's override (decision D2, Oct 13, 2026): the weights are Apache-2.0 but Places365 is licensed
@@ -28,3 +39,37 @@ by = "Erik"
 date = "2026-10-13"
 reason = "D2: M1 and personal use only; replace before any public release (D7)"
 note = "LaMa was trained on Places365, whose images are licensed for non-commercial research. Use it for personal work only."
+
+# MG-10, decision D12 (Erik, Oct 17, 2026): the lite checkpoint - BiRefNet_lite, the swin_v1_tiny
+# backbone of the general model - is the CPU default. These are the bytes of the GitHub release
+# asset BiRefNet-general-bb_swin_v1_tiny-epoch_232.onnx, re-hosted by onnx-community; the URL is
+# pinned to a commit of that repo, never to its main branch, and the hash is re-checked on download.
+# memory_mib is RS-01's measurement on this PC with ONNX Runtime's CPU memory arena switched off
+# (6.40 GiB peak); the runner creates the session with the arena off, which costs ~4% of the run
+# time and about half the peak. The general checkpoint (972,666,916 bytes) may be offered later with
+# CUDA in MG-11.
+[[model]]
+id = "birefnet-lite"
+version = "1"
+task = "subject_mask"
+file = "birefnet_lite.onnx"
+url = "https://huggingface.co/onnx-community/BiRefNet_lite-ONNX/resolve/de15b22ba131738a16dff04aab8bdf8dc32e3ac1/onnx/model.onnx"
+revision = "de15b22ba131738a16dff04aab8bdf8dc32e3ac1"
+sha256 = "5600024376f572a557870a5eb0afb1e5961636bef4e1e22132025467d0f03333"
+size = 224005088
+licence_code = "MIT"
+licence_weights = "MIT"
+licence_training_data = "research-only"
+max_pixels = 1048576
+memory_mib = 6600
+backends = { cpu = "supported", cuda = "untested", coreml = "untested" }
+provenance = "BiRefNet_lite (swin_v1_tiny backbone, epoch 232), the ONNX export published by onnx-community and byte for byte the ZhengPeng7/BiRefNet GitHub release asset BiRefNet-general-bb_swin_v1_tiny-epoch_232.onnx; pinned to Hugging Face revision de15b22ba131738a16dff04aab8bdf8dc32e3ac1 and hashed on the CraftML PC on Oct 17, 2026 (agents/models/birefnet.md and agents/receipts/RS-01.md in the PhotoCraft fork, decision D12). Input 1024x1024 fixed, output logits; sigmoid * 255 gives an 8-bit soft-edge mask where 255 is the subject."
+
+# Erik's override (decision D11, signed Oct 17, 2026 as D12 (a)): the weights are MIT, the training
+# sets are not. His wording is "non-commercial use only", not "personal use only", because the
+# datasets behind BiRefNet forbid commercial use rather than merely asking for a personal licence.
+[model.override]
+by = "Erik"
+date = "2026-10-17"
+reason = "D11/D12: non-commercial use only until the training data is replaced or licensed"
+note = "BiRefNet's weights are MIT, but it was trained on DIS5K (research-only, commercial use prohibited) and on DUTS, HRSOD, UHRSD and HRS10K, which have no published licence. Non-commercial use only: not for paid or client jobs."
