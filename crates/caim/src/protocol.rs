@@ -31,6 +31,17 @@ pub const DEVICE_AUTO: &str = "auto";
 /// The devices this manager can run on. MG-01 has one.
 pub const DEVICES: [&str; 1] = ["cpu"];
 
+/// The pixel cap in the words a person reads: megapixels at a megapixel or more, plain pixels below
+/// it. The number is rounded down to the nearest tenth so the sentence never claims more room than
+/// the task has, and one megapixel is singular because that is how it reads out loud.
+fn plain_pixels(pixels: u64) -> String {
+    if pixels < 1_000_000 {
+        return format!("{pixels} pixels");
+    }
+    let (whole, tenth) = (pixels / 1_000_000, pixels / 100_000 % 10);
+    if tenth == 0 { format!("{whole} {}", if whole == 1 { "megapixel" } else { "megapixels" }) } else { format!("{whole}.{tenth} megapixels") }
+}
+
 /// The `job` part of `POST /v1/jobs`.
 #[derive(Clone, Debug, Deserialize)]
 pub struct JobRequest {
@@ -81,9 +92,9 @@ impl JobRequest {
         // path and outrun the memory budget.
         if pixels > entry.max_pixels {
             return Err(Fail::too_large(format!(
-                "The image is {} pixels, over the {} megapixels Craft AI Manager accepts.",
+                "The image is {} pixels, which is larger than the {} Craft AI Manager accepts for this task.",
                 pixels,
-                entry.max_pixels / 1_000_000
+                plain_pixels(entry.max_pixels)
             )));
         }
         let [_, _, region_w, region_h] = self.region;
@@ -224,7 +235,9 @@ pub fn result_provenance(found: &job::Provenance) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DEVICE_AUTO, JobRequest, MAX_PIXELS, PROVIDER_AUTO, TASK_FILL, health, is_safe_id, job_state, json_body, result_provenance, tasks};
+    use super::{
+        DEVICE_AUTO, JobRequest, MAX_PIXELS, PROVIDER_AUTO, TASK_FILL, health, is_safe_id, job_state, json_body, plain_pixels, result_provenance, tasks,
+    };
     use crate::error::Status;
     use crate::job::Provenance;
     use crate::routing::{OUTPUT_IMAGE, OUTPUT_MASK, Offered, TASK_MASK};
@@ -364,12 +377,33 @@ mod tests {
         request.region = [0, 0, 1024, 1025];
         let fail = request.validate(&ready()).expect_err("one pixel over the mask cap");
         assert_eq!(fail.status, Status::TooLarge, "{fail}");
-        assert!(fail.sentence.contains("1 megapixels"), "the sentence names the task's cap, not Fill's: {fail}");
+        assert_eq!(
+            fail.sentence, "The image is 1049600 pixels, which is larger than the 1 megapixel Craft AI Manager accepts for this task.",
+            "the sentence names the task's own cap, in plain words, not Fill's"
+        );
         // The same size is fine for Fill, whose cap is 64 megapixels.
         let mut request = job();
         request.image_size = [1024, 1025];
         request.region = [0, 0, 1024, 1025];
         request.validate(&ready()).expect("well inside Fill's cap");
+    }
+
+    #[test]
+    fn the_pixel_cap_sentence_reads_in_plain_words() {
+        // "over the 1 megapixels" is not how anyone speaks: one megapixel is singular, a whole
+        // number of them is plural, a part of one keeps its tenth, and below a megapixel the
+        // sentence counts pixels.
+        assert_eq!(plain_pixels(1_048_576), "1 megapixel", "the mask task's cap");
+        assert_eq!(plain_pixels(64_000_000), "64 megapixels", "Fill's cap");
+        assert_eq!(plain_pixels(1_500_000), "1.5 megapixels", "a cap that is not a whole megapixel");
+        assert_eq!(plain_pixels(640_000), "640000 pixels", "under a megapixel, pixels");
+        // Fill's refusal reads the same way, in its plural form.
+        let mut request = job();
+        request.image_size = [MAX_PIXELS as u32 / 2, 4];
+        request.region = [0, 0, request.image_size[0] as i32, request.image_size[1] as i32];
+        let fail = request.validate(&ready()).expect_err("over Fill's cap");
+        assert_eq!(fail.status, Status::TooLarge, "{fail}");
+        assert!(fail.sentence.contains("larger than the 64 megapixels Craft AI Manager accepts"), "{fail}");
     }
 
     #[test]

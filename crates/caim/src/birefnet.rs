@@ -49,6 +49,21 @@ pub const MAX_PREPROCESS_SIDE: usize = 2048;
 /// `protocol::JobRequest::validate`) with a one-pixel other axis, and the model's own side is
 /// [MODEL_SIZE]. Raising it is a deliberate decision, not an accident of the caller's input.
 pub const MAX_RESAMPLE_AXIS: usize = 1_048_576;
+/// The largest area the preprocessor and the resamplers will take, in samples: `width * height`.
+/// [MAX_RESAMPLE_AXIS] bounds one axis, and two legal axes are not enough - a 1,048,576 x 1,048,576
+/// frame has both axes inside that cap and a 12 TiB source plane, which is an abort no caller can
+/// catch. Every real job is inside the area cap as well: the mask task's own `max_pixels` is exactly
+/// this number, and the model's own plane is [MODEL_SIZE] x [MODEL_SIZE], which is the same number
+/// again. Raising it is the same deliberate decision as raising the axis cap.
+pub const MAX_RESAMPLE_PIXELS: usize = MAX_RESAMPLE_AXIS;
+/// The largest row buffer the two-pass resize holds between its passes: `height` rows of
+/// `target_width` samples. Two planes that are each inside [MAX_RESAMPLE_PIXELS] can still ask for a
+/// huge one - a 1 x 1,048,576 plane grown to 1,048,576 x 1 has two legal areas and a 4 TiB buffer -
+/// so the working set is capped on its own. 16,777,216 f32 is 64 MiB. The model's own plane is 1024
+/// rows, so that admits a matte up to 16,384 samples wide and a model input from a source up to
+/// 16,384 rows tall - an aspect ratio of 256:1 at the mask task's cap - and answers empty for a more
+/// extreme sliver rather than aborting, which the runner says in its own sentence.
+pub const MAX_RESAMPLE_WORKING_SET: usize = 16 * MAX_RESAMPLE_PIXELS;
 /// The catalog id of the model this runner can run.
 pub const BIREFNET_ID: &str = "birefnet-lite";
 /// What `/result` reports when a job ran here.
@@ -81,6 +96,14 @@ const CANCELLED: &str = "Craft AI Manager stopped the job.";
 /// How often the watcher thread looks for a `DELETE` while a run is going on.
 const WATCH_POLL: Duration = Duration::from_millis(20);
 
+/// The sample count of a `width` x `height` plane, or `None` when that product wraps or is larger
+/// than [MAX_RESAMPLE_PIXELS]. Every public entry point that sizes an allocation from a caller's
+/// width and height goes through here, so the bound is the same one everywhere and it runs before
+/// anything is allocated.
+fn plane_pixels(width: usize, height: usize) -> Option<usize> {
+    width.checked_mul(height).filter(|samples| *samples <= MAX_RESAMPLE_PIXELS)
+}
+
 /// The image at model size: [preprocess] with the model's own side length.
 #[must_use]
 pub fn preprocess(image: &Frame) -> Vec<f32> {
@@ -91,20 +114,26 @@ pub fn preprocess(image: &Frame) -> Vec<f32> {
 /// ratio not kept, RGB, /255, ImageNet mean and std, NCHW planar. Alpha never reaches the model -
 /// BiRefNet takes three planes, and the matte it answers is about the subject, not the layer.
 ///
-/// A `size` outside `1..=MAX_PREPROCESS_SIDE` answers empty rather than allocating, because a public
-/// function must not let its caller choose the size of the allocation.
+/// A `size` outside `1..=MAX_PREPROCESS_SIDE`, or a frame whose area is outside
+/// `1..=MAX_RESAMPLE_PIXELS`, answers empty rather than allocating, because a public function must
+/// not let its caller choose the size of the allocation.
 #[must_use]
 pub fn preprocess_to(image: &Frame, size: usize) -> Vec<f32> {
     let (Ok(width), Ok(height)) = (usize::try_from(image.width), usize::try_from(image.height)) else {
         return Vec::new();
     };
     let max = f64::from(image.max_sample()).max(1.0);
-    if size == 0 || size > MAX_PREPROCESS_SIDE || width > MAX_RESAMPLE_AXIS || height > MAX_RESAMPLE_AXIS {
+    // The area, not only each axis: two axes inside [MAX_RESAMPLE_AXIS] can still describe a plane
+    // no machine can hold, and an allocation length that wraps or runs out is an abort.
+    let Some(source_len) = plane_pixels(width, height) else {
+        return Vec::new();
+    };
+    if size == 0 || size > MAX_PREPROCESS_SIDE {
         return Vec::new();
     }
     // Every length here is derived from what the caller sent, so every one is checked: a wrapped
     // allocation length is an abort in a release build, which no caller can catch.
-    let (Some(source_len), Some(plane_size)) = (width.checked_mul(height), size.checked_mul(size)) else {
+    let Some(plane_size) = size.checked_mul(size) else {
         return Vec::new();
     };
     let Some(out_len) = plane_size.checked_mul(MEAN.len()) else {
@@ -150,6 +179,8 @@ fn copy_plane(plane: &[f32], out: &mut [f32], start: usize) {
 ///
 /// An axis outside `1..=MAX_RESAMPLE_AXIS` answers empty rather than allocating: the widened tent
 /// holds one entry per covered source sample, so the axes are bounded before they decide a length.
+/// The two axes are not multiplied here because they never describe one plane: the taps total
+/// `O(source + target)`, so bounding each axis bounds what is collected.
 #[must_use]
 pub fn axis_weights(source: usize, target: usize) -> Vec<Vec<(usize, f64)>> {
     axis_taps(source, target, true)
@@ -203,8 +234,9 @@ fn axis_taps(source: usize, target: usize, widened: bool) -> Vec<Vec<(usize, f64
 /// Resize one channel plane, row-major, bilinearly on both axes, widening the filter on an axis that
 /// shrinks ([axis_weights]).
 ///
-/// A plane or a target with an axis outside `1..=MAX_RESAMPLE_AXIS` answers empty rather than
-/// allocating, for the same reason [axis_weights] bounds its axes.
+/// A plane or a target with an axis outside `1..=MAX_RESAMPLE_AXIS`, or an area outside
+/// `1..=MAX_RESAMPLE_PIXELS`, answers empty rather than allocating, for the same reason
+/// [axis_weights] bounds its axes.
 #[must_use]
 pub fn resize_bilinear(plane: &[f32], width: usize, height: usize, target_width: usize, target_height: usize) -> Vec<f32> {
     resize_plane(plane, width, height, target_width, target_height, true)
@@ -224,6 +256,19 @@ fn resize_plane(plane: &[f32], width: usize, height: usize, target_width: usize,
         || target_width > MAX_RESAMPLE_AXIS
         || target_height > MAX_RESAMPLE_AXIS
     {
+        return Vec::new();
+    }
+    // The axes are bounded above; the areas are bounded here, because the allocation follows the
+    // area and not the axes: two legal axes can still describe a plane no machine can hold.
+    if plane_pixels(width, height).is_none() || plane_pixels(target_width, target_height).is_none() {
+        return Vec::new();
+    }
+    // The buffer between the two passes is `height` rows of `target_width` samples, which two legal
+    // areas can still make enormous, so it is capped on its own before anything is allocated.
+    let Some(working_set) = height.checked_mul(target_width) else {
+        return Vec::new();
+    };
+    if working_set > MAX_RESAMPLE_WORKING_SET {
         return Vec::new();
     }
     let across = resample_across(plane, height, width, target_width, widened);
@@ -287,8 +332,14 @@ pub fn sigmoid(logit: f32) -> f32 {
 /// The resize back is the two-tap one, not the antialiased one the model input gets: the committed
 /// fixtures were made by a Python run that used two taps here (`tests/fixtures/SOURCE.md`), and the
 /// golden test is the check against that run.
+///
+/// A `width` x `height` outside `1..=MAX_RESAMPLE_PIXELS` answers empty rather than allocating, like
+/// every other public entry point here.
 #[must_use]
 pub fn matte(output: &[f32], width: usize, height: usize) -> Vec<u16> {
+    if plane_pixels(width, height).is_none() {
+        return Vec::new();
+    }
     let quantised: Vec<f32> = output.iter().map(|logit| (sigmoid(*logit) * 255.0).clamp(0.0, 255.0).round()).collect();
     let resized = resize_two_tap(&quantised, MODEL_SIZE, MODEL_SIZE, width, height);
     resized.iter().map(|sample| u16::try_from(sample.round().clamp(0.0, 255.0) as i64).unwrap_or(0)).collect()
@@ -385,6 +436,11 @@ impl Pipeline {
         }
         progress(0.0, MSG_PREPARE);
         let model_image = preprocess(image);
+        // The queue caps the job's pixels, so an empty plane here means a caller came at the runner
+        // from outside the protocol; say so rather than handing an empty input to the model.
+        if model_image.is_empty() {
+            return Err(Fail::too_large("The image is larger than Craft AI Manager can hold for one Select Subject job."));
+        }
         progress(PREPARE_PROGRESS, MSG_PREPARE);
         if stopped(cancel) {
             return Err(Fail::internal(CANCELLED));
@@ -434,7 +490,11 @@ impl Pipeline {
             )));
         }
         progress(RUN_END, MSG_FINISH);
-        let frame = Frame { width: image.width, height: image.height, channels: 1, bit_depth: 8, samples: matte(&output, width, height) };
+        let matte_samples = matte(&output, width, height);
+        if matte_samples.is_empty() {
+            return Err(Fail::too_large("The image is larger than Craft AI Manager can write a Select Subject mask for."));
+        }
+        let frame = Frame { width: image.width, height: image.height, channels: 1, bit_depth: 8, samples: matte_samples };
         progress(1.0, MSG_FINISH);
         Ok(self.filled(frame, elapsed_ms(&started), load_ms, run_ms))
     }
@@ -585,9 +645,9 @@ pub(crate) fn stand_in_pipeline(
 #[cfg(test)]
 mod tests {
     use super::{
-        BIREFNET_DEVICE, BIREFNET_ID, BIREFNET_MODEL, BIREFNET_PROVIDER, Identity, LOAD_PROGRESS, Loader, MAX_PREPROCESS_SIDE, MAX_RESAMPLE_AXIS, MODEL_SIZE,
-        MSG_FINISH, MSG_LOAD, MSG_PREPARE, MSG_RUN, PREPARE_PROGRESS, Pipeline, RUN_END, RUN_PROGRESS, StandIn, axis_weights, axis_weights_two_tap,
-        installed_pipeline, matte, preprocess_to, resize_bilinear, resize_two_tap, sigmoid, stand_in_pipeline,
+        BIREFNET_DEVICE, BIREFNET_ID, BIREFNET_MODEL, BIREFNET_PROVIDER, Identity, LOAD_PROGRESS, Loader, MAX_PREPROCESS_SIDE, MAX_RESAMPLE_AXIS,
+        MAX_RESAMPLE_PIXELS, MODEL_SIZE, MSG_FINISH, MSG_LOAD, MSG_PREPARE, MSG_RUN, PREPARE_PROGRESS, Pipeline, RUN_END, RUN_PROGRESS, StandIn, axis_weights,
+        axis_weights_two_tap, installed_pipeline, matte, preprocess, preprocess_to, resize_bilinear, resize_two_tap, sigmoid, stand_in_pipeline,
     };
     use crate::catalog::Model;
     use crate::error::Status;
@@ -714,6 +774,55 @@ mod tests {
         // exactly MAX_RESAMPLE_AXIS, and the model's own side is far inside it.
         assert_eq!(axis_weights(MAX_RESAMPLE_AXIS, 1).len(), 1, "the cap itself is inside the cap");
         assert_eq!(resize_bilinear(&[0.5f32; 4], 2, 2, MAX_RESAMPLE_AXIS, 1).len(), MAX_RESAMPLE_AXIS);
+    }
+
+    #[test]
+    fn every_public_entry_point_refuses_an_area_over_the_cap() {
+        // Bounding each axis is not enough: two legal axes can describe a plane no machine can hold,
+        // and an allocation that runs out or wraps is an abort no caller can catch. 2049 x 512 is the
+        // smallest case that separates the two rules - both axes are inside [MAX_RESAMPLE_AXIS] and
+        // the area is one sample over [MAX_RESAMPLE_PIXELS].
+        let (wide, tall) = (2049usize, 512usize);
+        assert!(wide <= MAX_RESAMPLE_AXIS && tall <= MAX_RESAMPLE_AXIS, "both axes are legal");
+        assert!(wide.checked_mul(tall).expect("the product fits") > MAX_RESAMPLE_PIXELS, "the area is not");
+        // Every entry point below answers empty before reading the plane or allocating from it, so an
+        // empty sample list is enough to prove the bound runs first.
+        let frame = Frame {
+            width: u32::try_from(wide).expect("inside u32"),
+            height: u32::try_from(tall).expect("inside u32"),
+            channels: 3,
+            bit_depth: 8,
+            samples: Vec::new(),
+        };
+        assert!(preprocess(&frame).is_empty(), "the model-size entry point");
+        assert!(preprocess_to(&frame, MODEL_SIZE).is_empty(), "the sized entry point");
+        assert!(resize_bilinear(&[0.5f32; 4], wide, tall, 2, 2).is_empty(), "a source plane over the area cap");
+        assert!(resize_bilinear(&[0.5f32; 4], 2, 2, wide, tall).is_empty(), "a target plane over the area cap");
+        assert!(resize_two_tap(&[0.5f32; 4], wide, tall, 2, 2).is_empty(), "the narrow rule is bounded too");
+        assert!(resize_two_tap(&[0.5f32; 4], 2, 2, wide, tall).is_empty(), "in both directions");
+        assert!(matte(&[], wide, tall).is_empty(), "the matte writer");
+        // Nothing real is refused: the model's own plane is exactly the area cap, and a resize to the
+        // widest axis any real job can name is still allowed.
+        assert_eq!(MODEL_SIZE * MODEL_SIZE, MAX_RESAMPLE_PIXELS, "the model's own plane is the cap");
+        assert_eq!(resize_bilinear(&[0.5f32; 4], 2, 2, MAX_RESAMPLE_PIXELS, 1).len(), MAX_RESAMPLE_PIXELS);
+    }
+
+    #[test]
+    fn the_resize_bounds_the_buffer_between_its_two_passes() {
+        // Two planes that are each inside the area cap can still ask for an enormous row buffer
+        // between the passes: 1 x 1,048,576 grown to 1,048,576 x 1 has two legal areas and a 4 TiB
+        // buffer, so the working set is capped on its own.
+        let side = MAX_RESAMPLE_PIXELS;
+        assert!(resize_bilinear(&[0.5f32; 1], 1, side, side, 1).is_empty(), "the antialiased rule");
+        assert!(resize_two_tap(&[0.5f32; 1], 1, side, side, 1).is_empty(), "the narrow rule too");
+        // The cap is exact: 16,384 rows of 1,024 samples is the buffer, and one row more is not.
+        assert_eq!(resize_bilinear(&vec![0.5f32; 16_384], 1, 16_384, 1_024, 1).len(), 1_024, "the buffer exactly at the cap");
+        assert!(resize_bilinear(&vec![0.5f32; 16_385], 1, 16_385, 1_024, 1).is_empty(), "one row over the cap");
+        // Nothing real is refused: a 16:1 mask job resizes both ways, and its buffer is a quarter of
+        // [MAX_RESAMPLE_WORKING_SET]. A sliver no camera makes is refused rather than allocated.
+        assert_eq!(resize_bilinear(&vec![0.5f32; 4096 * 256], 4096, 256, 256, 4096).len(), 4096 * 256, "a 16:1 job both ways");
+        assert_eq!(matte(&vec![0.0f32; MODEL_SIZE * MODEL_SIZE], 4096, 256).len(), 4096 * 256, "the matte for that job");
+        assert!(matte(&vec![0.0f32; MODEL_SIZE * MODEL_SIZE], MAX_RESAMPLE_PIXELS, 1).is_empty(), "a 1,048,576 x 1 sliver is refused, not aborted");
     }
 
     #[test]
