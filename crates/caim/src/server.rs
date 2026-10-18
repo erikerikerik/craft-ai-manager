@@ -14,13 +14,14 @@
 
 use std::io::{ErrorKind, Read};
 use std::net::{Ipv4Addr, Shutdown, TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::VERSION;
+use crate::birefnet;
 use crate::endpoint::{self, ENDPOINT_ENV};
 use crate::error::{Fail, Result, Status, quoted};
 use crate::http::{self, Clock, Head, Response, read_head, write_error};
@@ -29,6 +30,8 @@ use crate::job::{self, Backend, Runner, State};
 use crate::lama;
 use crate::multipart;
 use crate::protocol::{self, JobRequest};
+use crate::routing;
+use crate::store;
 use crate::token::{self, bearer_matches};
 
 /// Amendment 11: loopback only, and a port the operating system picks.
@@ -111,8 +114,9 @@ impl Default for ServeOptions {
 struct Context {
     port: u16,
     token: String,
-    /// Whether a backend is running, which is what `/v1/tasks` and `POST /v1/jobs` answer with.
-    fill_offered: bool,
+    /// What this start can run: every task the catalog knows, each marked ready or not. Amendment
+    /// 18 lists the tasks even when nothing is installed, so this is a table rather than a flag.
+    offered: routing::Offered,
     read_timeout: Duration,
     head_timeout: Duration,
     body_timeout: Duration,
@@ -153,14 +157,12 @@ impl Server {
             TcpListener::bind((LOCAL_HOST, 0)).map_err(|error| Fail::internal(format!("Craft AI Manager could not listen on 127.0.0.1: {error}")))?;
         let port = listener.local_addr().map_err(|error| Fail::internal(format!("Craft AI Manager could not find its own port: {error}")))?.port();
         listener.set_nonblocking(true).map_err(|error| Fail::internal(format!("Craft AI Manager could not set up its listener: {error}")))?;
-        // MG-04 item 2: without `--fake-backend`, LaMa is offered only when MG-02 says it is
-        // installed and acknowledged. Nothing is re-hashed at start; `verified.json` is the proof.
-        let backend = if options.fake_backend {
-            Backend::Fake { step_delay: options.step_delay }
-        } else {
-            lama::ready_pipeline_in(options.models_root.as_deref()).map_or(Backend::NoModel, Backend::Lama)
-        };
-        let fill_offered = !matches!(backend, Backend::NoModel);
+        // MG-04 item 2 and MG-10: without `--fake-backend`, a task is offered only when MG-02 says
+        // the model behind it is installed and acknowledged. Nothing is re-hashed at start;
+        // `verified.json` is the proof.
+        let offered = if options.fake_backend { routing::Offered::fake() } else { routing::Offered::from_store(options.models_root.as_deref()) };
+        let backend =
+            if options.fake_backend { Backend::Fake { step_delay: options.step_delay } } else { real_backend(&offered, options.models_root.as_deref()) };
         let backend_note = backend.note();
         let runner = Arc::new(Runner::with_memory_limit(backend, options.max_queue, options.memory_limit)?);
         // MG-08 review round 2: the handle gets the runner before the endpoint file exists, so a
@@ -177,7 +179,7 @@ impl Server {
         let context = Arc::new(Context {
             port,
             token: token.clone(),
-            fill_offered,
+            offered,
             read_timeout: options.read_timeout,
             head_timeout: options.head_timeout,
             body_timeout: options.body_timeout,
@@ -256,6 +258,24 @@ impl Server {
         }
         Ok(())
     }
+}
+
+/// The models this start can actually run, one slot per task.
+///
+/// A store that holds only one of the two models still serves the task it holds; the other task is
+/// listed with `ready: false` rather than hidden (amendment 18). `NoModel` only when neither is
+/// installed and acknowledged, which keeps MG-01's answer for a machine with no models at all.
+#[must_use]
+fn real_backend(offered: &routing::Offered, root: Option<&Path>) -> Backend {
+    let Some(root) = root.map(PathBuf::from).or_else(store::models_dir) else {
+        return Backend::NoModel;
+    };
+    let lama = offered.model_for(protocol::TASK_FILL).and_then(|model| lama::installed_pipeline(&root, model));
+    let birefnet = offered.model_for(routing::TASK_MASK).and_then(|model| birefnet::installed_pipeline(&root, model));
+    if lama.is_none() && birefnet.is_none() {
+        return Backend::NoModel;
+    }
+    Backend::Real { lama, birefnet }
 }
 
 /// What one start owns for stopping: the flag the accept loop watches, the runner whose jobs get
@@ -592,7 +612,7 @@ fn route(stream: &mut Connection, context: &Context, head: &Head, unread: &mut U
     }
     if path == PATH_TASKS {
         return if method == "GET" {
-            send(stream, context, Status::Ok, Some(JSON), &protocol::tasks(context.fill_offered))
+            send(stream, context, Status::Ok, Some(JSON), &protocol::tasks(&context.offered))
         } else {
             unknown_path(stream, context, path)
         };
@@ -621,13 +641,7 @@ fn route(stream: &mut Connection, context: &Context, head: &Head, unread: &mut U
         }
         ("GET", "result") => {
             let found = context.runner.provenance(id)?;
-            send(
-                stream,
-                context,
-                Status::Ok,
-                Some(JSON),
-                &protocol::result_provenance(&found.model, &found.device, &found.provider, found.elapsed_ms, found.image_size),
-            )
+            send(stream, context, Status::Ok, Some(JSON), &protocol::result_provenance(&found))
         }
         ("GET", "result.png") => context.runner.deliver_png(id, |png| send(stream, context, Status::Ok, Some(PNG), png)),
         _ => unknown_path(stream, context, path),
@@ -658,13 +672,13 @@ fn submit(stream: &mut Connection, context: &Context, head: &Head, unread: &mut 
     *unread = Unread::Nothing;
     let parts = multipart::parse(head.header("content-type"), &body)?;
     let request = JobRequest::parse(parts.job)?;
-    request.validate(context.fill_offered)?;
+    request.validate(&context.offered)?;
     let [width, height] = request.image_size;
     admission.reserve_work(width, height)?;
     let frame = image::decode_image(parts.image, width, height, usize::from(request.channels), request.bit_depth)?;
     let mask = image::decode_mask(parts.mask, width, height)?;
     drop(body);
-    let id = context.runner.submit_admitted(frame, mask, admission)?;
+    let id = context.runner.submit_admitted(&request.task, frame, mask, admission)?;
     send(stream, context, Status::Accepted, Some(JSON), &protocol::job_id(&id))
 }
 
@@ -681,6 +695,8 @@ pub const ENDPOINT_VARIABLE: &str = ENDPOINT_ENV;
 mod tests {
     use super::{Accept, Context, MAX_CONNECTIONS, READ_TIMEOUT, ServeOptions, Server, StopHandle, accept_loop, state_name};
     use crate::job::{Backend, MAX_QUEUE, Runner, State};
+    use crate::protocol::TASK_FILL;
+    use crate::routing;
     use std::io::{ErrorKind, Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::path::PathBuf;
@@ -721,7 +737,7 @@ mod tests {
         let context = Arc::new(Context {
             port,
             token: "t".repeat(64),
-            fill_offered: true,
+            offered: routing::Offered::fake(),
             read_timeout: options.read_timeout,
             head_timeout: options.head_timeout,
             body_timeout: options.body_timeout,
@@ -779,9 +795,9 @@ mod tests {
     #[test]
     fn one_press_cancels_the_running_and_queued_jobs_and_a_second_press_says_leave_now() {
         let runner = Arc::new(Runner::new(Backend::Fake { step_delay: Duration::from_millis(40) }, MAX_QUEUE).expect("the worker starts"));
-        let running = runner.submit(tiny_frame(), tiny_mask()).expect("the first job is queued");
+        let running = runner.submit(TASK_FILL, tiny_frame(), tiny_mask()).expect("the first job is queued");
         assert_eq!(settled(&runner, &running), State::Running, "the first job is inside the backend");
-        let queued = runner.submit(tiny_frame(), tiny_mask()).expect("the second job is queued");
+        let queued = runner.submit(TASK_FILL, tiny_frame(), tiny_mask()).expect("the second job is queued");
         let handle = StopHandle::new();
         handle.attach(&runner);
         assert!(!handle.press(), "the first press asks the server to stop");

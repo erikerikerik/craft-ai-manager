@@ -13,6 +13,8 @@
 
 /// The built-in fake backend: a mean-colour fill, so MG-01 can answer jobs with no model installed.
 pub mod backend;
+/// The Select Subject runner (MG-10): the BiRefNet maths, and its ONNX Runtime session.
+pub mod birefnet;
 /// The model catalog: what exists, its licences, and the gate that decides whether CAIM may offer it.
 pub mod catalog;
 /// The command line.
@@ -38,6 +40,8 @@ pub mod models;
 pub mod multipart;
 /// The JSON of the protocol: what a job asks for and what each endpoint answers.
 pub mod protocol;
+/// Which model serves which task, and whether it is ready (amendment 18).
+pub mod routing;
 /// The loopback server itself.
 pub mod server;
 /// Where models live on disk, and what "installed" means.
