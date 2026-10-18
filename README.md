@@ -31,6 +31,7 @@ ellipse - so PhotoCraft's mask tests can run with no model installed.
 ```text
 caim                        # the same as: caim serve
 caim serve --fake-backend   # jobs run on the built-in fill (fill) and ellipse (mask)
+caim open                     # start the manager, or say that one is already running
 caim models list            # what the catalog offers, what is installed, and what it costs on disk
 caim models install <id>    # download one model, hashing it while it arrives
 caim models verify <id>     # re-hash an installed model against the catalog
@@ -59,6 +60,39 @@ file inherits the per-user permissions `%LOCALAPPDATA%` already carries, so the 
 your own account; on Linux and macOS the file is created with mode `0600`, so it is readable only by your own account
 there too, even in the moment between the temp file and the rename. If `CRAFT_AI_ENDPOINT` points somewhere else, the file
 inherits that folder's permissions instead, so point it at a folder only you can read.
+
+`caim open` is the start-on-demand entry point (amendment 18, decision D5). It reads `endpoint.json` first: when a
+manager is answering `GET /v1/health` on the port that file names, it prints
+`Craft AI Manager is already running on 127.0.0.1:<port>. Nothing was started.` and exits 0 without binding a port.
+A manager counts as running only when the answer carries its own words: a `503` with its busy sentence
+means it is busy rather than gone, and a `200` has to carry its health body. A `200` or a `503` from anything
+else on that port - a dev server that took the port a crashed manager left behind - is a stranger, not a running
+manager, so `caim open` starts one.
+With nothing answering it serves exactly what `caim serve` serves - the window comes with MG-13. PhotoCraft's
+"Open Craft AI Manager" button runs `caim open`, which is why every start records where this program lives. Two
+`caim open` runs launched at the same moment decide once: the first holds `open.lock` beside the endpoint file while it
+starts a manager, and the second waits for that lock (up to 5 s) and then sees the manager the first one started.
+A lock this machine cannot make at all - the folder is not there and cannot be created, say - is an error, not
+contention: `caim open` prints what went wrong and exits 1 rather than saying another run is starting a manager
+that nobody is starting.
+
+Three more files live in that same folder, and none of them is deleted on exit. What comes and goes with a
+`caim open` run is the operating system's lock on `open.lock`, not the file itself:
+
+| File | What it is |
+|---|---|
+| `open.lock` | held by one `caim open` across the decision and the start, so two runs launched together cannot both serve and race to replace `endpoint.json`. Created with `create_new`, holding a random nonce and the holder's process id; released by closing the handle as soon as the server is listening. The file keeps its name, so every run locks the same inode, and a lock whose owner has ended is taken over the moment the next run looks at it |
+
+| File | What it is |
+|---|---|
+| `app.json` | `{"version": 1, "exe": "<absolute path of this executable>"}`, rewritten atomically on every start of `serve` and `open`, so another app can find the manager and start it |
+| `activity.jsonl` | one JSON line per finished job - `done`, `failed` or `cancelled` - with `time`, `task`, `model`, `version`, `device`, `device_requested`, `fallback_reason`, `elapsed_ms` and `state`; the newest 1,000 lines are kept, the file being rewritten once it passes 1,100 |
+
+`app.json` is written just after the endpoint file. Failing to write it is a sentence on stderr, not a failed start:
+the manager is still serving, it just cannot be found by path. Log fields CAIM has no value for yet - the model
+version, the requested device, the fallback reason - are written as `null`, so the file keeps its shape when MG-10
+and MG-11 fill them in. A line that cannot be written is a sentence on stderr and never fails the job it describes;
+the log is a convenience, not a dependency.
 
 The server answers only `127.0.0.1`, only with the right `Authorization: Bearer <token>` header, and only when
 `Host:` is exactly `127.0.0.1:<port>` - which is what stops a page in your browser, or a DNS rebinding, from reaching
@@ -243,7 +277,7 @@ is one where a link sits in place of the models folder or of a model's own folde
 link are never counted, because they are not in the models folder.
 
 `caim models remove <id>` deletes `<id>\<version>\`: the model file, `verified.json`, `acknowledged.json`, and any
-`.part` or `.lock` an interrupted install left behind. When that was the model's last version, the now empty `<id>`
+`.part`, its `.part.json` note or `.lock` an interrupted install left behind. When that was the model's last version, the now empty `<id>`
 folder goes with it. It asks no questions, because the command is already explicit. It refuses while a manager is
 running: the endpoint file names a port, and a connection to that port answers, so the model may be in use. A file left
 behind by a manager that died does not refuse, because the port is asked as well. What it deletes is always
@@ -251,19 +285,47 @@ behind by a manager that died does not refuse, because the port is asked as well
 same question again before it touches the disk, and a link in place of the models folder or of either model folder is
 refused rather than followed.
 
-A download goes to `<file>.part` in the same folder and is hashed as it streams. A server whose `Content-Length`, or
-whose bytes read, go past the catalog's `size` is refused; a hash or size mismatch deletes the `.part` file and names
-the expected and the actual value. Redirects are followed - Hugging Face hands the download to a CDN - but never down
-to plain HTTP. A model that is already installed makes no request at all. There is no resume yet (CAIM-03 puts resume
-in S2) and cancellation waits for MG-05; while a download runs the CLI prints a percentage.
+A download goes to a `.part` file in the same folder as the model and is hashed as it streams. A server whose
+`Content-Length`, or whose bytes read, go past the catalog's `size` is refused; a hash or size mismatch deletes the
+part and names the expected and the actual value. Redirects are followed - Hugging Face hands the download to a CDN -
+but never down to plain HTTP. A model that is already installed makes no request at all, and while a download runs
+the CLI prints a percentage.
 
-Each install writes its own `<file>.<random>.part`, created exclusively, and renames into place only the bytes it
-hashed itself, so two installs at once can never put a wrong file under the verified name. On top of that, one install
-of a model downloads at a time: it holds `<file>.lock` (created exclusively, touched every few seconds while the
-download runs), and a second install is told another one is running. A lock nobody has touched for two minutes was
-left by an install that died; the next install moves it aside under a name of its own (if several try at once, one
-rename wins) and takes over. `.part` files nobody has written to for two minutes are cleared the same way. The file is
-synced to disk before it is renamed into place.
+**Restart-safe resume (CAIM-03, MG-12).** While a download runs it keeps a note beside its bytes:
+`<file>.<random>.part` and `<file>.<random>.part.json`, the note holding the url, the pinned revision, the expected
+SHA-256 and the bytes written so far, rewritten atomically every 8 MiB. The next `caim models install` of the same
+model re-hashes those bytes - a partial file is never trusted for its hash alone - and asks for the rest with
+`Range: bytes=<n>-`. A `206` continues where it stopped, and the percentage starts at the resumed offset; a `200`
+means the server ignored the range, so the download starts over from zero; any other status is an error that leaves
+the bytes for the next try. A note naming another revision or another SHA-256 than the catalog asks for describes a
+different file, so both files are deleted and the download starts over. The finished hash still has to match the
+catalog: a mismatch deletes both files and the install fails. A download that stops short - a `Content-Length` that
+runs out, or a read error halfway through - keeps what arrived and says so, and the install line names how many of
+the bytes were already on disk.
+
+The note counts the bytes it was written alongside, so a run killed between two checkpoints normally leaves more
+bytes in the `.part` than the note counts. Those extra bytes are not covered by any note, so they are cut off and the
+recorded prefix is what resumes. A `.part` shorter than its note is missing bytes the note vouches for, so that pair
+is deleted and the download starts over. When the note counts the whole file - a run that died just after its last
+checkpoint - those bytes are hashed and put in place where they are, because asking the server for
+`Range: bytes=<size>-` would only be refused.
+
+Each install writes its own `<file>.<random>.part` and its own `<file>.<random>.part.json`, created exclusively, and
+renames into place only the bytes it hashed itself, so two installs at once can never put a wrong file under the
+verified name. That is why the pair carries a random tag rather than the bare `<file>.part` amendment 18 names:
+two installs of one model would otherwise overwrite each other's bytes and each other's note. On top of that, one
+install of a model downloads at a time: it holds `<file>.lock` (created exclusively, touched every few seconds while
+the download runs), and a second install is told another one is running. A lock nobody has touched for two minutes
+was left by an install that died; the next install moves it aside under a name of its own (if several try at once,
+one rename wins) and takes over. A `.part` nobody has written to for two minutes is cleared the same way, with one
+exception: a `.part` whose note is still there and just as old is a half download that the next install can pick up,
+so that pair stays until resume adopts it or the rules above reject it. An install that created the lock file itself
+knows no other installer exists, so it adopts such a pair however young it is - running the same command again picks
+the bytes up straight away. Only an install that took the lock over insists both halves are old, because the install
+that left them might only be stalled, and a takeover never writes into the bytes it found: it copies the recorded
+prefix into a `.part` of its own, because the stalled install may still hold the old file open and renaming it would
+leave this install verifying a file somebody else is still appending to. A `.part` with no note, and a note with no
+`.part`, are both dead and go. The file is synced to disk before it is renamed into place.
 
 **The licence gate.** An entry is not offered - and the test over the embedded catalog fails in CI - when a field is
 missing or empty, when anything says `UNCLEAR`, when the URL is not HTTPS, when `sha256` is not 64 lowercase hex, when

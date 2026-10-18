@@ -11,6 +11,8 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+/// The activity log: one JSON line per finished job, kept next to `endpoint.json`.
+pub mod activity;
 /// The built-in fake backend: a mean-colour fill, so MG-01 can answer jobs with no model installed.
 pub mod backend;
 /// The Select Subject runner (MG-10): the BiRefNet maths, and its ONNX Runtime session.

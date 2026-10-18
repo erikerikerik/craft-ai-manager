@@ -122,8 +122,13 @@ pub fn install_model(model: &Model, root: &Path, accept_note: bool, fetcher: &dy
         fetch::Outcome::AlreadyInstalled => {
             Ok(format!("{} is already installed at {}. Nothing was downloaded.", model.label(), fetch::installed_path(root, model).display()))
         }
-        fetch::Outcome::Downloaded { sha256, bytes, elapsed_ms } => {
-            Ok(format!("{} is installed: {bytes} bytes, SHA-256 {sha256}, in {elapsed_ms} ms. {}", model.label(), fetch::installed_path(root, model).display()))
+        fetch::Outcome::Downloaded { sha256, bytes, elapsed_ms, resumed_from } => {
+            let resumed = if resumed_from == 0 { String::new() } else { format!(", {resumed_from} of them already on disk") };
+            Ok(format!(
+                "{} is installed: {bytes} bytes{resumed}, SHA-256 {sha256}, in {elapsed_ms} ms. {}",
+                model.label(),
+                fetch::installed_path(root, model).display()
+            ))
         }
     }
 }

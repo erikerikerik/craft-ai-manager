@@ -2,11 +2,13 @@
 //! through while it runs. Amendment 11 fixes the states (`queued`, `running`, `done`, `failed`,
 //! `cancelled`), the queue cap of eight, and the ten minutes a finished result is kept for.
 
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use crate::activity;
 use crate::backend::{self, Filled};
 use crate::error::{Fail, Result};
 use crate::image::{self, Frame};
@@ -137,8 +139,9 @@ pub struct Provenance {
 /// One job, from the moment it is accepted until its result has been read or has expired.
 struct Entry {
     id: String,
-    /// Which of the catalog tasks this job is, so the worker can pick the runner. Amendment 18:
-    /// the task is checked before the job is queued, so this is always a task that was ready.
+    /// Which of the catalog tasks this job is, so the worker can pick the runner and the activity
+    /// log can name it. Amendment 18: the task is checked before the job is queued, so this is
+    /// always a task that was ready.
     task: String,
     state: State,
     progress: f64,
@@ -161,6 +164,8 @@ struct Shared {
     jobs: Vec<Entry>,
     next_id: u64,
     pending: usize,
+    /// Where finished jobs are logged, or `None` when this run has nowhere to log.
+    activity: Option<PathBuf>,
 }
 
 /// A queue slot is reserved before HTTP buffers a body; all failure paths release it.
@@ -246,7 +251,7 @@ impl Runner {
 
     pub(crate) fn with_memory_limit(backend: Backend, max_queue: usize, memory_limit: usize) -> Result<Runner> {
         let (queue_tx, queue_rx) = std::sync::mpsc::sync_channel::<String>(MAX_RECORDS);
-        let shared = Arc::new(Mutex::new(Shared { jobs: Vec::new(), next_id: 0, pending: 0 }));
+        let shared = Arc::new(Mutex::new(Shared { jobs: Vec::new(), next_id: 0, pending: 0, activity: None }));
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let worker_shared = Arc::clone(&shared);
         let worker_stop = Arc::clone(&stop);
@@ -256,6 +261,12 @@ impl Runner {
             .spawn(move || worker(worker_shared, queue_rx, worker_stop, backend))
             .map_err(|error| Fail::internal(format!("Craft AI Manager could not start its job worker: {error}")))?;
         Ok(Runner { shared, queue_tx, worker: Mutex::new(Some(handle)), stop, max_queue, budget: Budget::new(memory_limit) })
+    }
+
+    /// Point the queue at an activity log. Amendment 18 puts it next to `endpoint.json`, and a
+    /// run with no endpoint file has no log: nothing about a job changes either way.
+    pub(crate) fn set_activity_log(&self, path: Option<PathBuf>) {
+        lock(&self.shared).activity = path;
     }
 
     pub(crate) fn admit(&self, body_bytes: usize) -> Result<Admission> {
@@ -341,6 +352,10 @@ impl Runner {
             entry.state = State::Cancelled;
             entry.message = CANCELLED_MESSAGE.to_string();
             entry.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            let record = activity_record(entry);
+            let path = shared.activity.clone();
+            drop(shared);
+            log_activity(path.as_deref(), &record);
         }
         Ok(())
     }
@@ -408,6 +423,8 @@ impl Runner {
     pub(crate) fn request_stop(&self) {
         let mut shared = lock(&self.shared);
         self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let path = shared.activity.clone();
+        let mut logged = Vec::new();
         for entry in &mut shared.jobs {
             if !entry.state.is_finished() {
                 if entry.state == State::Queued {
@@ -418,7 +435,12 @@ impl Runner {
                 entry.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
                 entry.state = State::Cancelled;
                 entry.message = CANCELLED_MESSAGE.to_string();
+                logged.push(activity_record(entry));
             }
+        }
+        drop(shared);
+        for record in &logged {
+            log_activity(path.as_deref(), record);
         }
     }
 
@@ -532,26 +554,33 @@ fn finish(shared: &Arc<Mutex<Shared>>, id: &str, cancel: &std::sync::atomic::Ato
     let Some(entry) = find_mut(&mut shared.jobs, id) else { return };
     entry.finished_at = Some(Instant::now());
     if entry.state == State::Cancelled {
+        // A cancelled job already has its line in the activity log, written where it was cancelled.
+        // Writing it again would count the same job twice.
         entry.memory = None;
         entry.message = CANCELLED_MESSAGE.to_string();
         return;
     }
     match ready {
         Ok((png, provenance)) => {
-            if let Some(memory) = entry.memory.as_mut() {
-                // This only shrinks the conservative working-space reservation.
-                if let Err(fail) = memory.resize(png.capacity()) {
+            // This only shrinks the conservative working-space reservation.
+            let resized = match entry.memory.as_mut() {
+                Some(memory) => memory.resize(png.capacity()),
+                None => Ok(()),
+            };
+            match resized {
+                Err(fail) => {
                     entry.memory = None;
                     entry.state = State::Failed;
                     entry.message = fail.sentence;
-                    return;
+                }
+                Ok(()) => {
+                    entry.state = State::Done;
+                    entry.progress = 1.0;
+                    entry.message = "Done.".to_string();
+                    entry.png = Some(png);
+                    entry.provenance = Some(provenance);
                 }
             }
-            entry.state = State::Done;
-            entry.progress = 1.0;
-            entry.message = "Done.".to_string();
-            entry.png = Some(png);
-            entry.provenance = Some(provenance);
         }
         Err(fail) => {
             entry.memory = None;
@@ -563,6 +592,36 @@ fn finish(shared: &Arc<Mutex<Shared>>, id: &str, cancel: &std::sync::atomic::Ato
                 entry.message = fail.sentence;
             }
         }
+    }
+    let record = activity_record(entry);
+    let path = shared.activity.clone();
+    drop(shared);
+    log_activity(path.as_deref(), &record);
+}
+
+/// The line the activity log gets for a finished job (amendment 18, "Activity log"). The fields
+/// MG-10 and MG-11 will fill in are `None` today, which is what the amendment asks for.
+fn activity_record(entry: &Entry) -> activity::Record {
+    let provenance = entry.provenance.as_ref();
+    activity::Record {
+        time: activity::now_stamp(),
+        task: Some(entry.task.clone()),
+        model: provenance.map(|source| source.model.clone()),
+        version: None,
+        device: provenance.map(|source| source.device.clone()),
+        device_requested: None,
+        fallback_reason: None,
+        elapsed_ms: provenance.map(|source| source.elapsed_ms),
+        state: entry.state.wire().to_string(),
+    }
+}
+
+/// Write one finished job, and never let the log change what a job reported: amendment 18 says a
+/// failed write is a sentence on stderr and nothing else.
+fn log_activity(path: Option<&Path>, record: &activity::Record) {
+    let Some(path) = path else { return };
+    if let Err(fail) = activity::append(path, record) {
+        eprintln!("{}", fail.sentence);
     }
 }
 
