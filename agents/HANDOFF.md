@@ -1,5 +1,14 @@
 # HANDOFF: Craft AI Manager
 
+## 2026-10-18: Codex-Strata (autopilot) - MG-12 round 4 (D17, option 1): the launch lock keeps its name, and PR #7 is back in review with Claude
+
+- Erik un-parked **PR #7** with decision D17 and chose option 1: `LaunchLock::Drop` closes this run's handle and never unlinks `open.lock`, so every `caim open` opens and locks the same inode. The `remove_file` in the `create_new` branch went with it. Receipt: `agents/receipts/MG-12.md`, section "Round 4".
+- Same branch `ai/mg-12-resume-launch`. MG-10 landed while the PR was parked, so `origin/main` is merged in at `c69571f` (five conflicts, both sides kept) and the round-4 fix sits on top. The `parked` label is off the PR.
+- The D17 shape is a new unit test, `a_launch_lock_handed_over_under_a_waiter_still_has_one_holder`: a holder, a waiter that already has the file open, a third run asking the normal way, and a fourth asking from another thread. Put the unlink back for one run and it fails at "the third run finds the inode the waiter is holding"; with the fix it passes. `assert_nothing_left_behind` became `assert_only_the_lock_is_left`, and the two `open_command` tests now expect the lock file to survive.
+- Gates: `cargo fmt --check` 0, `cargo clippy --all-targets -- -D warnings` 0, `cargo test` 324 passed / 0 failed / 4 ignored. `cargo deny check` still cannot run here (cargo-deny is not installed); `Cargo.toml` and `Cargo.lock` are untouched.
+- **Waiting on Claude, not Codex-cloud:** this round's review is Claude's (the autopilot order for round 4 says so, and the finding being fixed is Codex-cloud's own), so no `@codex review` comment on #7. Comment on the PR lists the new commits for a review of those only. Once it approves and the checks are green: `gh pr ready 7`, `gh pr merge 7 --merge`, then the fork docs PR that moves MG-12 to `done`.
+- **Seen, not ours:** MG-10's `a_log_that_cannot_be_written_does_not_change_what_a_job_reports` (`crates/caim/tests/activity_log.rs:100`) failed once in a whole-suite run here - 185 bytes in a log just made read-only - and passed every other whole-suite run and 3 of 3 alone. Same family as the flake MG-10's receipt already flags.
+
 ## 2026-10-18: Codex-Strata (autopilot) - **PARKED: #7 waits for Erik - a seventh P2 in the launch lock, and MG-12's fix rounds are used up**
 
 - **What is left:** Codex-cloud's re-review of `4725568` found a seventh P2 in the same launch decision (`crates/caim/src/endpoint.rs:532`): `LaunchLock::Drop` unlinks the lock file, so on Unix a waiter that already has that inode open can lock an unlinked inode while another run creates a new file at the same name, and the launch decision stops being serialized for a moment. No fix is pushed - two rounds under SPEC 15 plus the round Erik authorised as round 3 (D14) are spent, and the last entry says the sixth look is the last one. PR #7 is labelled `parked`, head `4725568`, all four checks green, nothing else changed.
