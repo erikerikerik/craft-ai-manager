@@ -12,6 +12,7 @@ use crate::error::{Fail, Result};
 use crate::image::{self, Frame};
 use crate::lama;
 use crate::memory::{self, Budget, Reservation};
+use crate::routing::{self, TASK_MASK};
 
 /// Amendment 11: at most eight jobs queued or running at once; the ninth is a 503.
 pub const MAX_QUEUE: usize = 8;
@@ -66,9 +67,10 @@ impl State {
     }
 }
 
-/// What the worker runs a job on (MG-04 item 2). `caim serve` chooses one at start:
+/// What the worker runs a job on (MG-04 item 2). `caim serve` chooses one at start, through
+/// [routing](crate::routing), which is the only place a task is matched to a model:
 ///
-/// * `Lama` when MG-02 says the model is installed and acknowledged;
+/// * `Real` when MG-02 says at least one of the two models is installed and acknowledged;
 /// * `Fake` under `--fake-backend`, exactly as MG-01 had it;
 /// * `NoModel` otherwise, which keeps MG-01's answer and sentence.
 #[derive(Clone, Debug, Default)]
@@ -78,8 +80,10 @@ pub enum Backend {
     NoModel,
     /// The built-in fake backend, its ten steps spaced by `step_delay`.
     Fake { step_delay: Duration },
-    /// The real LaMa runner; its session is loaded on the first job and kept after that.
-    Lama(Arc<lama::Pipeline>),
+    /// The real ONNX runners, one slot per task, each with its session loaded on the first job and
+    /// kept after that. MG-10 added the second slot, so a store that holds only one of the two
+    /// models still serves the task it holds.
+    Real { lama: Option<Arc<lama::Pipeline>>, birefnet: Option<Arc<crate::birefnet::Pipeline>> },
 }
 
 impl Backend {
@@ -88,13 +92,21 @@ impl Backend {
     pub fn note(&self) -> &'static str {
         match self {
             Backend::NoModel => "none: no model is installed yet",
-            Backend::Fake { .. } => "fake-fill (the built-in mean-colour fill)",
-            Backend::Lama(_) => "lama (LaMa on the local CPU, loaded on the first job)",
+            Backend::Fake { .. } => "fake-fill and fake-mask (the built-in fill and ellipse)",
+            Backend::Real { lama: Some(_), birefnet: None } => "lama (LaMa on the local CPU, loaded on the first job)",
+            Backend::Real { lama: None, birefnet: Some(_) } => "birefnet-lite (BiRefNet on the local CPU, loaded on the first job)",
+            Backend::Real { lama: Some(_), birefnet: Some(_) } => "lama and birefnet-lite (both on the local CPU, loaded on the first job)",
+            // The start only makes `Real` when it found a model, so this is defensive rather than
+            // reachable; it keeps the line honest if that ever changes.
+            Backend::Real { .. } => "none: no model is installed yet",
         }
     }
 }
 
 /// What `GET /v1/jobs/{id}/result` reports: amendment 14 wants this pinned to the layer later.
+///
+/// Amendment 18 adds the rest of the account: what kind of result it is, which model version and
+/// which bytes ran, what device was asked for, which one ran, and why it fell back.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Provenance {
     pub model: String,
@@ -102,11 +114,32 @@ pub struct Provenance {
     pub provider: String,
     pub elapsed_ms: u64,
     pub image_size: [u32; 2],
+    /// `image` or `mask`: the shape of `result.png`.
+    pub kind: &'static str,
+    /// The catalog version of the model that ran. `None` for the fake backend, which has no model.
+    pub model_version: Option<String>,
+    /// The SHA-256 of the model file that ran.
+    pub model_sha256: Option<String>,
+    /// The device the caller asked for: `auto` until CAIM-04 adds a device setting.
+    pub device_requested: String,
+    /// The hardware that ran, in plain words.
+    pub device_name: Option<String>,
+    /// Why a backend other than the requested one ran. `None` when the requested one did.
+    pub fallback_reason: Option<String>,
+    /// How long the session took to load: 0 when a later job reused it.
+    pub load_ms: u64,
+    /// How long the model itself took, without the preparation or the encoding.
+    pub run_ms: u64,
+    /// The runtime's own error text, for the log only.
+    pub diagnostics: Option<String>,
 }
 
 /// One job, from the moment it is accepted until its result has been read or has expired.
 struct Entry {
     id: String,
+    /// Which of the catalog tasks this job is, so the worker can pick the runner. Amendment 18:
+    /// the task is checked before the job is queued, so this is always a task that was ready.
+    task: String,
     state: State,
     progress: f64,
     message: String,
@@ -245,13 +278,13 @@ impl Runner {
 
     /// Accept a job and put it at the back of the queue. The id is opaque to the client, and safe
     /// to put in a URL path.
-    pub fn submit(&self, frame: Frame, mask: Vec<u8>) -> Result<String> {
+    pub fn submit(&self, task: &str, frame: Frame, mask: Vec<u8>) -> Result<String> {
         let mut admission = self.admit(0)?;
         admission.reserve_work(frame.width, frame.height)?;
-        self.submit_admitted(frame, mask, admission)
+        self.submit_admitted(task, frame, mask, admission)
     }
 
-    pub(crate) fn submit_admitted(&self, frame: Frame, mask: Vec<u8>, mut admission: Admission) -> Result<String> {
+    pub(crate) fn submit_admitted(&self, task: &str, frame: Frame, mask: Vec<u8>, mut admission: Admission) -> Result<String> {
         admission.body = None;
         let id = {
             let mut shared = lock(&self.shared);
@@ -265,6 +298,7 @@ impl Runner {
             let id = format!("job-{}", shared.next_id);
             shared.jobs.push(Entry {
                 id: id.clone(),
+                task: task.to_string(),
                 state: State::Queued,
                 progress: 0.0,
                 message: "Waiting for Craft AI Manager.".to_string(),
@@ -423,13 +457,13 @@ fn run_one(shared: &Arc<Mutex<Shared>>, id: &str, backend: &Backend) {
         match find_mut(&mut shared.jobs, id) {
             Some(entry) if entry.state == State::Queued => {
                 entry.state = State::Running;
-                entry.message = "Craft AI Manager is filling the masked area.".to_string();
-                entry.input.take()
+                entry.message = routing::running_message(&entry.task).to_string();
+                Some((entry.task.clone(), entry.input.take()))
             }
             _ => None,
         }
     };
-    let Some((image, mask)) = taken else { return };
+    let Some((task, Some((image, mask)))) = taken else { return };
     let cancel = match find(&lock(shared).jobs, id) {
         Some(entry) => Arc::clone(&entry.cancel),
         None => return,
@@ -448,10 +482,17 @@ fn run_one(shared: &Arc<Mutex<Shared>>, id: &str, backend: &Backend) {
             entry.message = message.to_string();
         }
     };
-    let outcome = match backend {
-        Backend::NoModel => Err(Fail::bad_request("No model is installed for fill_masked_area yet")),
-        Backend::Fake { step_delay } => backend::run_fill(&image, &mask, &cancel, *step_delay, &mut progress),
-        Backend::Lama(pipeline) => pipeline.run_fill(&image, &mask, &cancel, &mut progress),
+    // The task picks the runner, and nothing else. A runner never decides which model to use, and
+    // a task with no runner in this backend gets the same sentence the queue would have given it
+    // before the job arrived.
+    let outcome = match (backend, task.as_str()) {
+        (Backend::NoModel, _) => Err(Fail::bad_request(routing::not_ready_sentence(&task))),
+        (Backend::Fake { step_delay }, TASK_MASK) => backend::run_mask(&image, &mask, &cancel, *step_delay, &mut progress),
+        (Backend::Fake { step_delay }, _) => backend::run_fill(&image, &mask, &cancel, *step_delay, &mut progress),
+        (Backend::Real { birefnet: Some(pipeline), .. }, TASK_MASK) => pipeline.run_mask(&image, &mask, &cancel, &mut progress),
+        (Backend::Real { birefnet: None, .. }, TASK_MASK) => Err(Fail::bad_request(routing::not_ready_sentence(TASK_MASK))),
+        (Backend::Real { lama: Some(pipeline), .. }, _) => pipeline.run_fill(&image, &mask, &cancel, &mut progress),
+        (Backend::Real { lama: None, .. }, _) => Err(Fail::bad_request(routing::not_ready_sentence(&task))),
     };
     drop(image);
     drop(mask);
@@ -467,11 +508,20 @@ fn finish(shared: &Arc<Mutex<Shared>>, id: &str, cancel: &std::sync::atomic::Ato
             Ok(png) => Ok((
                 png,
                 Provenance {
-                    model: filled.model.to_string(),
-                    device: filled.device.to_string(),
-                    provider: filled.provider.to_string(),
-                    elapsed_ms: filled.elapsed_ms,
                     image_size: [filled.frame.width, filled.frame.height],
+                    kind: filled.kind,
+                    model: filled.model,
+                    device: filled.device,
+                    provider: filled.provider,
+                    elapsed_ms: filled.elapsed_ms,
+                    model_version: filled.model_version,
+                    model_sha256: filled.model_sha256,
+                    device_requested: filled.device_requested,
+                    device_name: filled.device_name,
+                    fallback_reason: filled.fallback_reason,
+                    load_ms: filled.load_ms,
+                    run_ms: filled.run_ms,
+                    diagnostics: filled.diagnostics,
                 },
             )),
             Err(fail) => Err(fail),
@@ -534,13 +584,16 @@ fn sweep_locked(shared: &mut Shared) {
 
 #[cfg(test)]
 mod tests {
+    use crate::protocol::TASK_FILL;
+    use crate::routing::{OUTPUT_IMAGE, OUTPUT_MASK, Offered, TASK_MASK};
+
     #[test]
     fn a_64mp_rgba16_upload_fits_idle_admission_and_is_busy_only_during_contention() {
         let runner = super::Runner::new(super::Backend::Fake { step_delay: std::time::Duration::ZERO }, 8).expect("worker");
         let request =
             crate::protocol::JobRequest::parse(br#"{"task":"fill_masked_area","image_size":[8000,8000],"region":[0,0,8000,8000],"channels":4,"bit_depth":16}"#)
                 .expect("RGBA16 request");
-        request.validate(true).expect("64 MP ceiling unchanged");
+        request.validate(&Offered::fake()).expect("64 MP ceiling unchanged");
         // Reserve the admission path used by the server without allocating a 512 MB test PNG.
         // Includes worst-case raw RGBA16 + grayscale mask and multipart/JSON overhead.
         let body_bytes = 8000 * 8000 * 9 + 65536;
@@ -559,6 +612,7 @@ mod tests {
             let mut shared = super::lock(&runner.shared);
             shared.jobs.push(super::Entry {
                 id: format!("finished-{n}"),
+                task: TASK_FILL.to_string(),
                 state: super::State::Cancelled,
                 progress: 0.0,
                 message: "Cancelled.".into(),
@@ -599,9 +653,9 @@ mod tests {
     #[test]
     fn shutdown_cancels_active_and_queued_work_and_refuses_new_work() {
         let runner = Runner::new(Backend::Fake { step_delay: Duration::from_millis(40) }, MAX_QUEUE).expect("worker");
-        let active = runner.submit(frame(), mask()).expect("active");
+        let active = runner.submit(TASK_FILL, frame(), mask()).expect("active");
         assert_eq!(settle(&runner, &active), State::Running);
-        let queued = runner.submit(frame(), mask()).expect("queued");
+        let queued = runner.submit(TASK_FILL, frame(), mask()).expect("queued");
         runner.stop();
         for id in [&active, &queued] {
             assert_eq!(runner.state(id).expect("record").0, State::Cancelled);
@@ -609,7 +663,7 @@ mod tests {
             let entry = find(&shared.jobs, id).expect("entry");
             assert!(entry.input.is_none() && entry.memory.is_none() && entry.finished_at.is_some());
         }
-        assert!(runner.submit(frame(), mask()).is_err());
+        assert!(runner.submit(TASK_FILL, frame(), mask()).is_err());
     }
 
     #[test]
@@ -630,7 +684,7 @@ mod tests {
         let mut admission = runner.admit(20).expect("upload begins");
         admission.reserve_work(2, 2).expect("working space");
         runner.stop();
-        assert!(runner.submit_admitted(frame(), mask(), admission).is_err());
+        assert!(runner.submit_admitted(TASK_FILL, frame(), mask(), admission).is_err());
         let shared = lock(&runner.shared);
         assert_eq!(shared.pending, 0);
         assert!(shared.jobs.is_empty());
@@ -640,7 +694,7 @@ mod tests {
     #[test]
     fn expired_results_release_memory() {
         let runner = Runner::new(Backend::Fake { step_delay: Duration::ZERO }, MAX_QUEUE).expect("worker");
-        let id = runner.submit(frame(), mask()).expect("job");
+        let id = runner.submit(TASK_FILL, frame(), mask()).expect("job");
         assert_eq!(finish(&runner, &id), State::Done);
         {
             let mut shared = lock(&runner.shared);
@@ -654,7 +708,7 @@ mod tests {
     #[test]
     fn failed_result_writes_restore_the_png_and_its_memory_reservation() {
         let runner = Runner::new(Backend::Fake { step_delay: Duration::ZERO }, MAX_QUEUE).expect("worker");
-        let id = runner.submit(frame(), mask()).expect("job");
+        let id = runner.submit(TASK_FILL, frame(), mask()).expect("job");
         assert_eq!(finish(&runner, &id), State::Done);
         let mut expected = Vec::new();
         assert!(
@@ -681,7 +735,7 @@ mod tests {
     #[test]
     fn a_result_lease_survives_expiry_while_a_transfer_is_in_progress() {
         let runner = Runner::new(Backend::Fake { step_delay: Duration::ZERO }, MAX_QUEUE).expect("worker");
-        let id = runner.submit(frame(), mask()).expect("job");
+        let id = runner.submit(TASK_FILL, frame(), mask()).expect("job");
         assert_eq!(finish(&runner, &id), State::Done);
         runner
             .deliver_png(&id, |_| {
@@ -698,7 +752,7 @@ mod tests {
     fn retained_results_block_over_budget_uploads_until_consumed() {
         let limit = crate::memory::work_bytes(2, 2).expect("working space");
         let runner = Runner::with_memory_limit(Backend::Fake { step_delay: Duration::ZERO }, MAX_QUEUE, limit).expect("worker");
-        let id = runner.submit(frame(), mask()).expect("job");
+        let id = runner.submit(TASK_FILL, frame(), mask()).expect("job");
         assert_eq!(finish(&runner, &id), State::Done);
         assert!(runner.admit(limit).is_err(), "the retained result uses part of the budget");
         runner.take_png(&id).expect("consume result");
@@ -738,7 +792,7 @@ mod tests {
     #[test]
     fn a_job_goes_from_queued_to_done_with_a_result() {
         let runner = Runner::new(Backend::Fake { step_delay: Duration::ZERO }, MAX_QUEUE).expect("the worker starts");
-        let id = runner.submit(frame(), mask()).expect("the job is accepted");
+        let id = runner.submit(TASK_FILL, frame(), mask()).expect("the job is accepted");
         assert_eq!(id, "job-1");
         assert_eq!(finish(&runner, &id), State::Done);
         let provenance = runner.provenance(&id).expect("a done job has provenance");
@@ -749,7 +803,16 @@ mod tests {
                 device: "cpu".to_string(),
                 provider: "local".to_string(),
                 elapsed_ms: provenance.elapsed_ms,
-                image_size: [2, 2]
+                image_size: [2, 2],
+                kind: OUTPUT_IMAGE,
+                model_version: None,
+                model_sha256: None,
+                device_requested: "auto".to_string(),
+                device_name: Some("CPU".to_string()),
+                fallback_reason: None,
+                load_ms: 0,
+                run_ms: provenance.elapsed_ms,
+                diagnostics: None,
             }
         );
         let png = runner.take_png(&id).expect("the result image is there");
@@ -759,10 +822,45 @@ mod tests {
     }
 
     #[test]
+    fn a_mask_job_runs_on_the_mask_half_of_the_fake_backend() {
+        // Amendment 18: the task picks the runner, and the result says it is a mask.
+        let runner = Runner::new(Backend::Fake { step_delay: Duration::ZERO }, MAX_QUEUE).expect("the worker starts");
+        let id = runner.submit(TASK_MASK, frame(), mask()).expect("the job is accepted");
+        assert_eq!(finish(&runner, &id), State::Done);
+        let provenance = runner.provenance(&id).expect("a done job has provenance");
+        assert_eq!(provenance.model, "fake-mask");
+        assert_eq!(provenance.kind, OUTPUT_MASK);
+        let png = runner.take_png(&id).expect("the result image is there");
+        let decoder = png::Decoder::new(std::io::Cursor::new(&png));
+        let reader = decoder.read_info().expect("the mask result is a PNG");
+        let info = reader.info().clone();
+        assert_eq!([info.width, info.height], [2, 2], "the mask comes back at the size that was sent");
+        assert_eq!(info.color_type, png::ColorType::Grayscale, "a mask result is one channel");
+        assert_eq!(info.bit_depth, png::BitDepth::Eight, "and always 8-bit");
+        runner.stop();
+    }
+
+    #[test]
+    fn a_real_backend_with_only_one_model_still_refuses_the_other_task() {
+        // MG-10: the two runners are separate slots, so a store holding only LaMa answers the mask
+        // task with the mask sentence rather than running the wrong model.
+        let loads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let runs = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let pipeline = lama::stand_in_pipeline(128.0, Duration::ZERO, &loads, &runs);
+        let runner = Runner::new(Backend::Real { lama: Some(pipeline), birefnet: None }, MAX_QUEUE).expect("the worker starts");
+        let id = runner.submit(TASK_MASK, frame(), mask()).expect("the job is queued");
+        assert_eq!(finish(&runner, &id), State::Failed, "the queue accepted it, so the worker says why it cannot run");
+        let (_, _, message) = runner.state(&id).expect("the job exists");
+        assert_eq!(message, "The Select Subject model isn't installed.", "{message}");
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 0, "LaMa never ran");
+        runner.stop();
+    }
+
+    #[test]
     fn cancelling_a_queued_job_stops_it_before_it_starts() {
         let runner = Runner::new(Backend::Fake { step_delay: Duration::from_millis(20) }, 1).expect("the worker starts");
-        let first = runner.submit(frame(), mask()).expect("the first job is accepted");
-        let second = runner.submit(frame(), mask()).expect_err("the queue holds one");
+        let first = runner.submit(TASK_FILL, frame(), mask()).expect("the first job is accepted");
+        let second = runner.submit(TASK_FILL, frame(), mask()).expect_err("the queue holds one");
         assert_eq!(second.status.code(), 503);
         runner.cancel(&first).expect("cancelling works");
         assert_eq!(settle(&runner, &first), State::Cancelled);
@@ -773,13 +871,13 @@ mod tests {
     #[test]
     fn the_queue_cap_answers_busy_and_clears_when_a_job_finishes() {
         let runner = Runner::new(Backend::Fake { step_delay: Duration::from_millis(10) }, 2).expect("the worker starts");
-        let first = runner.submit(frame(), mask()).expect("the first job is accepted");
-        let second = runner.submit(frame(), mask()).expect("the second job is accepted");
-        assert_eq!(runner.submit(frame(), mask()).expect_err("the queue is full").status.code(), 503);
+        let first = runner.submit(TASK_FILL, frame(), mask()).expect("the first job is accepted");
+        let second = runner.submit(TASK_FILL, frame(), mask()).expect("the second job is accepted");
+        assert_eq!(runner.submit(TASK_FILL, frame(), mask()).expect_err("the queue is full").status.code(), 503);
         for id in [&first, &second] {
             settle(&runner, id);
         }
-        let third = runner.submit(frame(), mask()).expect("a finished job frees a place");
+        let third = runner.submit(TASK_FILL, frame(), mask()).expect("a finished job frees a place");
         assert_eq!(third, "job-3");
         runner.stop();
     }
@@ -816,14 +914,14 @@ mod tests {
     /// loaded and run.
     fn lama_runner(step: Duration, loads: &Arc<AtomicUsize>, runs: &Arc<AtomicUsize>) -> Runner {
         let pipeline = lama::stand_in_pipeline(128.0, step, loads, runs);
-        Runner::new(Backend::Lama(pipeline), MAX_QUEUE).expect("the worker starts")
+        Runner::new(Backend::Real { lama: Some(pipeline), birefnet: None }, MAX_QUEUE).expect("the worker starts")
     }
 
     #[test]
     fn a_lama_job_goes_through_its_stages_and_answers_with_the_model() {
         let (loads, runs) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
         let runner = lama_runner(Duration::from_millis(4), &loads, &runs);
-        let id = runner.submit(frame(), mask()).expect("the job is accepted");
+        let id = runner.submit(TASK_FILL, frame(), mask()).expect("the job is accepted");
         // Read the messages as they arrive, so the order the stages report in is the order a
         // client would see them in.
         let mut seen: Vec<String> = Vec::new();
@@ -875,9 +973,9 @@ mod tests {
     fn a_lama_job_cancelled_while_queued_never_loads_the_model() {
         let (loads, runs) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
         let runner = lama_runner(Duration::from_millis(20), &loads, &runs);
-        let first = runner.submit(frame(), mask()).expect("the first job is accepted");
+        let first = runner.submit(TASK_FILL, frame(), mask()).expect("the first job is accepted");
         assert_eq!(settle(&runner, &first), State::Running, "the first job is holding the worker");
-        let second = runner.submit(frame(), mask()).expect("the second job joins the queue");
+        let second = runner.submit(TASK_FILL, frame(), mask()).expect("the second job joins the queue");
         runner.cancel(&second).expect("cancelling works");
         assert_eq!(finish(&runner, &second), State::Cancelled, "the queued job is cancelled before it starts");
         assert_eq!(loads.load(Ordering::SeqCst), 0, "it never got as far as loading the model");
@@ -889,7 +987,7 @@ mod tests {
     fn a_lama_job_cancelled_while_running_stops_the_run() {
         let (loads, runs) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
         let runner = lama_runner(Duration::from_millis(20), &loads, &runs);
-        let id = runner.submit(frame(), mask()).expect("the job is accepted");
+        let id = runner.submit(TASK_FILL, frame(), mask()).expect("the job is accepted");
         assert_eq!(settle(&runner, &id), State::Running);
         runner.cancel(&id).expect("a running job can be cancelled");
         assert_eq!(finish(&runner, &id), State::Cancelled, "the run notices and stops");
@@ -902,8 +1000,8 @@ mod tests {
     fn two_lama_jobs_finish_in_the_order_they_arrived() {
         let (loads, runs) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
         let runner = lama_runner(Duration::from_millis(10), &loads, &runs);
-        let first = runner.submit(frame(), mask()).expect("the first job is accepted");
-        let second = runner.submit(frame(), mask()).expect("the second job is accepted");
+        let first = runner.submit(TASK_FILL, frame(), mask()).expect("the first job is accepted");
+        let second = runner.submit(TASK_FILL, frame(), mask()).expect("the second job is accepted");
         let mut order: Vec<&str> = Vec::new();
         let deadline = std::time::Instant::now() + PATIENCE;
         while std::time::Instant::now() < deadline {
@@ -926,8 +1024,8 @@ mod tests {
     fn cancelling_a_queued_job_frees_its_input_and_starts_its_clock() {
         // C3: the worker skips a cancelled job, so cancel() itself has to let the sweep have it.
         let runner = Runner::new(Backend::Fake { step_delay: Duration::from_millis(50) }, MAX_QUEUE).expect("the worker starts");
-        let first = runner.submit(frame(), mask()).expect("the first job is accepted");
-        let second = runner.submit(frame(), mask()).expect("the second job joins the queue");
+        let first = runner.submit(TASK_FILL, frame(), mask()).expect("the first job is accepted");
+        let second = runner.submit(TASK_FILL, frame(), mask()).expect("the second job joins the queue");
         runner.cancel(&second).expect("cancelling works");
         {
             let shared = lock(&runner.shared);
@@ -944,7 +1042,9 @@ mod tests {
     fn a_job_cancelled_mid_stage_says_cancelled_and_stops_reporting() {
         // C4: the stage that was running when the DELETE arrived used to overwrite "Cancelled.".
         let (loads, runs) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
-        let runner = Runner::new(Backend::Lama(lama::stand_in_pipeline(128.0, Duration::from_millis(1), &loads, &runs)), MAX_QUEUE).expect("the worker starts");
+        let runner =
+            Runner::new(Backend::Real { lama: Some(lama::stand_in_pipeline(128.0, Duration::from_millis(1), &loads, &runs)), birefnet: None }, MAX_QUEUE)
+                .expect("the worker starts");
         // Big enough that preparing the crop takes a while, so the cancel lands inside that stage.
         let (width, height) = (3000u32, 3000u32);
         let image = Frame { width, height, channels: 3, bit_depth: 8, samples: vec![9; (width * height * 3) as usize] };
@@ -954,7 +1054,7 @@ mod tests {
                 big_mask[row * 3000 + column] = 255;
             }
         }
-        let id = runner.submit(image, big_mask).expect("the job is accepted");
+        let id = runner.submit(TASK_FILL, image, big_mask).expect("the job is accepted");
         let deadline = std::time::Instant::now() + PATIENCE;
         loop {
             let (state, _, message) = runner.state(&id).expect("the job exists");
@@ -983,12 +1083,12 @@ mod tests {
         // C8: after the worker stopped, the job stayed queued for ever and the 500 said "no job with that id".
         let runner = Runner::new(Backend::Fake { step_delay: Duration::ZERO }, MAX_QUEUE).expect("the worker starts");
         runner.stop();
-        let fail = runner.submit(frame(), mask()).expect_err("there is no worker to take the job");
+        let fail = runner.submit(TASK_FILL, frame(), mask()).expect_err("there is no worker to take the job");
         assert_eq!(fail.status.code(), 500, "{fail}");
         assert!(!fail.sentence.contains("no job with that id"), "the sentence says what went wrong: {fail}");
         assert!(lock(&runner.shared).jobs.is_empty(), "the job is not left behind in the queue");
         for _ in 0..MAX_QUEUE + 1 {
-            assert_eq!(runner.submit(frame(), mask()).expect_err("still no worker").status.code(), 500, "never a 503 from leftovers");
+            assert_eq!(runner.submit(TASK_FILL, frame(), mask()).expect_err("still no worker").status.code(), 500, "never a 503 from leftovers");
         }
     }
 }

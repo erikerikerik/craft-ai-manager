@@ -1,13 +1,18 @@
-# Where the golden fixture comes from
+# Where the golden fixtures come from
 
-One real Wikimedia Commons photo, CC0, with one obvious removable object on a simple background.
-PC-06 Part A replaced the synthetic fixture MG-04 had to fall back on (no network in that run).
+Two real Wikimedia Commons photos, both CC0. The first has one obvious removable object on a simple
+background; PC-06 Part A replaced the synthetic fixture MG-04 had to fall back on (no network in that
+run). The second is a person against a busy background, which MG-10 added for the Select Subject
+golden test.
 
 | File | What it is |
 | --- | --- |
 | `input.png` | 448x448, 8-bit RGB, 288,217 bytes. The photo, cropped and downscaled. |
 | `mask.png` | 448x448, 8-bit grayscale, 10,217 bytes. Hand-made over the object: 255 where the object is, 0 elsewhere, soft edge. |
 | `expected.png` | 448x448, 8-bit RGB, 279,192 bytes. The answer the first good LaMa run produced, kept after looking at it. |
+| `input-person.png` | 768x512, 8-bit RGB, 514,881 bytes. The second photo, downscaled. |
+| `mask-buoy.png` | 448x448, 8-bit grayscale, 4,116 bytes. The subject of `input.png`, from the real BiRefNet. |
+| `mask-person.png` | 768x512, 8-bit grayscale, 9,558 bytes. The subject of `input-person.png`, same model. |
 
 ## The photo
 
@@ -71,13 +76,69 @@ Checked by eye before keeping it: the buoy, the handle and the reflection are pl
 water reads as water. Machine check for leftovers: the warm-colour test from step 1 of the mask
 finds 31,438 pixels in `input.png` and 0 in `expected.png`.
 
+## The second photo (MG-10)
+
+- File page: <https://commons.wikimedia.org/wiki/File:Sitting_And_Smiling_(Unsplash).jpg>
+- Original file: <https://upload.wikimedia.org/wikipedia/commons/2/23/Sitting_And_Smiling_%28Unsplash%29.jpg>
+- Title: "Sitting And Smiling (Unsplash).jpg" - a person sitting outdoors, hair blown across the face
+  by the wind, against a busy background of sky and vegetation.
+- Author: [Brooke Cagle](https://unsplash.com/@brookecagle), own work, released to Unsplash.
+- Licence: **CC0 1.0 Universal** (Public Domain Dedication). Read from the Commons API `extmetadata`
+  on 2026-10-17: `LicenseShortName=CC0`, `UsageTerms=Creative Commons Zero, Public Domain Dedication`,
+  `AttributionRequired=false`.
+- Dated 2017-03-19 on the file page. Original 5370x3580 JPEG.
+- RS-01 downloaded it as `photo-person-cc0.jpg` (1920x1280) and used it for the Select Subject
+  research; the same file is the source here, so the two tasks measure the same subject.
+
+Why this photo: the hard part of a matte is the hair and the fine detail against a busy background,
+which is exactly what amendment 18's soft edge is for. A buoy on open water would pass even if the
+runner threw the edge away.
+
+## How `input-person.png` was made
+
+1. `photo-person-cc0.jpg` (1920x1280, RS-01's copy) opened with PIL and converted to RGB.
+2. Resized to 768x512 with PIL `LANCZOS` and saved as an 8-bit RGB PNG: 514,881 bytes.
+
+Why 768x512: the mask task's `max_pixels` is 1,048,576, and 768x512 is 393,216 - comfortably inside
+it, and the same aspect ratio as the source, so nothing is stretched twice.
+
+## How `mask-buoy.png` and `mask-person.png` were made
+
+By the real model, through a **Python** run of the same contract - deliberately not by this crate, so
+the golden test compares CAIM's runner against an independent implementation rather than against a
+copy of its own output:
+
+- `birefnet_lite.onnx`, 224,005,088 bytes, SHA-256
+  `5600024376f572a557870a5eb0afb1e5961636bef4e1e22132025467d0f03333` (the catalog entry), installed
+  and acknowledged with `caim models install birefnet --accept-note`.
+- `onnxruntime` 1.31.0, `CPUExecutionProvider`, `enable_cpu_mem_arena = False` (decision D12), Python
+  PIL 12.3.0 and numpy 2.5.4.
+- Preprocessing exactly as `agents/models/birefnet.md` (RS-01) verified: PIL `BILINEAR` stretch to
+  1024x1024 (aspect not kept), RGB, /255, mean (0.485, 0.456, 0.406), std (0.229, 0.224, 0.225),
+  NCHW.
+- Post-processing: `sigmoid(logit) * 255`, clamped and rounded at 1024x1024, then a two-tap
+  half-pixel-centre bilinear resize back to the fixture size, rounded again. No threshold - the
+  intermediate values are the soft edge amendment 18 asks for.
+- Written as 8-bit grayscale PNG.
+
+The generator script was throwaway (`.codex-tmp/make_masks.py`, outside the repo). The check that the
+two implementations agree is the golden test itself: `IoU >= 0.95` against these files, and a mean
+distance of at most 2.0 levels a pixel.
+
+Foreground fraction (pixels at 128 or above) is 0.1026 for the buoy and 0.2572 for the person, against
+RS-01's 0.1027 and 0.2573 for the same two photos at their own sizes - the same subject, found twice.
+Soft-edge pixels (between 1 and 254) are 1,885 on the buoy and 6,919 on the person.
+
+The model files themselves are never committed, and neither are the source JPEGs.
+
 ## Licence
 
-The photo is CC0 1.0 Universal, so `input.png` and everything derived from it carry no attribution
+Both photos are CC0 1.0 Universal, so every fixture derived from them carries no attribution
 obligation; they are offered to the project under CC0 - use, copy and re-license them freely.
 
-The model that produced `expected.png` is *not* CC0. Its weights licence is in
-`docs/models/lama.md`, and the model file itself is never committed.
+The models that produced `expected.png`, `mask-buoy.png` and `mask-person.png` are *not* CC0. Their
+weight licences and their training-data notes are in `docs/models/lama.md`,
+`ATTRIBUTION.md` and the catalog entry, and no model file is ever committed here.
 
 ## What the golden test checks
 
@@ -85,3 +146,15 @@ The model that produced `expected.png` is *not* CC0. Its weights licence is in
 
 > 141018 pixels outside the mask are identical; inside, 0.000 levels a channel from the committed
 > answer, and the masked area moved from 65.6 to 23.1 away from the background colour
+
+and, for the two mask runs:
+
+> buoy: session load 3724 ms, first run 9797 ms (13775 ms wall), warm run 8482 ms; IoU 0.9997, mean
+> 0.012 levels from the committed matte, 1885 soft-edge pixels, warm-run drift 0 levels
+>
+> person: session load 3785 ms, first run 9868 ms (13928 ms wall), warm run 8608 ms; IoU 0.9996, mean
+> 0.023 levels from the committed matte, 6919 soft-edge pixels, warm-run drift 0 levels
+
+Those timings are from a debug build on the CraftML PC (Ryzen 9 7950X); a release build runs the same
+model in about half the time, and RS-01 measured 3.6-3.8 s to load and 4.06-4.29 s warm with the
+arena off.

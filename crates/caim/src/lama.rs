@@ -18,11 +18,12 @@ use std::time::{Duration, Instant};
 
 use ort::environment::Environment;
 
-use crate::backend::Filled;
+use crate::backend::{Filled, Timings};
 use crate::catalog::{self, Model};
 use crate::error::{Fail, Result};
 use crate::image::{CHANNELS, Frame};
 use crate::protocol::TASK_FILL;
+use crate::routing::OUTPUT_IMAGE;
 use crate::store;
 
 /// The size LaMa takes, in pixels, on a side. Fixed by the graph, not by us.
@@ -39,6 +40,8 @@ pub const LAMA_ID: &str = "lama";
 pub const LAMA_MODEL: &str = "lama";
 /// LaMa runs on the CPU: no GPU execution provider is compiled in.
 pub const LAMA_DEVICE: &str = "cpu";
+/// The hardware words amendment 18 puts in `device_name`.
+pub const LAMA_DEVICE_NAME: &str = "CPU";
 /// Everything CAIM does is local.
 pub const LAMA_PROVIDER: &str = "local";
 
@@ -561,8 +564,20 @@ pub type Loader = Box<dyn Fn(&Path) -> Result<Box<dyn Session>> + Send + Sync>;
 /// ~1.2 s model load is paid once per process rather than once per job (MG-04 item 2).
 pub struct Pipeline {
     path: PathBuf,
+    /// The catalog version and file hash of the model this pipeline runs, so every result can say
+    /// which bytes made it (amendment 18). `None` when the pipeline was built straight from a path,
+    /// which is what the tests and any caller without a catalog entry do.
+    identity: Option<Identity>,
     session: Mutex<Option<Box<dyn Session>>>,
     load: Loader,
+}
+
+/// The part of a catalog entry amendment 18 pins to a result. The model is always its distributed
+/// source file: an ONNX Runtime optimised graph is a disposable artifact, never provenance.
+#[derive(Clone, Debug)]
+pub struct Identity {
+    pub version: String,
+    pub sha256: String,
 }
 
 /// A pipeline is described by its model file and whether the session has been loaded yet; the
@@ -577,14 +592,37 @@ impl Pipeline {
     /// A pipeline that runs the ONNX file at `path` on ONNX Runtime.
     #[must_use]
     pub fn new(path: impl Into<PathBuf>) -> Arc<Pipeline> {
-        Self::with_loader(path, Box::new(load_ort_session))
+        Self::with_identity_and_loader(path, None, Box::new(load_ort_session))
     }
 
     /// The same with the session factory replaced, which is how a test walks the stages with a
     /// stand-in instead of the 200 MB graph.
     #[must_use]
     pub fn with_loader(path: impl Into<PathBuf>, load: Loader) -> Arc<Pipeline> {
-        Arc::new(Pipeline { path: path.into(), session: Mutex::new(None), load })
+        Self::with_identity_and_loader(path, None, load)
+    }
+
+    /// A pipeline for a catalog entry, so its results carry the entry's version and hash.
+    #[must_use]
+    pub fn for_model(path: impl Into<PathBuf>, model: &Model) -> Arc<Pipeline> {
+        Self::with_identity_and_loader(path, Some(Identity { version: model.version.clone(), sha256: model.sha256.clone() }), Box::new(load_ort_session))
+    }
+
+    #[must_use]
+    fn with_identity_and_loader(path: impl Into<PathBuf>, identity: Option<Identity>, load: Loader) -> Arc<Pipeline> {
+        Arc::new(Pipeline { path: path.into(), identity, session: Mutex::new(None), load })
+    }
+
+    /// A finished fill from this pipeline, with amendment 18's account of what ran.
+    fn filled(&self, frame: Frame, elapsed_ms: u64, load_ms: u64, run_ms: u64) -> Filled {
+        let timings = Timings { elapsed_ms, load_ms, run_ms };
+        let mut filled = Filled::new(frame, timings, LAMA_MODEL, LAMA_DEVICE, LAMA_PROVIDER, OUTPUT_IMAGE);
+        if let Some(identity) = self.identity.as_ref() {
+            filled.model_version = Some(identity.version.clone());
+            filled.model_sha256 = Some(identity.sha256.clone());
+        }
+        filled.device_name = Some(LAMA_DEVICE_NAME.to_string());
+        filled
     }
 
     /// Fill the masked area with the model, reporting the MG-05 stages as it goes.
@@ -609,7 +647,7 @@ impl Pipeline {
         let Some(box_) = mask_box(width, height, mask) else {
             // Nothing is masked: the input comes back unchanged and the model never runs.
             progress(1.0, MSG_FINISH);
-            return Ok(Filled { frame: image.clone(), elapsed_ms: elapsed_ms(&started), model: LAMA_MODEL, device: LAMA_DEVICE, provider: LAMA_PROVIDER });
+            return Ok(self.filled(image.clone(), elapsed_ms(&started), 0, 0));
         };
         let window = crop_window(box_, width, height);
         let model_mask = dilate(&mask_plane(mask, window, width, MODEL_SIZE), MODEL_SIZE, DILATE_PX);
@@ -618,13 +656,19 @@ impl Pipeline {
         if stopped(cancel) {
             return Err(Fail::internal(CANCELLED));
         }
-        let output = {
+        // The run's own outcome is carried out of the lock so the session can go back into the
+        // guard whether the run worked or not; `map` keeps the error type concrete.
+        let run = {
             let mut guard = self.session.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut load_ms = 0u64;
             let mut session = match guard.take() {
                 Some(session) => session,
                 None => {
                     progress(LOAD_PROGRESS, MSG_LOAD);
-                    (self.load)(&self.path)?
+                    let loading = Instant::now();
+                    let session = (self.load)(&self.path)?;
+                    load_ms = elapsed_ms(&loading);
+                    session
                 }
             };
             if stopped(cancel) {
@@ -632,24 +676,23 @@ impl Pipeline {
                 return Err(Fail::internal(CANCELLED));
             }
             progress(RUN_PROGRESS, MSG_RUN);
-            let output = session.run(&model_image, &model_mask, cancel);
+            let running = Instant::now();
+            let outcome = session.run(&model_image, &model_mask, cancel);
+            let run_ms = elapsed_ms(&running);
             *guard = Some(session);
-            output
+            // A run ORT stopped because the job was cancelled is a cancellation, not a failure. The
+            // session is back in the guard by now, so the next job still finds it.
+            let outcome = outcome.map_err(|fail| if stopped(cancel) { Fail::internal(CANCELLED) } else { fail });
+            outcome.map(|samples| (samples, load_ms, run_ms))
         };
+        let (output, load_ms, run_ms) = run?;
         if stopped(cancel) {
             return Err(Fail::internal(CANCELLED));
         }
-        let output = match output {
-            Ok(output) => output,
-            Err(fail) => {
-                // A run ORT stopped because the job was cancelled is a cancellation, not a failure.
-                return Err(if stopped(cancel) { Fail::internal(CANCELLED) } else { fail });
-            }
-        };
         progress(RUN_END, MSG_FINISH);
         let frame = blend(image, mask, window, &fill_back(&output, window));
         progress(1.0, MSG_FINISH);
-        Ok(Filled { frame, elapsed_ms: elapsed_ms(&started), model: LAMA_MODEL, device: LAMA_DEVICE, provider: LAMA_PROVIDER })
+        Ok(self.filled(frame, elapsed_ms(&started), load_ms, run_ms))
     }
 }
 
@@ -707,7 +750,10 @@ impl Session for OrtSession {
 static ENVIRONMENT: OnceLock<std::result::Result<Arc<Environment>, String>> = OnceLock::new();
 
 /// The process-wide ONNX Runtime environment, with telemetry off: CAIM is local and offline.
-fn environment() -> Result<Arc<Environment>> {
+///
+/// `pub(crate)` because ONNX Runtime allows one environment per process, so the other runner
+/// ([crate::birefnet]) shares this one rather than building a second.
+pub(crate) fn environment() -> Result<Arc<Environment>> {
     let made = ENVIRONMENT.get_or_init(|| ort::init().with_telemetry(false).build().map(Arc::new).map_err(|error| error.to_string()));
     match made {
         Ok(environment) => Ok(Arc::clone(environment)),
@@ -739,7 +785,7 @@ pub fn installed_pipeline(root: &Path, model: &Model) -> Option<Arc<Pipeline>> {
     if !store::is_installed(root, model) || !store::is_acknowledged(root, model) {
         return None;
     }
-    Some(Pipeline::new(store::model_file(root, model)))
+    Some(Pipeline::for_model(store::model_file(root, model), model))
 }
 
 /// The backend `caim serve` should run jobs on: the installed, acknowledged LaMa, or `None`.
@@ -1048,7 +1094,7 @@ mod tests {
             [MSG_PREPARE, MSG_PREPARE, MSG_LOAD, MSG_RUN, MSG_FINISH, MSG_FINISH]
         );
         assert_eq!(stages.iter().map(|(value, _)| *value).collect::<Vec<_>>(), [0.0, 0.2, 0.25, 0.3, 0.9, 1.0], "prepare, load, run, finish");
-        assert_eq!((filled.model, filled.device, filled.provider), ("lama", "cpu", "local"));
+        assert_eq!((filled.model.as_str(), filled.device.as_str(), filled.provider.as_str()), ("lama", "cpu", "local"));
         assert_eq!(runs.load(Ordering::SeqCst), 1, "the model ran once");
     }
 
