@@ -46,7 +46,7 @@ const MAX_PROBE_BYTES: usize = 2048;
 /// The endpoint file is JSON, and the protocol caps JSON at 64 KiB.
 const MAX_FILE_BYTES: u64 = 64 * 1024;
 /// The file beside `endpoint.json` that says one `caim open` is deciding whether to start a
-/// manager right now.
+/// manager right now. It is never deleted, so every run opens and locks the same inode.
 const LAUNCH_LOCK_NAME: &str = "open.lock";
 /// How long a second `caim open` waits for the first to finish starting before it gives up. The
 /// lock is only held while a server binds its port and publishes the endpoint file, so a few
@@ -443,20 +443,24 @@ pub enum LockOutcome {
 /// rather than for the life of the manager.
 ///
 /// Ownership is the operating system's answer to "is that run still alive?", not a timestamp. The
-/// holder keeps the file open - read and write, so it can read its own record back - and holds an
-/// exclusive lock on it ([std::fs::File::try_lock]), and
-/// the operating system releases that lock when the holder's handle closes, which it does by itself
-/// when the process ends - cleanly, after a crash, or because it was killed. So a lock whose lock
-/// is free has an owner that is gone, whatever the clock says, and a lock whose lock is held
-/// belongs to a live run however old the file is. There is no stale window: a start that is merely
-/// slow, descheduled, or stopped in a debugger keeps its lock until it ends, which is the whole
-/// point of having one.
+/// holder keeps the file open - read and write - and holds an exclusive lock on it
+/// ([std::fs::File::try_lock]), and the operating system releases that lock when the holder's
+/// handle closes, which it does by itself when the process ends - cleanly, after a crash, or
+/// because it was killed. So a lock whose lock is free has an owner that is gone, whatever the
+/// clock says, and a lock whose lock is held belongs to a live run however old the file is. There
+/// is no stale window: a start that is merely slow, descheduled, or stopped in a debugger keeps its
+/// lock until it ends, which is the whole point of having one.
+///
+/// Letting go closes this run's handle and nothing else: the file keeps its name. Unlinking it
+/// would let a run that already had that inode open keep locking a file no path leads to while the
+/// next run made a fresh one under the same name, and both would be told they may start a manager.
+/// With the name in place every run opens and locks the same inode, so the operating system's
+/// answer is always about the file that matters. A lock a finished run left behind is simply the
+/// next run's lock, free for the taking, which is why nothing here deletes it.
 pub struct LaunchLock {
-    path: PathBuf,
-    nonce: String,
     /// The handle this run holds the operating system's lock through. Keeping it open is what makes
     /// this run the owner; the lock goes when it closes, and the operating system closes it if this
-    /// run ends.
+    /// run ends. The file itself is never removed, so the next run locks the same inode.
     file: std::fs::File,
 }
 
@@ -486,12 +490,14 @@ impl LaunchLock {
                 // Nobody holds the name, so it is ours to make. The record goes in before the lock
                 // does, so the file is never sitting there without saying who wrote it.
                 Ok(mut file) => {
+                    // A record that cannot be written leaves the file where it is for the next run
+                    // to take over. Deleting it would hand a fresh inode to a run already waiting on
+                    // this one, which is the split this lock exists to avoid.
                     if let Err(error) = write_record(&mut file, &nonce) {
-                        let _ = std::fs::remove_file(path);
                         return LockOutcome::Failed(Fail::internal(format!("Craft AI Manager could not write its launch lock at {}: {error}", path.display())));
                     }
                     match file.try_lock() {
-                        Ok(()) => return LockOutcome::Taken(LaunchLock { path: path.to_path_buf(), nonce, file }),
+                        Ok(()) => return LockOutcome::Taken(LaunchLock { file }),
                         // Somebody opened the file in the moment between this run making it and
                         // locking it, and locked it first: that is another run, so wait like anywhere.
                         Err(std::fs::TryLockError::WouldBlock) => {}
@@ -515,8 +521,8 @@ impl LaunchLock {
             // handle closes, which it does by itself when that run ends.
             let mut file = match OpenOptions::new().read(true).write(true).open(path) {
                 Ok(file) => file,
-                // The owner let go and removed the file between these two opens, so the name is free
-                // again and this run can claim it from the start.
+                // Somebody outside this program removed the file, so the name is free again and
+                // this run can claim it from the start.
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(error) => {
                     return LockOutcome::Failed(Fail::internal(format!("Craft AI Manager could not open its launch lock at {}: {error}", path.display())));
@@ -529,7 +535,7 @@ impl LaunchLock {
                     if let Err(error) = file.set_len(0).and_then(|()| write_record(&mut file, &nonce)) {
                         return LockOutcome::Failed(Fail::internal(format!("Craft AI Manager could not write its launch lock at {}: {error}", path.display())));
                     }
-                    return LockOutcome::Taken(LaunchLock { path: path.to_path_buf(), nonce, file });
+                    return LockOutcome::Taken(LaunchLock { file });
                 }
                 // A live run holds it. Waiting it out is the honest answer; taking it would start a
                 // second manager, which is the very thing the lock exists to stop.
@@ -546,34 +552,28 @@ impl LaunchLock {
             std::thread::sleep(LAUNCH_LOCK_POLL);
         }
     }
+
+    /// The process id this lock's record names as its owner, read through the handle that holds the
+    /// lock - while it is held, no other handle can be relied on to read the file. For whoever looks
+    /// at the folder, never for deciding: the operating system's lock is what says whether an owner
+    /// is alive.
+    #[must_use]
+    pub fn owner_id(&self) -> Option<u32> {
+        let mut file = self.file.try_clone().ok()?;
+        let mut text = String::new();
+        file.rewind().ok()?;
+        file.read_to_string(&mut text).ok()?;
+        text.lines().nth(1)?.parse().ok()
+    }
 }
 
-/// The bytes a launch lock holds: this run's nonce, so it can tell its own lock from one somebody
-/// else took over, and this run's process id, so a person looking at the folder can see who is
-/// starting a manager. The id is for reading, not for deciding: the operating system's lock is what
-/// says whether an owner is alive, and it needs nothing from the process table to do that.
+/// The bytes a launch lock holds: a random nonce, so a person reading the folder can tell one
+/// run's record from the next run's, and this run's process id, so they can see who is starting a
+/// manager. Neither decides anything: the operating system's lock is what says whether an owner is
+/// alive, and it needs nothing from the process table to do that.
 fn write_record(file: &mut std::fs::File, nonce: &str) -> std::io::Result<()> {
     file.write_all(format!("{nonce}\n{}\n", std::process::id()).as_bytes())?;
     file.flush()
-}
-
-impl Drop for LaunchLock {
-    /// Let go of the lock. The bytes are read back through this run's own handle, which is the
-    /// handle the operating system's lock is held through: while it stays open no other run can
-    /// claim this lock, so a file that still starts with this run's nonce is one nobody has taken
-    /// over, and it is removed before the handle closes. A file that no longer starts with the nonce
-    /// belongs to somebody else now, so it is left alone.
-    fn drop(&mut self) {
-        let mut text = String::new();
-        let ours = self
-            .file
-            .rewind()
-            .and_then(|()| self.file.read_to_string(&mut text))
-            .is_ok_and(|bytes| bytes > 0 && text.lines().next() == Some(self.nonce.as_str()));
-        if ours {
-            let _ = std::fs::remove_file(&self.path);
-        }
-    }
 }
 
 /// The endpoint file as JSON, never reading past the cap so an oversized file is never parsed.
@@ -597,7 +597,7 @@ mod tests {
         published_credentials, published_port, read_reply, remove, temp_path, write, write_app,
     };
     use crate::error::Status;
-    use std::io::{Read, Seek, Write};
+    use std::io::{Read, Write};
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant, SystemTime};
 
@@ -1016,7 +1016,7 @@ mod tests {
         let second = take_lock(&path);
         holder.join().expect("the first run let go");
         drop(second);
-        assert_nothing_left_behind(&folder);
+        assert_only_the_lock_is_left(&folder);
         let _ = std::fs::remove_dir_all(&folder);
     }
 
@@ -1032,7 +1032,7 @@ mod tests {
         assert!(started.elapsed() >= LAUNCH_LOCK_WAIT, "it waits for the whole window before giving up");
         drop(held);
         assert!(matches!(LaunchLock::take(&path), LockOutcome::Taken(_)), "and the lock is free again once the first run is done");
-        assert_nothing_left_behind(&folder);
+        assert_only_the_lock_is_left(&folder);
         let _ = std::fs::remove_dir_all(&folder);
     }
 
@@ -1048,9 +1048,9 @@ mod tests {
         let started = Instant::now();
         let taken = take_lock(&path);
         assert!(started.elapsed() < LAUNCH_LOCK_WAIT, "a lock with no owner is taken over at once, not after waiting out the window a live owner gets");
-        assert_eq!(owner_id(&taken), Some(std::process::id()), "and the lock now names the run that took it over");
+        assert_eq!(taken.owner_id(), Some(std::process::id()), "and the lock now names the run that took it over");
         drop(taken);
-        assert_nothing_left_behind(&folder);
+        assert_only_the_lock_is_left(&folder);
         let _ = std::fs::remove_dir_all(&folder);
     }
 
@@ -1062,16 +1062,47 @@ mod tests {
         let folder = lock_folder("old-but-alive");
         let path = launch_lock_path_for(&folder.join("endpoint.json"));
         let held = take_lock(&path);
-        assert_eq!(owner_id(&held), Some(std::process::id()), "the lock says who is holding it");
+        assert_eq!(held.owner_id(), Some(std::process::id()), "the lock says who is holding it");
         let file = std::fs::File::options().write(true).open(&path).expect("the lock file can be opened");
         file.set_modified(SystemTime::now() - Duration::from_secs(60 * 60)).expect("the lock can be made an hour old");
         drop(file);
         assert!(matches!(LaunchLock::take(&path), LockOutcome::Held), "an hour old is still somebody else's lock");
         assert!(path.is_file(), "and the run that wanted it did not remove it");
-        assert_eq!(owner_id(&held), Some(std::process::id()), "still naming the run that is holding it");
+        assert_eq!(held.owner_id(), Some(std::process::id()), "still naming the run that is holding it");
         drop(held);
         assert!(matches!(LaunchLock::take(&path), LockOutcome::Taken(_)), "the lock is free the moment its owner is gone");
-        assert_nothing_left_behind(&folder);
+        assert_only_the_lock_is_left(&folder);
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn a_launch_lock_handed_over_under_a_waiter_still_has_one_holder() {
+        // The shape that used to slip through (D17, option 1): one run holds the lock, a second run
+        // has the file open but has not managed to lock it, and a third asks for the lock the normal
+        // way. If letting go unlinked the file, the waiter could lock the inode it already had while
+        // the third run made a fresh file under the same name, and both would be told they may start
+        // a manager. Because the lock keeps its name, all three are looking at one inode.
+        let folder = lock_folder("one-inode");
+        let path = launch_lock_path_for(&folder.join("endpoint.json"));
+        let first = take_lock(&path);
+        let waiter = std::fs::OpenOptions::new().read(true).write(true).open(&path).expect("a waiting run can open the lock file");
+        assert!(matches!(waiter.try_lock(), Err(std::fs::TryLockError::WouldBlock)), "the run that holds it keeps the waiter out");
+        drop(first);
+        waiter.try_lock().expect("the lock is free the moment its owner is gone, through the handle the waiter already had");
+        let third = LaunchLock::take(&path);
+        assert!(matches!(third, LockOutcome::Held), "the third run finds the inode the waiter is holding, not a new file under the same name");
+        drop(waiter);
+        let fourth = take_lock(&path);
+        assert_eq!(fourth.owner_id(), Some(std::process::id()), "and the same lock is there for the next run to take over");
+        // The same question from another thread while that run holds it: still exactly one holder.
+        let concurrent = {
+            let path = path.clone();
+            std::thread::spawn(move || matches!(LaunchLock::take(&path), LockOutcome::Taken(_)))
+        };
+        assert!(!concurrent.join().expect("the other run finished deciding"), "a run asking from another thread waits rather than taking a held lock");
+        drop(fourth);
+        assert!(path.is_file(), "letting go never unlinks the launch lock, so the name is still there for the next run");
+        assert_only_the_lock_is_left(&folder);
         let _ = std::fs::remove_dir_all(&folder);
     }
 
@@ -1102,16 +1133,6 @@ mod tests {
         }
     }
 
-    /// The process id a launch lock names as its owner, read through the handle that holds the
-    /// lock: while the lock is held the operating system will not let another handle read the file.
-    fn owner_id(lock: &LaunchLock) -> Option<u32> {
-        let mut file = lock.file.try_clone().ok()?;
-        let mut text = String::new();
-        file.rewind().ok()?;
-        file.read_to_string(&mut text).ok()?;
-        text.lines().nth(1)?.parse().ok()
-    }
-
     /// The process id an unlocked launch lock file names, for the case where its owner has ended.
     fn owner_id_in_file(path: &Path) -> Option<u32> {
         std::fs::read_to_string(path).ok()?.lines().nth(1)?.parse().ok()
@@ -1135,10 +1156,12 @@ mod tests {
         folder
     }
 
-    /// A lock that has been released leaves its folder exactly as it found it.
-    fn assert_nothing_left_behind(folder: &Path) {
+    /// A released lock leaves its folder holding the lock file and nothing else. The lock keeps its
+    /// name on purpose: every run has to open and lock the same inode, so a run that already had the
+    /// file open can never be left locking an orphan while a fresh file appears under the name.
+    fn assert_only_the_lock_is_left(folder: &Path) {
         let left_behind: Vec<String> =
             std::fs::read_dir(folder).expect("the folder is readable").flatten().map(|entry| entry.file_name().to_string_lossy().to_string()).collect();
-        assert!(left_behind.is_empty(), "a released lock leaves nothing behind: {left_behind:?}");
+        assert_eq!(left_behind, vec![LAUNCH_LOCK_NAME.to_string()], "a released lock leaves the lock file and nothing else: {left_behind:?}");
     }
 }

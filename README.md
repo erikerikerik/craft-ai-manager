@@ -76,12 +76,12 @@ A lock this machine cannot make at all - the folder is not there and cannot be c
 contention: `caim open` prints what went wrong and exits 1 rather than saying another run is starting a manager
 that nobody is starting.
 
-Three more files live in that same folder. `app.json` and `activity.jsonl` are never deleted on exit; `open.lock`
-exists only while a `caim open` is deciding whether to start a manager:
+Three more files live in that same folder, and none of them is deleted on exit. What comes and goes with a
+`caim open` run is the operating system's lock on `open.lock`, not the file itself:
 
 | File | What it is |
 |---|---|
-| `open.lock` | held by one `caim open` across the decision and the start, so two runs launched together cannot both serve and race to replace `endpoint.json`. Created with `create_new`, holding a random nonce; gone as soon as the server is listening. One nobody has touched for 30 s belonged to a run that died, and the next run takes it over |
+| `open.lock` | held by one `caim open` across the decision and the start, so two runs launched together cannot both serve and race to replace `endpoint.json`. Created with `create_new`, holding a random nonce and the holder's process id; released by closing the handle as soon as the server is listening. The file keeps its name, so every run locks the same inode, and a lock whose owner has ended is taken over the moment the next run looks at it |
 
 | File | What it is |
 |---|---|

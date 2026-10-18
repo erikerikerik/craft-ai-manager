@@ -238,7 +238,7 @@ fn two_caim_open_runs_at_once_start_one_manager_between_them() {
         .map(|entry| entry.file_name().to_string_lossy().to_string())
         .filter(|name| name.contains("open.lock"))
         .collect();
-    assert!(left_behind.is_empty(), "the launch lock is gone once a manager is listening: {left_behind:?}");
+    assert_eq!(left_behind.len(), 1, "the launch lock keeps its name, so every run locks the same inode: {left_behind:?}");
     running.kill().expect("the manager is ours to stop");
     running.wait().expect("the manager stopped");
     let _ = std::fs::remove_dir_all(&folder);
@@ -306,7 +306,9 @@ fn open_starts_a_manager_at_once_when_a_dead_run_left_the_launch_lock_behind() {
     let (out, _err) = read_output(&mut child);
     assert_eq!(health.status, 200, "a real manager started, on the port it published");
     assert!(!out.contains("being started by another"), "and it never waited for another run: {out}");
-    assert!(!lock.exists(), "and the leftover launch lock is gone once a manager is listening");
+    assert!(lock.exists(), "and the leftover launch lock keeps its name, so every run locks the same inode");
+    let taken = craft_ai_manager::endpoint::LaunchLock::take(&lock);
+    assert!(matches!(taken, craft_ai_manager::endpoint::LockOutcome::Taken(_)), "and that lock is free again once the manager it started has stopped");
     let _ = std::fs::remove_dir_all(&folder);
 }
 
