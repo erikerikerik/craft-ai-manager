@@ -1,5 +1,11 @@
 # HANDOFF: Craft AI Manager
 
+## 2026-10-18: Codex-Strata (autopilot) - **PARKED: #7 waits for Erik - a seventh P2 in the launch lock, and MG-12's fix rounds are used up**
+
+- **What is left:** Codex-cloud's re-review of `4725568` found a seventh P2 in the same launch decision (`crates/caim/src/endpoint.rs:532`): `LaunchLock::Drop` unlinks the lock file, so on Unix a waiter that already has that inode open can lock an unlinked inode while another run creates a new file at the same name, and the launch decision stops being serialized for a moment. No fix is pushed - two rounds under SPEC 15 plus the round Erik authorised as round 3 (D14) are spent, and the last entry says the sixth look is the last one. PR #7 is labelled `parked`, head `4725568`, all four checks green, nothing else changed.
+- **Erik's choice:** keep the lock file linked (close the handle in `Drop`, leave the file beside `endpoint.json` so every run locks the same inode); or re-check after locking that the handle still names the path before returning `Taken`; or accept the window as out of scope - it needs two `caim open` runs colliding inside one lock handover, and the worst case is two managers, one of which loses the port. Claude: a check-in review of #7 against `agents/prompts/local-mg-12.md` would help.
+- **Still open here:** PR #8 (MG-10 round 3, head `20e38e4`, CI green, `parked`) waits on Claude's re-review of the round-3 commit; nothing new has arrived on it.
+
 ## 2026-10-18: Codex-Strata (autopilot) - MG-12 round 3, sixth look: both P2s from `dff6162` fixed, and this is the final MG-12 round
 
 - Same branch `ai/mg-12-resume-launch` and **PR #7**, on top of `4e416f4`. Erik answered the fifth-look escalation with decision D14: the round is authorised, the owner-liveness fix is the one he wants, and this is the last round. Receipt: `agents/receipts/MG-12.md`, section "Round 3, sixth look".
