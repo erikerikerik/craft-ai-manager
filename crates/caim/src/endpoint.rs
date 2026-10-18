@@ -8,7 +8,7 @@
 //! 0600 (the MG-01 review follow-up).
 
 use std::fs::OpenOptions;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -54,11 +54,6 @@ const LAUNCH_LOCK_NAME: &str = "open.lock";
 const LAUNCH_LOCK_WAIT: Duration = Duration::from_secs(5);
 /// How long between polls of a launch lock somebody else is holding.
 const LAUNCH_LOCK_POLL: Duration = Duration::from_millis(25);
-/// A launch lock older than this was left by a `caim open` that died between taking it and
-/// starting the server. It is longer than [LAUNCH_LOCK_WAIT] on purpose: a lock is only ever taken
-/// over once nobody is willing to wait for it any more, so a start that is merely slow keeps its
-/// lock.
-const LAUNCH_LOCK_STALE: Duration = Duration::from_secs(30);
 
 static WRITE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -280,14 +275,18 @@ pub fn health_probe(port: u16, token: &str) -> Health {
     if stream.write_all(request.as_bytes()).and_then(|()| stream.flush()).is_err() {
         return Health::Absent;
     }
-    // One read can legally hand back half a status line, so keep reading until the line ends, the peer
-    // hangs up, or the health check has had its say. Deciding on a fragment would start a second manager
-    // on top of the one that is running and overwrite its endpoint file. A 503 needs the body too,
-    // because 503 is the ordinary way for any local service to say it cannot take a request.
-    let deadline = Instant::now() + HEALTH_TIMEOUT;
+    health_from(&read_reply(&mut stream, Instant::now() + HEALTH_TIMEOUT))
+}
+
+/// Read one reply and stop when the reply is over, never after a number of reads: this program's own
+/// mark in the body, the whole body the headers promised, a hang-up, the cap, or the deadline. One
+/// read can legally hand back half a status line, and the manager writes its headers and its body as
+/// two writes (http.rs:334-335) that TCP splits again however it likes, so deciding on a fragment
+/// would start a second manager on top of the one that is running and overwrite its endpoint file.
+/// Split out of [health_probe] so the pieces can be handed over by hand.
+fn read_reply<R: Read>(stream: &mut R, deadline: Instant) -> Vec<u8> {
     let mut head: Vec<u8> = Vec::new();
     let mut buffer = [0u8; 256];
-    let mut reads_past_headers = 0usize;
     loop {
         match stream.read(&mut buffer) {
             Ok(0) => break,
@@ -308,7 +307,8 @@ pub fn health_probe(port: u16, token: &str) -> Health {
         }
         // A 401 and anything else are decided by the status line alone: only this program answers
         // /v1/health that way to the token the endpoint file holds. A 200 and a 503 are different:
-        // any local service can answer both of them to a path it has never heard of.
+        // any local service can answer both of them to a path it has never heard of, and the body is
+        // the only thing that says whose answer it is.
         let mark = if status_line_says(&so_far, "503") {
             CAIM_ERROR_MARK
         } else if status_line_says(&so_far, "200") {
@@ -316,19 +316,28 @@ pub fn health_probe(port: u16, token: &str) -> Health {
         } else {
             break;
         };
-        // The answer is this program's as soon as its own words are in the body. One more read
-        // covers a body that arrives after the headers; then the reply is somebody else's.
+        // This program's own words in the body: the manager is answering, and there is nothing left
+        // worth reading.
         if so_far.contains(mark) {
             break;
         }
-        if so_far.contains("\r\n\r\n") {
-            reads_past_headers += 1;
-            if reads_past_headers >= 2 {
-                break;
-            }
+        // Not ours yet, so the answer counts as finished only when it says so itself: the whole body
+        // its headers promised has arrived, or the peer hung up (a reply that declares no length ends
+        // that way). Counting reads instead calls the first piece of a manager's body a stranger's
+        // whole answer, and starts a second manager over a live one.
+        if body_still_missing(&head).is_some_and(|bytes| bytes == 0) {
+            break;
         }
     }
-    let text = String::from_utf8_lossy(&head);
+    head
+}
+
+/// What the bytes of one reply say about the port. A 200 and a 503 each have to carry this program's
+/// own words, because either is the ordinary way for any local service to answer a path it has never
+/// heard of. A reply that stopped before its headers were over is the other case: a manager writes
+/// headers and body in one pass, so a half answer is far more likely a slow manager than a stranger.
+fn health_from(head: &[u8]) -> Health {
+    let text = String::from_utf8_lossy(head);
     if status_line_says(&text, "200") {
         if text.contains(CAIM_HEALTH_MARK) {
             Health::Ready
@@ -363,11 +372,27 @@ pub fn health_probe(port: u16, token: &str) -> Health {
         Health::Absent
     }
 }
-
 /// Does this reply carry `code` on its status line, under either HTTP version?
 fn status_line_says(text: &str, code: &str) -> bool {
     let after_version = text.strip_prefix("HTTP/1.1 ").or_else(|| text.strip_prefix("HTTP/1.0 "));
     after_version.is_some_and(|rest| rest.starts_with(code))
+}
+
+/// How many body bytes this reply still owes: `None` while its headers are still arriving, and
+/// how many are missing once they are over - `Some(0)` means the whole body the reply
+/// promised is here. A reply that declares no length ends at the hang-up, which the read loop already
+/// treats as the end, so a missing `Content-Length` is `None` and means keep reading.
+fn body_still_missing(head: &[u8]) -> Option<usize> {
+    let text = String::from_utf8_lossy(head);
+    let (headers, body) = text.split_once("\r\n\r\n")?;
+    let mut promised = None;
+    for line in headers.lines().skip(1) {
+        let Some((name, value)) = line.split_once(':') else { continue };
+        if name.eq_ignore_ascii_case("content-length") {
+            promised = value.trim().parse::<usize>().ok();
+        }
+    }
+    Some(promised?.saturating_sub(body.len()))
 }
 
 /// What `caim open` should do about a manager (amendment 18).
@@ -416,17 +441,31 @@ pub enum LockOutcome {
 /// `endpoint.json`. The loser keeps serving on a port no client can find, and both write the same
 /// activity log. The lock goes as soon as the server is listening, so it is held for a moment
 /// rather than for the life of the manager.
+///
+/// Ownership is the operating system's answer to "is that run still alive?", not a timestamp. The
+/// holder keeps the file open - read and write, so it can read its own record back - and holds an
+/// exclusive lock on it ([std::fs::File::try_lock]), and
+/// the operating system releases that lock when the holder's handle closes, which it does by itself
+/// when the process ends - cleanly, after a crash, or because it was killed. So a lock whose lock
+/// is free has an owner that is gone, whatever the clock says, and a lock whose lock is held
+/// belongs to a live run however old the file is. There is no stale window: a start that is merely
+/// slow, descheduled, or stopped in a debugger keeps its lock until it ends, which is the whole
+/// point of having one.
 pub struct LaunchLock {
     path: PathBuf,
     nonce: String,
+    /// The handle this run holds the operating system's lock through. Keeping it open is what makes
+    /// this run the owner; the lock goes when it closes, and the operating system closes it if this
+    /// run ends.
+    file: std::fs::File,
 }
 
 impl LaunchLock {
     /// Take the lock: [LockOutcome::Taken] when this run holds it, [LockOutcome::Held] when another
     /// `caim open` holds it, and [LockOutcome::Failed] when no lock could be made at all. A held lock is
     /// waited for up to [LAUNCH_LOCK_WAIT], which is how the second run ends up seeing the manager the
-    /// first one started instead of starting its own; a lock older than [LAUNCH_LOCK_STALE] belonged to
-    /// a run that died partway through starting, and is taken over once - see [crate::fetch::claim_stale].
+    /// first one started instead of starting its own. A lock whose owner has ended is taken over the
+    /// moment it is seen - see [LaunchLock] for why the age of the file plays no part.
     #[must_use]
     pub fn take(path: &Path) -> LockOutcome {
         let nonce = match crate::token::random_token() {
@@ -443,13 +482,26 @@ impl LaunchLock {
         }
         let deadline = Instant::now() + LAUNCH_LOCK_WAIT;
         loop {
-            match OpenOptions::new().write(true).create_new(true).open(path) {
+            match OpenOptions::new().read(true).write(true).create_new(true).open(path) {
+                // Nobody holds the name, so it is ours to make. The record goes in before the lock
+                // does, so the file is never sitting there without saying who wrote it.
                 Ok(mut file) => {
-                    if let Err(error) = file.write_all(nonce.as_bytes()).and_then(|()| file.flush()) {
+                    if let Err(error) = write_record(&mut file, &nonce) {
                         let _ = std::fs::remove_file(path);
                         return LockOutcome::Failed(Fail::internal(format!("Craft AI Manager could not write its launch lock at {}: {error}", path.display())));
                     }
-                    return LockOutcome::Taken(LaunchLock { path: path.to_path_buf(), nonce });
+                    match file.try_lock() {
+                        Ok(()) => return LockOutcome::Taken(LaunchLock { path: path.to_path_buf(), nonce, file }),
+                        // Somebody opened the file in the moment between this run making it and
+                        // locking it, and locked it first: that is another run, so wait like anywhere.
+                        Err(std::fs::TryLockError::WouldBlock) => {}
+                        Err(error) => {
+                            return LockOutcome::Failed(Fail::internal(format!(
+                                "Craft AI Manager could not lock its launch lock at {}: {error}",
+                                path.display()
+                            )));
+                        }
+                    }
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
                 // A folder that is not there, a file we cannot create: nothing can be decided safely,
@@ -458,8 +510,35 @@ impl LaunchLock {
                     return LockOutcome::Failed(Fail::internal(format!("Craft AI Manager could not open its launch lock at {}: {error}", path.display())));
                 }
             }
-            if crate::fetch::is_older_than(path, LAUNCH_LOCK_STALE) && crate::fetch::claim_stale(path, &nonce, LAUNCH_LOCK_STALE) {
-                continue;
+            // The name is taken, and the only question worth asking is whether the run that took it is
+            // still there. The operating system answers it: its lock is released when the owner's
+            // handle closes, which it does by itself when that run ends.
+            let mut file = match OpenOptions::new().read(true).write(true).open(path) {
+                Ok(file) => file,
+                // The owner let go and removed the file between these two opens, so the name is free
+                // again and this run can claim it from the start.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return LockOutcome::Failed(Fail::internal(format!("Craft AI Manager could not open its launch lock at {}: {error}", path.display())));
+                }
+            };
+            match file.try_lock() {
+                // The owner has ended, so the file is nobody's. Take it over: this run's bytes, and
+                // the lock this run now holds through `file`.
+                Ok(()) => {
+                    if let Err(error) = file.set_len(0).and_then(|()| write_record(&mut file, &nonce)) {
+                        return LockOutcome::Failed(Fail::internal(format!("Craft AI Manager could not write its launch lock at {}: {error}", path.display())));
+                    }
+                    return LockOutcome::Taken(LaunchLock { path: path.to_path_buf(), nonce, file });
+                }
+                // A live run holds it. Waiting it out is the honest answer; taking it would start a
+                // second manager, which is the very thing the lock exists to stop.
+                Err(std::fs::TryLockError::WouldBlock) => drop(file),
+                // The operating system will not lock the file at all, so a live owner cannot be told
+                // from a dead one. That is a broken folder, and it is not contention either.
+                Err(error) => {
+                    return LockOutcome::Failed(Fail::internal(format!("Craft AI Manager could not lock its launch lock at {}: {error}", path.display())));
+                }
             }
             if Instant::now() >= deadline {
                 return LockOutcome::Held;
@@ -469,20 +548,31 @@ impl LaunchLock {
     }
 }
 
+/// The bytes a launch lock holds: this run's nonce, so it can tell its own lock from one somebody
+/// else took over, and this run's process id, so a person looking at the folder can see who is
+/// starting a manager. The id is for reading, not for deciding: the operating system's lock is what
+/// says whether an owner is alive, and it needs nothing from the process table to do that.
+fn write_record(file: &mut std::fs::File, nonce: &str) -> std::io::Result<()> {
+    file.write_all(format!("{nonce}\n{}\n", std::process::id()).as_bytes())?;
+    file.flush()
+}
+
 impl Drop for LaunchLock {
-    /// Release the lock the way [crate::fetch] releases an install lock, without a check-then-delete
-    /// race: move it aside to a name only this run uses, and delete it there only if it is still the
-    /// one this run wrote; if another run took it over in the meantime, put that one back.
+    /// Let go of the lock. The bytes are read back through this run's own handle, which is the
+    /// handle the operating system's lock is held through: while it stays open no other run can
+    /// claim this lock, so a file that still starts with this run's nonce is one nobody has taken
+    /// over, and it is removed before the handle closes. A file that no longer starts with the nonce
+    /// belongs to somebody else now, so it is left alone.
     fn drop(&mut self) {
-        let aside = crate::fetch::sibling(&self.path, &format!("{}.release", self.nonce));
-        if std::fs::rename(&self.path, &aside).is_err() {
-            return;
+        let mut text = String::new();
+        let ours = self
+            .file
+            .rewind()
+            .and_then(|()| self.file.read_to_string(&mut text))
+            .is_ok_and(|bytes| bytes > 0 && text.lines().next() == Some(self.nonce.as_str()));
+        if ours {
+            let _ = std::fs::remove_file(&self.path);
         }
-        let ours = std::fs::read_to_string(&aside).is_ok_and(|text| text == self.nonce);
-        if !ours && std::fs::rename(&aside, &self.path).is_ok() {
-            return;
-        }
-        let _ = std::fs::remove_file(&aside);
     }
 }
 
@@ -502,12 +592,12 @@ fn read_value(path: &Path) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::{
-        APP_NAME, APP_VERSION, ENDPOINT_VERSION, Health, LAUNCH_LOCK_NAME, LAUNCH_LOCK_STALE, LAUNCH_LOCK_WAIT, Launch, LaunchLock, LockOutcome, app_path_for,
-        endpoint_file_from_env, health_probe, is_ours, launch_decision, launch_lock_path_for, published_credentials, published_port, remove, temp_path, write,
-        write_app,
+        APP_NAME, APP_VERSION, CAIM_ERROR_MARK, CAIM_HEALTH_MARK, ENDPOINT_VERSION, Health, LAUNCH_LOCK_NAME, LAUNCH_LOCK_WAIT, Launch, LaunchLock,
+        LockOutcome, app_path_for, body_still_missing, endpoint_file_from_env, health_from, health_probe, is_ours, launch_decision, launch_lock_path_for,
+        published_credentials, published_port, read_reply, remove, temp_path, write, write_app,
     };
     use crate::error::Status;
-    use std::io::{Read, Write};
+    use std::io::{Read, Seek, Write};
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant, SystemTime};
 
@@ -706,6 +796,92 @@ mod tests {
         assert_eq!(health_probe(port, "token"), Health::Ready, "a 200 split across reads is still a manager answering");
         server.join().expect("the fake manager finished");
     }
+    #[test]
+    fn a_health_body_that_arrives_in_pieces_is_still_this_program() {
+        // The manager writes its headers and its body as two writes (http.rs:334-335), and TCP splits
+        // them again however it likes, so the body can arrive over several reads. Deciding after a
+        // fixed number of reads calls the first piece of a live manager's body a stranger's whole
+        // answer, and starts a second manager on top of the one that is running.
+        let body = String::from_utf8(crate::protocol::health(&format!("caim/{}", crate::VERSION))).expect("the health answer is UTF-8");
+        let head = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+        let (first, rest) = body.split_at(5);
+        assert!(!first.contains(CAIM_HEALTH_MARK), "the test needs a first piece that is not yet the whole answer");
+        let mut pieces = Pieces::new(&[head.as_str(), first, rest]);
+        let reply = read_reply(&mut pieces, Instant::now() + Duration::from_secs(5));
+        assert_eq!(health_from(&reply), Health::Ready, "a 200 whose body arrives in pieces is still this program answering");
+    }
+
+    #[test]
+    fn a_busy_answer_whose_body_arrives_in_pieces_is_still_this_program() {
+        // The same for the 503 a busy manager answers with: its own sentence is what says the port is
+        // Craft AI Manager's, and that sentence can arrive in pieces too.
+        let body = r#"{"error":"Craft AI Manager already has 8 requests open, so it cannot take another one yet."}"#;
+        let head = format!("HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+        let (first, rest) = body.split_at(12);
+        assert!(!first.contains(CAIM_ERROR_MARK), "the test needs a first piece that is not yet the whole answer");
+        let mut pieces = Pieces::new(&[head.as_str(), first, rest]);
+        let reply = read_reply(&mut pieces, Instant::now() + Duration::from_secs(5));
+        assert_eq!(health_from(&reply), Health::Busy, "a 503 whose body arrives in pieces is still a busy manager, not a stranger");
+    }
+
+    #[test]
+    fn a_stranger_answer_is_read_to_its_end_and_not_to_the_deadline() {
+        // The other side of the same rule: reading a reply to its end is not waiting about for a
+        // manager that is not there. The stranger's page is complete, so the reply is over at its last
+        // promised byte - the reader is never asked for the piece after it - and the port is free.
+        let body = "<html><head><title>It works</title></head><body>every path answers 200 here</body></html>";
+        let head = format!("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+        let (first, rest) = body.split_at(20);
+        let (second, third) = rest.split_at(rest.len() / 2);
+        let mut pieces = Pieces::new(&[head.as_str(), first, second, third, "bytes nobody asked for"]);
+        let reply = read_reply(&mut pieces, Instant::now() + Duration::from_secs(5));
+        assert_eq!(health_from(&reply), Health::Absent, "a 200 that is not our health answer is still a stranger on the port");
+        assert_eq!(pieces.handed, 4, "the reply was over at its last promised byte: the reader was never asked for the piece after it");
+    }
+
+    /// A reader that hands back one piece per call, the way a socket splits a reply, and then the
+    /// hang-up a `Connection: close` answer ends with. `handed` counts the calls, so a test can ask
+    /// whether the reader was pushed past the end of a reply that was already over.
+    struct Pieces {
+        parts: Vec<Vec<u8>>,
+        handed: usize,
+    }
+
+    impl Pieces {
+        fn new(parts: &[&str]) -> Self {
+            Self { parts: parts.iter().map(|part| part.as_bytes().to_vec()).collect(), handed: 0 }
+        }
+    }
+
+    impl std::io::Read for Pieces {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            if self.handed >= self.parts.len() {
+                return Ok(0);
+            }
+            let part = std::mem::take(&mut self.parts[self.handed]);
+            self.handed += 1;
+            let take = part.len().min(buffer.len());
+            buffer[..take].copy_from_slice(&part[..take]);
+            Ok(take)
+        }
+    }
+
+    #[test]
+    fn a_reply_is_only_over_when_the_body_it_declared_has_arrived() {
+        // The stopping rule of the read loop on its own: headers still arriving is not an answer, a
+        // reply that declares no length ends at the hang-up, and a body is over at its last promised
+        // byte.
+        assert_eq!(body_still_missing(b"HTTP/1.1 200 OK\r\nContent-Len"), None, "the headers are not over yet");
+        assert_eq!(
+            body_still_missing(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n<html>"),
+            None,
+            "a reply with no declared length ends when the peer hangs up"
+        );
+        assert_eq!(body_still_missing(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nabc"), Some(2), "three of five body bytes");
+        assert_eq!(body_still_missing(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nabcde"), Some(0), "and the whole body is over");
+        assert_eq!(body_still_missing(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nabcdefgh"), Some(0), "more bytes than promised is still a finished answer");
+        assert_eq!(body_still_missing(b"HTTP/1.1 200 OK\r\nContent-Length: nine\r\n\r\n"), None, "a length that is not a number promises nothing");
+    }
 
     #[test]
     fn a_manager_with_no_free_connection_slot_is_still_running() {
@@ -861,16 +1037,40 @@ mod tests {
     }
 
     #[test]
-    fn a_launch_lock_left_by_a_dead_run_is_taken_over_once() {
-        let folder = lock_folder("dead-run");
+    fn a_launch_lock_whose_owner_has_ended_is_taken_over_at_once() {
+        // What a `caim open` that died between taking the lock and starting a server leaves behind:
+        // the file, with the operating system's lock on it already gone. Nothing here is made old on
+        // purpose, because the takeover is about the owner being gone and not about the clock.
+        let folder = lock_folder("dead-owner");
         let path = launch_lock_path_for(&folder.join("endpoint.json"));
-        std::fs::write(&path, "a run that died partway through starting").expect("a lock file can be left behind");
-        let file = std::fs::File::options().write(true).open(&path).expect("the lock file can be opened");
-        file.set_modified(SystemTime::now() - LAUNCH_LOCK_STALE - Duration::from_secs(1)).expect("the lock can be made old");
-        drop(file);
+        leave_a_dead_owner_lock(&path);
+        assert_eq!(owner_id_in_file(&path), Some(424242), "the lock a dead run left behind still names it");
+        let started = Instant::now();
         let taken = take_lock(&path);
-        assert!(path.is_file(), "and it is held again");
+        assert!(started.elapsed() < LAUNCH_LOCK_WAIT, "a lock with no owner is taken over at once, not after waiting out the window a live owner gets");
+        assert_eq!(owner_id(&taken), Some(std::process::id()), "and the lock now names the run that took it over");
         drop(taken);
+        assert_nothing_left_behind(&folder);
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn a_launch_lock_a_live_run_holds_is_not_taken_over_however_old_the_file_is() {
+        // The rule this replaces took a lock whose owner was merely slow. Age is not the question:
+        // while the owner is alive the operating system's lock is held, so an hour-old file that is
+        // still being held stays taken, and the run that wants it waits and then says so.
+        let folder = lock_folder("old-but-alive");
+        let path = launch_lock_path_for(&folder.join("endpoint.json"));
+        let held = take_lock(&path);
+        assert_eq!(owner_id(&held), Some(std::process::id()), "the lock says who is holding it");
+        let file = std::fs::File::options().write(true).open(&path).expect("the lock file can be opened");
+        file.set_modified(SystemTime::now() - Duration::from_secs(60 * 60)).expect("the lock can be made an hour old");
+        drop(file);
+        assert!(matches!(LaunchLock::take(&path), LockOutcome::Held), "an hour old is still somebody else's lock");
+        assert!(path.is_file(), "and the run that wanted it did not remove it");
+        assert_eq!(owner_id(&held), Some(std::process::id()), "still naming the run that is holding it");
+        drop(held);
+        assert!(matches!(LaunchLock::take(&path), LockOutcome::Taken(_)), "the lock is free the moment its owner is gone");
         assert_nothing_left_behind(&folder);
         let _ = std::fs::remove_dir_all(&folder);
     }
@@ -900,6 +1100,31 @@ mod tests {
             LockOutcome::Held => panic!("another run is holding the launch lock"),
             LockOutcome::Failed(fail) => panic!("the launch lock could not be taken: {}", fail.sentence),
         }
+    }
+
+    /// The process id a launch lock names as its owner, read through the handle that holds the
+    /// lock: while the lock is held the operating system will not let another handle read the file.
+    fn owner_id(lock: &LaunchLock) -> Option<u32> {
+        let mut file = lock.file.try_clone().ok()?;
+        let mut text = String::new();
+        file.rewind().ok()?;
+        file.read_to_string(&mut text).ok()?;
+        text.lines().nth(1)?.parse().ok()
+    }
+
+    /// The process id an unlocked launch lock file names, for the case where its owner has ended.
+    fn owner_id_in_file(path: &Path) -> Option<u32> {
+        std::fs::read_to_string(path).ok()?.lines().nth(1)?.parse().ok()
+    }
+
+    /// A lock left by a run that has ended: the file is there, and the operating system's lock on it
+    /// is free, which is exactly what a process exit leaves behind. The handle closes, the lock goes
+    /// with it, and the file stays.
+    fn leave_a_dead_owner_lock(path: &Path) {
+        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(path).expect("a launch lock can be left behind");
+        file.write_all(b"the nonce of a run that died partway through starting\n424242\n").expect("the lock can say who wrote it");
+        file.try_lock().expect("the run that wrote the lock holds it");
+        drop(file);
     }
 
     /// A folder of the test's own for one launch lock.

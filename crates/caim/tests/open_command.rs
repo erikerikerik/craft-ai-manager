@@ -64,7 +64,18 @@ fn open_does_not_start_a_second_manager_while_the_first_is_busy() {
     let value: serde_json::Value = serde_json::from_str(&text).expect("the endpoint file is JSON");
     assert_eq!(value.get("port").and_then(serde_json::Value::as_u64), Some(u64::from(server.port())), "the busy manager's file was not replaced");
     drop(holder);
-    assert_eq!(server.get("/v1/health").status, 200, "the same manager answers again once a slot frees");
+    // `accept_loop` (crates/caim/src/server.rs:387) prunes a finished connection when its poll next
+    // runs, so the slot frees a moment after the drop rather than at it. The msrv job caught this
+    // test asking in the very next statement. Wait for the slot, bounded.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let health = loop {
+        let health = server.get("/v1/health");
+        if health.status == 200 || Instant::now() >= deadline {
+            break health;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(health.status, 200, "the same manager answers again once a slot frees");
     let _ = server.shutdown();
 }
 
@@ -252,6 +263,50 @@ fn open_fails_loudly_when_it_cannot_make_its_launch_lock() {
     assert!(!out.contains("being started by another"), "and it does not blame another run: {out}");
     assert!(!err.is_empty(), "it says what went wrong: {err}");
     assert!(!endpoint.exists(), "and no endpoint file was written");
+    let _ = std::fs::remove_dir_all(&folder);
+}
+
+#[test]
+fn open_starts_a_manager_at_once_when_a_dead_run_left_the_launch_lock_behind() {
+    // A `caim open` that was killed between taking the launch lock and starting a server leaves the
+    // file behind. Its owner has ended, and the operating system released the lock when it did, so
+    // the next run takes the lock over and starts a manager straight away: it does not wait for a
+    // window to pass, and it does not print the sentence that promises a manager somebody else is
+    // starting.
+    let folder = std::env::temp_dir().join(format!("caim-it-{}-open-dead-lock", std::process::id()));
+    let _ = std::fs::remove_dir_all(&folder);
+    std::fs::create_dir_all(&folder).expect("a folder for the endpoint file");
+    let endpoint = folder.join("endpoint.json");
+    let lock = craft_ai_manager::endpoint::launch_lock_path_for(&endpoint);
+    {
+        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&lock).expect("a launch lock can be left behind");
+        file.write_all(b"the nonce of a run that died partway through starting\n424242\n").expect("the lock can say who wrote it");
+        file.try_lock().expect("the run that wrote the lock holds it");
+    } // the handle closes here: the lock goes with it and the file stays, as an exit leaves it
+    let store = support::empty_store("open-dead-lock");
+    let mut child = open_run(&endpoint, &store);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let (port, token) = loop {
+        let text = std::fs::read_to_string(&endpoint).unwrap_or_default();
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+            let published = value.get("port").and_then(serde_json::Value::as_u64).and_then(|number| u16::try_from(number).ok());
+            let found = value.get("token").and_then(serde_json::Value::as_str).map(str::to_string);
+            if let (Some(published), Some(found)) = (published, found) {
+                break (published, found);
+            }
+        }
+        assert!(Instant::now() < deadline, "a launch lock left by a run that has ended stopped a manager from starting");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let request = format!("GET /v1/health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n");
+    let health = support::talk(port, request.as_bytes());
+    // Stop the manager before asserting, so a failing assert cannot leave one running.
+    let _ = child.kill();
+    child.wait().expect("the manager stopped");
+    let (out, _err) = read_output(&mut child);
+    assert_eq!(health.status, 200, "a real manager started, on the port it published");
+    assert!(!out.contains("being started by another"), "and it never waited for another run: {out}");
+    assert!(!lock.exists(), "and the leftover launch lock is gone once a manager is listening");
     let _ = std::fs::remove_dir_all(&folder);
 }
 
