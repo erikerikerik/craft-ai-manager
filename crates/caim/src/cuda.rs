@@ -17,7 +17,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -44,19 +44,26 @@ pub const PROBE_ARGS: [&str; 2] = ["--query-gpu=name,memory.free,memory.total", 
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// How often to check on the probe while it runs.
 pub const PROBE_POLL: Duration = Duration::from_millis(50);
-/// The word that marks one graph node as placed on the CUDA provider in ONNX Runtime's own profile.
-pub const CUDA_NODE_MARK: &str = "CUDA Execution Provider";
+/// The name ONNX Runtime puts in the `provider` field of a node event when that node ran on the card.
+/// It is the runtime's own identifier for the provider, with no spaces in it. The independent review
+/// of the first draft caught a spaced spelling here: it matches nothing in any profile, so every CUDA
+/// job would have been read as a CPU job and retried on the CPU. [the_mark_is_the_runtimes_own_name]
+/// pins it to the string `ort` hands ONNX Runtime when it registers the provider, so the two cannot
+/// drift apart.
+pub const CUDA_NODE_MARK: &str = "CUDAExecutionProvider";
 
 /// Is this a platform CAIM has CUDA libraries pinned for? The four archives below are NVIDIA's
 /// `windows-x86_64` redist set and nothing else: MG-11's CUDA path is the Windows 4090 PC, and a
-/// download list is not something to widen by accident. Off Windows there is nothing pinned, so
-/// [components] is empty, [is_ready] can never be true, and a user is told the platform is not
-/// covered rather than being pointed at a command that would fetch `.dll` files this machine cannot
-/// load. The NVIDIA index does carry `linux-x86_64` entries; pinning them is its own task with its
-/// own evidence, not a side effect of a CI run.
+/// download list is not something to widen by accident. Off Windows, and on a Windows that is not
+/// x86_64, nothing is pinned, so [components] is empty, [is_ready] can never be true, and a user is
+/// told the platform is not covered rather than being pointed at a command that would fetch 1.9 GB of
+/// libraries this machine cannot load - the review of the first draft named the 32-bit and ARM64
+/// cases, where every pinned archive is the wrong shape for the process. The NVIDIA index does carry
+/// `linux-x86_64` entries; pinning them is its own task with its own evidence, not a side effect of
+/// a CI run.
 #[must_use]
 pub fn supported_here() -> bool {
-    cfg!(windows)
+    cfg!(all(target_os = "windows", target_arch = "x86_64"))
 }
 
 /// The sentence for the case above, shared by the resolver's note and `caim cuda status`.
@@ -318,6 +325,10 @@ pub fn status_lines() -> Result<Vec<String>> {
 /// One card the probe found.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Card {
+    /// Which card this is in the probe's own order, counting from 0. `nvidia-smi` lists cards in the
+    /// order the CUDA runtime numbers them, so this is the id ONNX Runtime's provider has to be told
+    /// to use - see [chosen_card].
+    pub index: i32,
     /// The vendor's own words, which is what amendment 18 wants in `device_name`.
     pub name: String,
     /// Free memory *now*, in MiB - never the card's total.
@@ -387,21 +398,49 @@ fn parse_cards(text: &str) -> Vec<Card> {
         if name.is_empty() {
             continue;
         }
-        found.push(Card { name, free_mib: free, total_mib: total });
+        found.push(Card { index: i32::try_from(found.len()).unwrap_or(i32::MAX), name, free_mib: free, total_mib: total });
     }
     found
 }
 
+/// Which card the probe chose for the job it was asked about, in ONNX Runtime's numbering, or
+/// [NO_CARD] when it chose none. [accelerators] writes it while resolving a job and [register] reads
+/// it when that job's session is built, which is what keeps a machine with two cards from being
+/// measured on one and run on the other - the review of the first draft found that mismatch, because
+/// ONNX Runtime's provider defaults to device 0 whatever the probe picked. One job at a time holds
+/// the card ([job_gate]), so there is nothing to race.
+static CHOSEN_CARD: AtomicI32 = AtomicI32::new(NO_CARD);
+/// The value that means "the probe chose no card", in which case [register] leaves ONNX Runtime's own
+/// default alone.
+const NO_CARD: i32 = -1;
+
+/// The card a CUDA session for this job has to use, when the probe named one.
+#[must_use]
+fn chosen_card() -> Option<i32> {
+    let index = CHOSEN_CARD.load(Ordering::Relaxed);
+    (index != NO_CARD).then_some(index)
+}
+
 /// What the machine has, in the words [crate::device] asks for. The resolver calls this once per job
-/// that could want CUDA; it is the only place the vendor's tool runs for a job.
+/// that could want CUDA; it is the only place the vendor's tool runs for a job. The card with the
+/// most free memory wins, and choosing it is also what [register] later binds the provider to.
 #[must_use]
 pub fn accelerators() -> Vec<device::Accelerator> {
     let Some(card) = cards().into_iter().max_by_key(|card| card.free_mib) else {
+        CHOSEN_CARD.store(NO_CARD, Ordering::Relaxed);
         return Vec::new();
     };
+    CHOSEN_CARD.store(card.index, Ordering::Relaxed);
     let ready = store_root().is_some_and(|root| is_ready(&root));
     let why_not = if supported_here() { "the CUDA libraries are not installed: run caim cuda install --accept-note".to_string() } else { unpinned_sentence() };
-    vec![device::Accelerator { device: device::Device::Cuda, name: card.name, free_mib: Some(card.free_mib), ready, note: (!ready).then_some(why_not) }]
+    vec![device::Accelerator {
+        device: device::Device::Cuda,
+        name: card.name,
+        free_mib: Some(card.free_mib),
+        ready,
+        resident: false,
+        note: (!ready).then_some(why_not),
+    }]
 }
 
 /// One preload per folder per process. ONNX Runtime's own loader leaks the libraries by design -
@@ -503,12 +542,19 @@ impl Placement {
                 "Craft AI Manager could not read the ONNX Runtime profile at {named}, so it cannot tell whether this model used the card."
             ));
         };
-        let nodes = text.matches(CUDA_NODE_MARK).count();
+        let nodes = placed_nodes(&text);
         if nodes == 0 {
             return Verdict::NotPlaced(format!("ONNX Runtime ran this model without the card: the profile at {named} names no {CUDA_NODE_MARK} node."));
         }
         Verdict::Placed { nodes }
     }
+}
+
+/// How many node events in a profile ran on the card. Split out of [Placement::verdict] so the
+/// counting has a test: the profile itself only exists on a machine that has run a CUDA session.
+#[must_use]
+fn placed_nodes(profile: &str) -> usize {
+    profile.matches(CUDA_NODE_MARK).count()
 }
 
 /// Did the nodes land on the card?
@@ -525,11 +571,16 @@ pub enum Verdict {
 ///
 /// The CPU provider stays underneath it, which is how ONNX Runtime itself handles an operator with
 /// no CUDA kernel. *Whether* to ask is the resolver's decision ([crate::device]); this is the half
-/// that knows the vendor's name for the thing.
+/// that knows the vendor's name for the thing - and its number for it, so a machine with more than
+/// one card runs on the one the resolver measured ([chosen_card]) rather than on device 0.
 pub fn register(
     builder: ort::session::builder::SessionBuilder,
 ) -> std::result::Result<ort::session::builder::SessionBuilder, Box<ort::Error<ort::session::builder::SessionBuilder>>> {
-    builder.with_execution_providers([ort::ep::CUDA::default().build()]).map_err(Box::new)
+    let mut provider = ort::ep::CUDA::default();
+    if let Some(index) = chosen_card() {
+        provider = provider.with_device_id(index);
+    }
+    builder.with_execution_providers([provider.build()]).map_err(Box::new)
 }
 
 // The archives
@@ -985,5 +1036,36 @@ mod tests {
         let second = placement(device::Device::Cuda).expect("every CUDA session is");
         assert_ne!(first.prefix(), second.prefix(), "two sessions never share a profile file");
         assert_eq!(placement(device::Device::Cpu), None, "a CPU session has nothing to read back");
+    }
+
+    /// The mark has to be the runtime's own identifier. A spaced spelling matches nothing in any
+    /// profile, and a profile that names no CUDA node is read as "the card did none of this".
+    #[test]
+    fn the_mark_is_the_runtimes_own_name() {
+        assert_eq!(CUDA_NODE_MARK, <ort::ep::CUDA as ort::ep::ExecutionProvider>::NAME, "CAIM counts the provider `ort` registers");
+        assert!(!CUDA_NODE_MARK.contains(' '), "ONNX Runtime's provider identifiers have no spaces");
+    }
+
+    #[test]
+    fn a_profile_counts_the_nodes_that_ran_on_the_card() {
+        let card = r#"{"name":"Conv_1","cat":"NodeKernel","args":{"provider":"CUDAExecutionProvider"}} {"name":"Add_1","cat":"NodeKernel","args":{"provider":"CUDAExecutionProvider"}}"#;
+        assert_eq!(placed_nodes(card), 2, "two node events on the card");
+        let cpu = r#"{"name":"Conv_1","cat":"NodeKernel","args":{"provider":"CPUExecutionProvider"}}"#;
+        assert_eq!(placed_nodes(cpu), 0, "which is the whole point: a CPU profile names no CUDA node");
+    }
+
+    #[test]
+    fn the_probe_lists_cards_in_the_order_the_runtime_numbers_them() {
+        let found = parse_cards("NVIDIA GeForce RTX 4090, 991, 24564\nNVIDIA GeForce RTX 3060, 11234, 12288\n");
+        assert_eq!(
+            found.iter().map(|card| card.index).collect::<Vec<_>>(),
+            vec![0, 1],
+            "the first line is device 0, which is what ONNX Runtime uses when nobody tells it otherwise"
+        );
+        assert_eq!(
+            found.iter().max_by_key(|card| card.free_mib).map(|card| card.index),
+            Some(1),
+            "and the card the resolver picks is the other one, which is why [register] has to say which"
+        );
     }
 }

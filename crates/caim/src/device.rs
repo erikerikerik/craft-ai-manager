@@ -183,6 +183,13 @@ pub struct Accelerator {
     pub free_mib: Option<u64>,
     /// Are the libraries that provider needs installed?
     pub ready: bool,
+    /// Does the pipeline that is about to run this job already keep this model's session on this
+    /// accelerator? A probe cannot know, so [crate::cuda] always says no; [crate::job] sets it from
+    /// the pipeline that owns the session. It matters because the free memory above was measured
+    /// *after* that session allocated its model: charging those same bytes again would send the next
+    /// job to the CPU and throw away the warm session the chain exists to keep, which is what the
+    /// independent review of the first draft found.
+    pub resident: bool,
     /// What to tell a human when `ready` is false.
     pub note: Option<String>,
 }
@@ -212,6 +219,15 @@ impl Machine {
     #[must_use]
     pub fn accelerator(&self, device: Device) -> Option<&Accelerator> {
         self.accelerators.iter().find(|accelerator| accelerator.device == device)
+    }
+
+    /// Record that the pipeline about to run this job already holds its session for `device`, so the
+    /// resolver must not charge that memory a second time. The queue knows which pipeline is running;
+    /// the probe cannot.
+    pub fn mark_resident(&mut self, device: Device, resident: bool) {
+        if let Some(accelerator) = self.accelerators.iter_mut().find(|accelerator| accelerator.device == device) {
+            accelerator.resident = resident;
+        }
     }
 }
 
@@ -339,8 +355,13 @@ impl Resolver {
         }
         // Amendment 18: free memory measured now, never the card's total. PhotoCraft holds VRAM of
         // its own (upstream #5234, #5973), so the whole card is never ours.
+        //
+        // A pipeline that already keeps this model's session on the card is the exception the probe
+        // cannot see: the free memory it measured is what is left over that session, and reusing it
+        // allocates nothing new. Charging it twice would fall back to the CPU on every job after the
+        // first, so the gate only applies to a model that still has to be loaded.
         let free = card.free_mib.unwrap_or(0);
-        if free < manifest.memory_mib {
+        if !card.resident && free < manifest.memory_mib {
             return blocked(
                 Reason::InsufficientMemory,
                 format!(
@@ -513,6 +534,7 @@ mod tests {
                 name: CARD.to_string(),
                 free_mib,
                 ready,
+                resident: false,
                 note: (!ready).then(|| "run caim cuda install".to_string()),
             }],
         }
@@ -659,6 +681,22 @@ mod tests {
             Resolver::new(Setting::Cuda).resolve("subject_mask", &manifest(CUDA_SUPPORTED, 6_600), &machine(Some(6_600), true)).chain,
             vec![Device::Cuda, Device::Cpu]
         );
+    }
+
+    #[test]
+    fn a_model_already_sitting_on_the_card_is_not_charged_twice() {
+        // The 4090 after one CUDA job: 991 MiB free is what is left over the session this pipeline is
+        // holding, and the next job for that same model reuses it rather than loading a second copy.
+        let mut held = machine(Some(991), true);
+        held.mark_resident(Device::Cuda, true);
+        assert_eq!(Resolver::new(Setting::Cuda).resolve("subject_mask", &manifest(CUDA_SUPPORTED, 6_600), &held).chain, vec![Device::Cuda, Device::Cpu]);
+        // A model the pipeline has not loaded yet still has to fit in what is actually free.
+        assert_eq!(Resolver::new(Setting::Cuda).resolve("subject_mask", &manifest(CUDA_SUPPORTED, 6_600), &machine(Some(991), true)).chain, vec![Device::Cpu]);
+        // Only the accelerator the session sits on is excused; marking a device the machine does not
+        // have changes nothing.
+        let mut other = machine(Some(991), true);
+        other.mark_resident(Device::Cpu, true);
+        assert_eq!(Resolver::new(Setting::Cuda).resolve("subject_mask", &manifest(CUDA_SUPPORTED, 6_600), &other).reason, Some(Reason::InsufficientMemory));
     }
 
     #[test]

@@ -642,6 +642,13 @@ impl Pipeline {
         self.identity.as_ref().map(Identity::manifest)
     }
 
+    /// Does this pipeline already keep its session on the card? The queue asks before resolving the
+    /// next job, so the resolver does not charge the memory that session is holding a second time.
+    #[must_use]
+    pub fn holds_card_session(&self) -> bool {
+        self.session.lock().is_ok_and(|guard| guard.as_ref().is_some_and(|(device, _)| *device == Device::Cuda))
+    }
+
     /// A finished fill from this pipeline, with amendment 18's account of what ran.
     ///
     /// `decision` is what was asked for and what the resolver made of it; `ran_on` is the device that
