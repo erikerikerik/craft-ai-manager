@@ -79,8 +79,17 @@ impl Offered {
     /// "nothing is installed" without touching the model folder on the machine.
     #[must_use]
     pub fn from_store(root: Option<&Path>) -> Self {
-        let Some(root) = root.map(PathBuf::from).or_else(store::models_dir) else {
-            return Self::default();
+        Self::from_root(root.map(PathBuf::from).or_else(store::models_dir))
+    }
+
+    /// The same with the store folder handed over rather than read, so a test can say "this machine
+    /// has no data directory at all" without changing the environment of a running process. `None`
+    /// still lists the catalog, with nothing ready: amendment 18 wants a client to be able to grey a
+    /// feature out, and an empty list reads as a feature that does not exist.
+    #[must_use]
+    pub fn from_root(root: Option<PathBuf>) -> Self {
+        let Some(root) = root else {
+            return Self::build(|_| false, |model| model.id.clone());
         };
         Self::build(|model| store::is_installed(&root, model) && store::is_acknowledged(&root, model), |model| model.id.clone())
     }
@@ -195,9 +204,23 @@ mod tests {
     }
 
     #[test]
-    fn no_store_folder_at_all_offers_nothing() {
-        // `store::models_dir()` answers None when the platform path cannot be worked out.
-        assert!(Offered::from_store(Some(std::path::Path::new("/definitely/not/here"))).entries().iter().all(|entry| !entry.ready));
+    fn no_store_folder_at_all_still_lists_the_tasks() {
+        let offered = Offered::from_store(Some(std::path::Path::new("/definitely/not/here")));
+        assert_eq!(offered.entries().len(), 2, "a folder that is not there is an empty store, not a missing feature");
+        assert!(offered.entries().iter().all(|entry| !entry.ready));
+    }
+
+    #[test]
+    fn a_machine_with_no_data_directory_still_lists_the_tasks() {
+        // What `store::models_dir()` answers when the platform path cannot be worked out: no
+        // `HOME`, no `XDG_DATA_HOME`, no `LOCALAPPDATA`. The tasks are still offered, so a job for
+        // Select Subject gets the not-ready sentence rather than the unknown-task one.
+        let offered = Offered::from_root(None);
+        assert_eq!(offered.entries().len(), 2, "{:?}", offered.entries());
+        assert!(offered.entries().iter().all(|entry| !entry.ready), "{:?}", offered.entries());
+        assert!(!offered.any_ready());
+        assert!(offered.get(TASK_MASK).is_some(), "Select Subject is still a task this manager knows");
+        assert_eq!(offered.model_for(TASK_MASK).expect("the catalog still names the model").id, "birefnet-lite");
     }
 
     #[test]

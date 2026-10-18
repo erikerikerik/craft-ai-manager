@@ -36,6 +36,11 @@ use crate::store;
 
 /// The size BiRefNet takes, in pixels, on a side. Fixed by the graph, not by us.
 pub const MODEL_SIZE: usize = 1024;
+/// The largest side [preprocess_to] will build. The model wants [MODEL_SIZE]; the headroom is for a
+/// caller that wants the same normalised planes at its own size. `size` is public API, so it is
+/// bounded before it decides an allocation: `3 * size * size` f32 is 50 MB at 2048, and past the
+/// point where that length wraps it is an abort rather than an error a caller can catch.
+pub const MAX_PREPROCESS_SIDE: usize = 2048;
 /// The catalog id of the model this runner can run.
 pub const BIREFNET_ID: &str = "birefnet-lite";
 /// What `/result` reports when a job ran here.
@@ -77,16 +82,29 @@ pub fn preprocess(image: &Frame) -> Vec<f32> {
 /// The image stretched to `size` by `size` and normalised the way RS-01 verified: bilinear, aspect
 /// ratio not kept, RGB, /255, ImageNet mean and std, NCHW planar. Alpha never reaches the model -
 /// BiRefNet takes three planes, and the matte it answers is about the subject, not the layer.
+///
+/// A `size` outside `1..=MAX_PREPROCESS_SIDE` answers empty rather than allocating, because a public
+/// function must not let its caller choose the size of the allocation.
 #[must_use]
 pub fn preprocess_to(image: &Frame, size: usize) -> Vec<f32> {
     let (Ok(width), Ok(height)) = (usize::try_from(image.width), usize::try_from(image.height)) else {
         return Vec::new();
     };
     let max = f64::from(image.max_sample()).max(1.0);
-    let plane_size = size.saturating_mul(size);
-    let mut out = vec![0.0f32; 3 * plane_size];
+    if size == 0 || size > MAX_PREPROCESS_SIDE {
+        return Vec::new();
+    }
+    // Every length here is derived from what the caller sent, so every one is checked: a wrapped
+    // allocation length is an abort in a release build, which no caller can catch.
+    let (Some(source_len), Some(plane_size)) = (width.checked_mul(height), size.checked_mul(size)) else {
+        return Vec::new();
+    };
+    let Some(out_len) = plane_size.checked_mul(MEAN.len()) else {
+        return Vec::new();
+    };
+    let mut out = vec![0.0f32; out_len];
     for (channel, (mean, std)) in MEAN.iter().zip(STD.iter()).enumerate() {
-        let mut plane = vec![0.0f32; width.saturating_mul(height)];
+        let mut plane = vec![0.0f32; source_len];
         for row in 0..height {
             for column in 0..width {
                 let at = row.saturating_mul(width).saturating_add(column).saturating_mul(image.channels).saturating_add(channel);
@@ -112,12 +130,32 @@ fn copy_plane(plane: &[f32], out: &mut [f32], start: usize) {
     }
 }
 
-/// The two source samples and weights each pixel of a resized axis is made of: half-pixel centres,
-/// edges clamped rather than wrapped, weights that add up to one. The same rule
-/// [lama::axis_weights] uses when an axis grows - which is all BiRefNet ever wants, because the
-/// official transforms bilinear-sample in both directions instead of averaging a shrink.
+/// The samples and weights each pixel of a resized axis is made of: half-pixel centres, edges
+/// clamped rather than wrapped, weights that add up to one.
+///
+/// On an axis that shrinks the tent widens to cover every source sample the destination pixel spans,
+/// which is what PIL `BILINEAR` does and what the preprocessing contract in
+/// `agents/models/birefnet.md` records. A shrink is not hypothetical: the mask task's cap of
+/// 1,048,576 pixels admits a 4096x256 image, so a 4096-wide axis comes down to 1024. Two taps there
+/// would alias high detail straight into the model input. On an axis that grows the rule is the same
+/// two samples [lama::axis_weights] uses.
 #[must_use]
 pub fn axis_weights(source: usize, target: usize) -> Vec<Vec<(usize, f64)>> {
+    axis_taps(source, target, true)
+}
+
+/// [axis_weights] with the tent never widened: always the two samples around the destination centre.
+/// [matte] keeps these because the committed fixtures were made that way, as
+/// `tests/fixtures/SOURCE.md` records, so the golden test still measures CAIM's runner against the
+/// independent Python run rather than against a different resampler.
+#[must_use]
+pub fn axis_weights_two_tap(source: usize, target: usize) -> Vec<Vec<(usize, f64)>> {
+    axis_taps(source, target, false)
+}
+
+/// The taps for one axis. `widened` is the antialiased rule; the tent's half-width is one source
+/// sample when an axis grows and the reduction factor when it shrinks, which is PIL's rule too.
+fn axis_taps(source: usize, target: usize, widened: bool) -> Vec<Vec<(usize, f64)>> {
     if target == 0 {
         return Vec::new();
     }
@@ -126,30 +164,53 @@ pub fn axis_weights(source: usize, target: usize) -> Vec<Vec<(usize, f64)>> {
     }
     let scale = f64::from(u32::try_from(source).unwrap_or(u32::MAX)) / f64::from(u32::try_from(target).unwrap_or(u32::MAX));
     let last = f64::from(u32::try_from(source - 1).unwrap_or(u32::MAX));
+    let radius = if widened { scale.max(1.0) } else { 1.0 };
     (0..target)
         .map(|index| {
             let centre = ((f64::from(u32::try_from(index).unwrap_or(u32::MAX)) + 0.5) * scale - 0.5).clamp(0.0, last);
-            let before = centre.floor() as usize;
-            let after = before.saturating_add(1).min(source - 1);
-            let fraction = centre - f64::from(u32::try_from(before).unwrap_or(u32::MAX));
-            if before == after { vec![(before, 1.0)] } else { vec![(before, 1.0 - fraction), (after, fraction)] }
+            let from = (centre - radius).ceil().clamp(0.0, last) as usize;
+            let to = (centre + radius).floor().clamp(0.0, last) as usize;
+            let taps: Vec<(usize, f64)> = (from..=to)
+                .filter_map(|at| {
+                    let distance = (centre - f64::from(u32::try_from(at).unwrap_or(u32::MAX))).abs();
+                    (distance < radius).then_some((at, 1.0 - distance / radius))
+                })
+                .collect();
+            let total: f64 = taps.iter().map(|(_, weight)| *weight).sum();
+            if taps.is_empty() || total <= 0.0 {
+                // Only an edge can leave a destination pixel with nothing to sample; the nearest
+                // source sample then carries it on its own.
+                return vec![(centre.round() as usize, 1.0)];
+            }
+            taps.into_iter().map(|(at, weight)| (at, weight / total)).collect()
         })
         .collect()
 }
 
-/// Resize one channel plane, row-major, bilinearly on both axes.
+/// Resize one channel plane, row-major, bilinearly on both axes, widening the filter on an axis that
+/// shrinks ([axis_weights]).
 #[must_use]
 pub fn resize_bilinear(plane: &[f32], width: usize, height: usize, target_width: usize, target_height: usize) -> Vec<f32> {
+    resize_plane(plane, width, height, target_width, target_height, true)
+}
+
+/// [resize_bilinear] with the two-tap rule on both axes ([axis_weights_two_tap]).
+#[must_use]
+pub fn resize_two_tap(plane: &[f32], width: usize, height: usize, target_width: usize, target_height: usize) -> Vec<f32> {
+    resize_plane(plane, width, height, target_width, target_height, false)
+}
+
+fn resize_plane(plane: &[f32], width: usize, height: usize, target_width: usize, target_height: usize, widened: bool) -> Vec<f32> {
     if target_width == 0 || target_height == 0 {
         return Vec::new();
     }
-    let across = resample_across(plane, height, width, target_width);
-    resample_down(&across, height, target_width, target_height)
+    let across = resample_across(plane, height, width, target_width, widened);
+    resample_down(&across, height, target_width, target_height, widened)
 }
 
 /// Resample every row of a plane from `width` to `target_width` samples.
-fn resample_across(plane: &[f32], rows: usize, width: usize, target_width: usize) -> Vec<f32> {
-    let weights = axis_weights(width, target_width);
+fn resample_across(plane: &[f32], rows: usize, width: usize, target_width: usize, widened: bool) -> Vec<f32> {
+    let weights = axis_taps(width, target_width, widened);
     let mut out = vec![0.0f32; rows.saturating_mul(target_width)];
     for row in 0..rows {
         let Some(row_start) = row.checked_mul(width) else { continue };
@@ -170,8 +231,8 @@ fn resample_across(plane: &[f32], rows: usize, width: usize, target_width: usize
 
 /// Resample a plane from `rows` rows to `target_rows`; the plane already has `target_width` samples
 /// a row.
-fn resample_down(plane: &[f32], rows: usize, target_width: usize, target_rows: usize) -> Vec<f32> {
-    let weights = axis_weights(rows, target_rows);
+fn resample_down(plane: &[f32], rows: usize, target_width: usize, target_rows: usize, widened: bool) -> Vec<f32> {
+    let weights = axis_taps(rows, target_rows, widened);
     let mut out = vec![0.0f32; target_rows.saturating_mul(target_width)];
     for (target_index, taps) in weights.iter().enumerate() {
         let Some(target_start) = target_index.checked_mul(target_width) else { continue };
@@ -200,10 +261,14 @@ pub fn sigmoid(logit: f32) -> f32 {
 /// `sigmoid(logit) * 255`, rounded, at 1024x1024 first and then resized back - which is what RS-01
 /// measured with, and what keeps the soft edge: amendment 18 says the values between 0 and 255 *are*
 /// the feature (the hair, the anti-aliased boundary), so nothing is thresholded here.
+///
+/// The resize back is the two-tap one, not the antialiased one the model input gets: the committed
+/// fixtures were made by a Python run that used two taps here (`tests/fixtures/SOURCE.md`), and the
+/// golden test is the check against that run.
 #[must_use]
 pub fn matte(output: &[f32], width: usize, height: usize) -> Vec<u16> {
     let quantised: Vec<f32> = output.iter().map(|logit| (sigmoid(*logit) * 255.0).clamp(0.0, 255.0).round()).collect();
-    let resized = resize_bilinear(&quantised, MODEL_SIZE, MODEL_SIZE, width, height);
+    let resized = resize_two_tap(&quantised, MODEL_SIZE, MODEL_SIZE, width, height);
     resized.iter().map(|sample| u16::try_from(sample.round().clamp(0.0, 255.0) as i64).unwrap_or(0)).collect()
 }
 
@@ -498,9 +563,9 @@ pub(crate) fn stand_in_pipeline(
 #[cfg(test)]
 mod tests {
     use super::{
-        BIREFNET_DEVICE, BIREFNET_ID, BIREFNET_MODEL, BIREFNET_PROVIDER, Identity, LOAD_PROGRESS, Loader, MODEL_SIZE, MSG_FINISH, MSG_LOAD, MSG_PREPARE,
-        MSG_RUN, PREPARE_PROGRESS, Pipeline, RUN_END, RUN_PROGRESS, StandIn, axis_weights, installed_pipeline, matte, preprocess_to, resize_bilinear, sigmoid,
-        stand_in_pipeline,
+        BIREFNET_DEVICE, BIREFNET_ID, BIREFNET_MODEL, BIREFNET_PROVIDER, Identity, LOAD_PROGRESS, Loader, MAX_PREPROCESS_SIDE, MODEL_SIZE, MSG_FINISH,
+        MSG_LOAD, MSG_PREPARE, MSG_RUN, PREPARE_PROGRESS, Pipeline, RUN_END, RUN_PROGRESS, StandIn, axis_weights, axis_weights_two_tap, installed_pipeline,
+        matte, preprocess_to, resize_bilinear, resize_two_tap, sigmoid, stand_in_pipeline,
     };
     use crate::catalog::Model;
     use crate::error::Status;
@@ -564,7 +629,8 @@ mod tests {
 
     #[test]
     fn the_axis_weights_add_up_to_one_and_stay_inside_the_source() {
-        for (source, target) in [(1usize, 1usize), (3, 7), (7, 3), (1024, 1024), (4, 1), (1024, 2)] {
+        // (4096, 1024) is the shrink a 4096x256 job sends, which is inside the mask task's cap.
+        for (source, target) in [(1usize, 1usize), (3, 7), (7, 3), (1024, 1024), (4, 1), (1024, 2), (4096, 1024)] {
             let weights = axis_weights(source, target);
             assert_eq!(weights.len(), target, "{source} -> {target}");
             for taps in &weights {
@@ -575,6 +641,35 @@ mod tests {
         }
         assert!(axis_weights(4, 0).is_empty());
         assert!(axis_weights(0, 3).iter().all(Vec::is_empty), "nothing to sample from");
+    }
+
+    #[test]
+    fn a_shrunk_axis_widens_the_tent_and_a_grown_one_does_not() {
+        // 8 -> 4: an interior destination pixel covers four source samples, 1:3:3:1 over 8. Two taps
+        // would read half the row and throw the rest away.
+        assert_eq!(axis_weights(8, 4)[1], vec![(1, 0.125), (2, 0.375), (3, 0.375), (4, 0.125)]);
+        assert_eq!(axis_weights_two_tap(8, 4)[1], vec![(2, 0.5), (3, 0.5)], "the matte path keeps the narrow rule the fixtures were made with");
+        // Growing is the same rule either way, so both fixtures - smaller than 1024 on every axis -
+        // preprocess exactly as RS-01 measured.
+        assert_eq!(axis_weights(3, 7), axis_weights_two_tap(3, 7));
+    }
+
+    #[test]
+    fn a_shrink_spreads_a_narrow_feature_instead_of_choosing_one_side_of_it() {
+        // One bright sample in a dark row, shrunk 8 -> 4. The widened tent covers both destination
+        // pixels it touches; two taps land on one of them and lose the rest, which is the aliasing
+        // that would reach the model.
+        let plane: Vec<f32> = (0..8).map(|at| if at == 3 { 1.0 } else { 0.0 }).collect();
+        assert_eq!(resize_bilinear(&plane, 8, 1, 4, 1), vec![0.0, 0.375, 0.125, 0.0]);
+        assert_eq!(resize_two_tap(&plane, 8, 1, 4, 1), vec![0.0, 0.5, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn the_public_preprocess_bounds_the_size_before_allocating_it() {
+        let frame = flat(3, 4, 4, 128);
+        assert!(preprocess_to(&frame, 0).is_empty(), "nothing to build");
+        assert!(preprocess_to(&frame, MAX_PREPROCESS_SIDE + 1).is_empty(), "a caller must not get to choose the allocation");
+        assert_eq!(preprocess_to(&frame, MODEL_SIZE).len(), 3 * MODEL_SIZE * MODEL_SIZE, "the model's own size is inside the bound");
     }
 
     #[test]
