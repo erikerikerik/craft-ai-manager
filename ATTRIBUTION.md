@@ -18,7 +18,7 @@ the same maths as MG-10 before we wrote ours, and both were read before and duri
 | PR | What it does | What we took |
 |---|---|---|
 | [#2995](https://github.com/erikerikerik/photocraft/pull/2995) | Select Subject "High quality": BiRefNet-lite through `tract`, in a new `photocraft-ml` crate. | The checkpoint choice and its pin (`onnx-community/BiRefNet_lite-ONNX`, `onnx/model.onnx`), and an independent confirmation of the SHA-256 RS-01 measured. |
-| [#4812](https://github.com/erikerikerik/photocraft/pull/4812) | Remove Background through ONNX Runtime, with OpenVINO, DirectML and CPU fallback. | The preprocessing contract (bilinear stretch to 1024x1024, RGB, /255, ImageNet mean and std, NCHW) and the finding that this graph's logits collapse on the DirectML execution provider - which is why `crates/caim/catalog/models.toml` marks `cuda` and `coreml` `untested` and only `cpu` `supported`. |
+| [#4812](https://github.com/erikerikerik/photocraft/pull/4812) | Remove Background through ONNX Runtime, with OpenVINO, DirectML and CPU fallback. | The preprocessing contract (bilinear stretch to 1024x1024, RGB, /255, ImageNet mean and std, NCHW) and the finding that this graph's logits collapse on the DirectML execution provider - which is why `crates/caim/catalog/models.toml` marks `cuda` and `coreml` `untested` and only `cpu` `supported`. MG-11 also read its execution-provider fallback chain as a reference; CAIM's resolver follows amendment 18 instead, and nothing is taken from that PR. |
 
 Neither PR has merged upstream, and neither is a dependency of this repo: nothing is `use`d from
 them. What we took is the arithmetic and the facts about the graph, written here and named again in
@@ -50,12 +50,41 @@ each carries a signed `[model.override]` from Erik and needs one `--accept-note`
 
 ## Runtime and libraries
 
-- **ONNX Runtime**, prebuilt binaries pulled in by the `ort` / `ort-sys` crates - MIT. CAIM uses the
-  CPU execution provider only, and creates BiRefNet's session with the CPU memory arena switched off
-  (decision D12).
-- Every other crate - `ctrlc`, `getrandom`, `httparse`, `png` (the PNG codec CAIM writes its own
-  framing around), `serde`, `serde_json`, `sha2`, `thiserror`, `toml`, `ureq` - is in the
-  `deny.toml` allow list, and `cargo deny check` fails the build if that changes.
+- **ONNX Runtime**, prebuilt binaries pulled in by the `ort` / `ort-sys` crates - MIT. Since MG-11 that build has the
+  CUDA execution provider compiled in, but CAIM registers CPU and CUDA only, and the NVIDIA libraries a CUDA run needs
+  are a download the user asks for (next section). BiRefNet's session is still created with the CPU memory arena
+  switched off (decision D12).
+- Every other crate - `ctrlc`, `flate2` and `libloading` (both new in MG-11), `getrandom`, `httparse`,
+  `png` (the PNG codec CAIM writes its own framing around), `serde`, `serde_json`, `sha2`, `thiserror`,
+  `toml`, `ureq` - is in the `deny.toml` allow list, and `cargo deny check` fails the build if that changes.
+
+## The NVIDIA runtime libraries (MG-11)
+
+CAIM ships no CUDA and no cuDNN, and nothing NVIDIA is linked at build time. A CUDA run needs the NVIDIA DLLs, so
+`caim cuda install --accept-note` downloads four archives pinned by name, version, size and SHA-256 in
+`crates/caim/src/cuda.rs` from NVIDIA's own redist CDN, and unpacks from each archive only the library files CAIM names:
+
+| Archive | Version | Licence |
+|---|---|---|
+| `cuda_cudart` | 13.4.92 | NVIDIA CUDA Toolkit (EULA) |
+| `libcublas` | 13.8.0.4 | NVIDIA CUDA Toolkit (EULA) |
+| `libcufft` | 12.4.0.43 | NVIDIA CUDA Toolkit (EULA) |
+| `cudnn` | 9.27.0.42 (the `cuda13` build) | NVIDIA cuDNN Software License Agreement |
+
+Both are EULAs rather than permissive licences, so they are deliberately outside the `deny.toml` allow list: that list
+weighs the crates CAIM links, not files the user asks for on their own machine. What they do grant is what CAIM does with
+them - NVIDIA's redist pages cover redistributing these components with an application. Because the licence is not
+permissive, nothing is fetched quietly: the command names both agreements and the exact archives and their sizes, and
+downloads only once the user has acknowledged them, which is the same gate MG-02 built for a flagged model's note and the
+same `acknowledged.json` record.
+
+The two crates MG-11 adds are permissive and inside the allow list: `libloading` 0.9.0 (ISC, pulled in by `ort`'s
+`preload-dylibs` feature) and `flate2` 1.1.10 (MIT OR Apache-2.0), which inflates the archive entries CAIM needs.
+
+The CUDA and cuDNN versions are pinned to what the ONNX Runtime build `ort-sys` fetches expects (`cuda13`), not chosen
+freely. The sizes and SHA-256 values above were read from NVIDIA's own index files,
+`https://developer.download.nvidia.com/compute/cuda/redist/redistrib_13.4.3.json` and
+`https://developer.download.nvidia.com/compute/cudnn/redist/redistrib_9.27.0.json`, on 2026-10-18.
 
 ## The photos in the tests
 

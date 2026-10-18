@@ -32,7 +32,7 @@ fn wait_for_lines(path: &Path, expected: usize) -> Vec<Value> {
 }
 
 #[test]
-fn a_finished_job_leaves_one_line_with_the_fields_that_exist_today() {
+fn a_finished_job_leaves_one_line_with_amendment_18s_fields() {
     let server = support::TestServer::fake("activity-done");
     let id = server.submit_id(&support::fill_job(4, 2, 8, 3), &support::sample_image(), &support::sample_mask());
     server.wait_for_state(&id, "done");
@@ -47,9 +47,9 @@ fn a_finished_job_leaves_one_line_with_the_fields_that_exist_today() {
     let time = line.get("time").and_then(Value::as_str).expect("a time");
     assert_eq!(time.len(), 20, "YYYY-MM-DDThh:mm:ssZ: {time}");
     assert!(time.ends_with('Z'), "and the time is UTC: {time}");
-    for field in ["version", "device_requested", "fallback_reason"] {
-        assert!(line.get(field).is_none_or(Value::is_null), "{field} stays null until MG-10 and MG-11 fill it in");
-    }
+    assert_eq!(line.get("device_requested").and_then(Value::as_str), Some("auto"), "MG-11: the log names the device the start was asked to use");
+    assert!(line.get("version").is_none_or(Value::is_null), "the fake backend has no model version, so the log says so");
+    assert!(line.get("fallback_reason").is_none_or(Value::is_null), "nothing fell back, so the log gives no reason");
 }
 
 #[test]

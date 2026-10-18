@@ -8,7 +8,20 @@
 // cargo test --test golden -- --ignored --nocapture
 //
 // They look in CRAFT_AI_MODELS first, then the platform model folder, exactly like `caim serve`.
+//
+// The two `*_on_the_card` tests are MG-11's CUDA half of the same gate. They need the vendor's
+// libraries as well as the models, and they are the evidence amendment 18 wants before a catalog
+// entry may say `cuda = "supported"`:
+//
+// `text
+// caim cuda install --accept-note
+// cargo test --test golden -- --ignored card
+//
+// Run them with nothing else holding the card: a CUDA session needs the model's `memory_mib` free,
+// and a run that cannot start falls back to the CPU, which these tests report as a failure.
 
+use craft_ai_manager::backend::Filled;
+use craft_ai_manager::device::{Decision, Device, Setting};
 use craft_ai_manager::{birefnet, catalog, image, lama, store};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
@@ -31,6 +44,9 @@ const MATTE_TOLERANCE: f64 = 2.0;
 /// The committed fixture is square: 448x448. `lama::dilate` only works on a square plane, so the
 /// photo is a square crop of the original rather than the full landscape.
 const SIDE: u32 = 448;
+/// MG-11: how much of the image the card's matte may disagree with the CPU matte about. Amendment
+/// 18's CUDA gate: within 1/255 on at least 99.5% of the pixels.
+const CARD_DISAGREEMENT_CEILING: f64 = 0.005;
 
 fn fixture(name: &str) -> PathBuf {
     Path::new(FIXTURES).join(name)
@@ -52,7 +68,12 @@ fn lama_takes_the_object_out_and_leaves_the_rest_alone() {
     let mask = image::decode_mask(&mask_bytes, SIDE, SIDE).expect("the fixture mask is 8-bit grayscale");
     let root = store::models_dir().expect("CRAFT_AI_MODELS or the platform model folder");
     let pipeline = lama::ready_pipeline_in(Some(&root)).expect("install LaMa first: caim models install lama --accept-note");
+    // Two runs: the first pays for the session, the second shows the warm time, which is what
+    // amendment 18's timing table asks for.
     let filled = pipeline.run_fill(&frame, &mask, &AtomicBool::new(false), &mut |_, _| {}).expect("the model runs");
+    let warm = pipeline.run_fill(&frame, &mask, &AtomicBool::new(false), &mut |_, _| {}).expect("the session is kept for the next job");
+    assert!(filled.load_ms > 0, "the first job paid for the session: {} ms", filled.load_ms);
+    assert_eq!(warm.load_ms, 0, "the second job reused the session");
 
     // Same size, channels and depth as the image that went in.
     assert_eq!((filled.frame.width, filled.frame.height), (SIDE, SIDE), "the answer is the same size");
@@ -120,7 +141,8 @@ fn lama_takes_the_object_out_and_leaves_the_rest_alone() {
     };
     let (before, after) = (distance(&frame), distance(&filled.frame));
     println!(
-        "{outside} pixels outside the mask are identical; inside, {mean:.3} levels a channel from the committed answer, and the masked area moved from {before:.1} to {after:.1} away from the background colour"
+        "lama on the CPU: session load {} ms, first run {} ms, warm run {} ms; {outside} pixels outside the mask are identical; inside, {mean:.3} levels a channel from the committed answer, and the masked area moved from {before:.1} to {after:.1} away from the background colour",
+        filled.load_ms, filled.run_ms, warm.run_ms
     );
     assert!(after < before, "the masked area moved from {before:.1} to {after:.1} away from the background colour");
 }
@@ -209,4 +231,161 @@ fn birefnet_finds_the_buoy() {
 #[ignore = "needs an installed BiRefNet: caim models install birefnet --accept-note"]
 fn birefnet_finds_the_person_and_keeps_the_hair() {
     mask_golden("person", "input-person.png", "mask-person.png", 768, 512);
+}
+
+/// The decision that forces the card. The catalog keeps `cuda = "untested"` until these two tests
+/// have passed, so the resolver would - correctly - keep such a model off the card. Gathering the
+/// evidence means asking for the card by hand, chain and all: CUDA first, and the CPU behind it so
+/// a card that cannot start the graph still answers rather than failing the job.
+fn card_decision() -> Decision {
+    Decision { requested: Setting::Cuda, chain: vec![Device::Cuda, Device::Cpu], reason: None, device_name: None, note: None }
+}
+
+/// A CUDA run that came back on the CPU is not evidence: say which of amendment 18's reasons it
+/// gave, because that is the sentence that tells Erik what to fix. One helper for both models
+/// because both answers are the same struct.
+fn assert_on_the_card(filled: &Filled, who: &str) {
+    assert_eq!(
+        filled.device,
+        "cuda",
+        "{who}: the card was asked for and the result says it ran on {} (fallback_reason: {}, diagnostics: {})",
+        filled.device,
+        filled.fallback_reason.as_deref().unwrap_or("none"),
+        filled.diagnostics.as_deref().unwrap_or("none")
+    );
+    assert_eq!(filled.device_requested, "cuda", "{who}: the result says what was asked for");
+    assert!(filled.device_name.as_deref().unwrap_or_default().starts_with("NVIDIA"), "{who}: device_name is {:?}", filled.device_name);
+}
+
+#[test]
+#[ignore = "needs an installed LaMa and the CUDA libraries: caim cuda install --accept-note"]
+fn lama_on_the_card() {
+    let input_bytes = std::fs::read(fixture("input.png")).expect("the fixture image is committed");
+    let expected_bytes = std::fs::read(fixture("expected.png")).expect("the committed answer is there");
+    let mask_bytes = std::fs::read(fixture("mask.png")).expect("the fixture mask is committed");
+    let frame = image::decode_image(&input_bytes, SIDE, SIDE, 3, 8).expect("the fixture image is 8-bit RGB");
+    let mask = image::decode_mask(&mask_bytes, SIDE, SIDE).expect("the fixture mask is 8-bit grayscale");
+    let root = store::models_dir().expect("CRAFT_AI_MODELS or the platform model folder");
+    let pipeline = lama::ready_pipeline_in(Some(&root)).expect("install LaMa first: caim models install lama --accept-note");
+    let cancel = AtomicBool::new(false);
+
+    let cpu = pipeline.run_fill(&frame, &mask, &cancel, &mut |_, _| {}).expect("the CPU run works");
+    let card = pipeline.run_fill_on(&frame, &mask, &card_decision(), &cancel, &mut |_, _| {}).expect("the model runs on the card");
+    let warm = pipeline.run_fill_on(&frame, &mask, &card_decision(), &cancel, &mut |_, _| {}).expect("the card session is kept for the next job");
+    assert_on_the_card(&card, "lama");
+    assert_on_the_card(&warm, "lama");
+    assert!(card.load_ms > 0, "the card session was made for this run: {} ms", card.load_ms);
+    assert_eq!(warm.load_ms, 0, "the second card job reused it");
+
+    // The same gate as the CPU golden: the masked area is within two levels a channel of the
+    // committed answer, and every pixel outside the mask is untouched.
+    let answer = image::decode_image(&expected_bytes, SIDE, SIDE, 3, 8).expect("the committed answer is 8-bit RGB");
+    let (mut total, mut inside, mut outside, mut over_one) = (0.0f64, 0usize, 0usize, 0usize);
+    for (pixel, &covered) in mask.iter().enumerate() {
+        if covered == 0 {
+            for channel in 0..3 {
+                assert_eq!(card.frame.sample(pixel, channel), frame.sample(pixel, channel), "pixel {pixel} channel {channel} is outside the mask");
+            }
+            outside += 1;
+            continue;
+        }
+        for channel in 0..3 {
+            let (got, want) = (f64::from(card.frame.sample(pixel, channel).unwrap_or(0)), f64::from(answer.sample(pixel, channel).unwrap_or(0)));
+            total += (got - want).abs();
+            if card.frame.sample(pixel, channel).unwrap_or(0).abs_diff(cpu.frame.sample(pixel, channel).unwrap_or(0)) > 1 {
+                over_one += 1;
+            }
+        }
+        inside += 1;
+    }
+    assert!(outside > 0 && inside > 0, "the fixture mask covers part of the image");
+    let mean = total / real(inside.saturating_mul(3));
+    assert!(mean <= TOLERANCE, "lama on the card: the masked area is {mean:.3} levels a channel from the committed answer");
+    let samples = real(inside.saturating_mul(3));
+    println!(
+        "lama on the card ({}): card load {} ms, first run {} ms, warm run {} ms; CPU load {} ms, run {} ms; {mean:.3} levels a channel from the committed answer, {} of {samples:.0} masked samples over one level from the CPU answer",
+        card.device_name.as_deref().unwrap_or("?"),
+        card.load_ms,
+        card.run_ms,
+        warm.run_ms,
+        cpu.load_ms,
+        cpu.run_ms,
+        over_one
+    );
+}
+
+/// One golden mask run on the card, against both the committed matte and the CPU matte of the same
+/// photo. Upstream #4812 found this graph's logits collapse on DirectML, so the CPU comparison is
+/// the check that the card has not done the same thing quietly.
+fn card_mask_golden(who: &str, photo: &str, expected: &str, width: u32, height: u32) {
+    let input_bytes = std::fs::read(fixture(photo)).expect("the fixture photo is committed");
+    let expected_bytes = std::fs::read(fixture(expected)).expect("the committed matte is there");
+    let frame = image::decode_image(&input_bytes, width, height, 3, 8).expect("the fixture photo is 8-bit RGB");
+    let pixels = u64::from(width).checked_mul(u64::from(height)).expect("a fixture-sized image");
+    let all = vec![255u8; usize::try_from(pixels).expect("a fixture-sized image")];
+    let root = store::models_dir().expect("CRAFT_AI_MODELS or the platform model folder");
+    let pipeline = birefnet::ready_pipeline_in(Some(&root)).expect("install BiRefNet first: caim models install birefnet --accept-note");
+    let cancel = AtomicBool::new(false);
+
+    let cpu = pipeline.run_mask(&frame, &all, &cancel, &mut |_, _| {}).expect("the CPU run works");
+    let card = pipeline.run_mask_on(&frame, &all, &card_decision(), &cancel, &mut |_, _| {}).expect("the model runs on the card");
+    let warm = pipeline.run_mask_on(&frame, &all, &card_decision(), &cancel, &mut |_, _| {}).expect("the card session is kept for the next job");
+    assert_on_the_card(&card, who);
+    assert_on_the_card(&warm, who);
+    assert!(card.load_ms > 0, "{who}: the card session was made for this run: {} ms", card.load_ms);
+    assert_eq!(warm.load_ms, 0, "{who}: the second card job reused it");
+
+    let answer = image::decode_mask(&expected_bytes, width, height).expect("the committed matte is 8-bit grayscale at the same size");
+    let (mut both, mut either, mut total, mut soft, mut over_one) = (0usize, 0usize, 0usize, 0usize, 0usize);
+    for (pixel, &want) in answer.iter().enumerate() {
+        let (Some(got), Some(from_cpu)) = (card.frame.sample(pixel, 0), cpu.frame.sample(pixel, 0)) else {
+            continue;
+        };
+        let want = u16::from(want);
+        if got >= 128 && want >= 128 {
+            both += 1;
+        }
+        if got >= 128 || want >= 128 {
+            either += 1;
+        }
+        total += usize::from(got.abs_diff(want));
+        if (1..255).contains(&got) {
+            soft += 1;
+        }
+        if got.abs_diff(from_cpu) > 1 {
+            over_one += 1;
+        }
+    }
+    assert!(either > 0, "{who}: the committed matte and the card's answer both have a subject");
+    let iou = real(both) / real(either);
+    let mean = real(total) / real(all.len());
+    assert!(iou >= IOU_FLOOR, "{who} on the card: the subject is only {iou:.4} agreed with the committed matte");
+    assert!(mean <= MATTE_TOLERANCE, "{who} on the card: the matte is {mean:.3} levels a pixel away from the committed one");
+    assert!(soft > 0, "{who} on the card: amendment 18 wants a soft edge, and there is none");
+    // Amendment 18's CUDA gate, and the DirectML failure upstream #4812 hit: a card matte that has
+    // collapsed would disagree with the CPU matte over a large part of the image.
+    let share = real(over_one) / real(all.len());
+    assert!(share <= CARD_DISAGREEMENT_CEILING, "{who} on the card: {share:.4} of the pixels sit over one level from the CPU matte");
+
+    println!(
+        "{who} on the card ({}): card load {} ms, first run {} ms, warm run {} ms; CPU load {} ms, run {} ms; IoU {iou:.4}, mean {mean:.3} levels from the committed matte, {soft} soft-edge pixels, {share:.4} of the pixels over one level from the CPU matte",
+        card.device_name.as_deref().unwrap_or("?"),
+        card.load_ms,
+        card.run_ms,
+        warm.run_ms,
+        cpu.load_ms,
+        cpu.run_ms
+    );
+}
+
+#[test]
+#[ignore = "needs an installed BiRefNet and the CUDA libraries: caim cuda install --accept-note"]
+fn birefnet_on_the_card_finds_the_buoy() {
+    card_mask_golden("buoy", "input.png", "mask-buoy.png", 448, 448);
+}
+
+#[test]
+#[ignore = "needs an installed BiRefNet and the CUDA libraries: caim cuda install --accept-note"]
+fn birefnet_on_the_card_finds_the_person_and_keeps_the_hair() {
+    card_mask_golden("person", "input-person.png", "mask-person.png", 768, 512);
 }

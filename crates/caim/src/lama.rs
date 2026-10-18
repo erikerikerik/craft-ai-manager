@@ -11,6 +11,7 @@
 //! exists to make LaMa repaint the edge of the selection as well. Amendment 16: where the mask is
 //! above 0 the fill goes in at full strength, because PhotoCraft does the blending by coverage.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
@@ -20,6 +21,8 @@ use ort::environment::Environment;
 
 use crate::backend::{Filled, Timings};
 use crate::catalog::{self, Model};
+use crate::cuda;
+use crate::device::{self, Device};
 use crate::error::{Fail, Result};
 use crate::image::{CHANNELS, Frame};
 use crate::protocol::TASK_FILL;
@@ -38,10 +41,6 @@ pub const PAD_PERCENT: usize = 25;
 pub const LAMA_ID: &str = "lama";
 /// What `/result` reports when a job ran here.
 pub const LAMA_MODEL: &str = "lama";
-/// LaMa runs on the CPU: no GPU execution provider is compiled in.
-pub const LAMA_DEVICE: &str = "cpu";
-/// The hardware words amendment 18 puts in `device_name`.
-pub const LAMA_DEVICE_NAME: &str = "CPU";
 /// Everything CAIM does is local.
 pub const LAMA_PROVIDER: &str = "local";
 
@@ -554,11 +553,16 @@ pub fn blend(image: &Frame, mask: &[u8], window: Window, fill: &[Vec<f32>]) -> F
 pub trait Session: Send {
     /// Run one crop. `image` and `mask` are the packed planes [model_input] and [mask_plane] make
     /// (after dilation); the answer is the same shape, with samples meant to be 0-255.
-    fn run(&mut self, image: &[f32], mask: &[f32], cancel: &AtomicBool) -> Result<Vec<f32>>;
+    ///
+    /// A run the runtime could not finish answers with [device::Attempt::Failed], amendment 18's
+    /// reason, and the runtime's own text, which is what lets [device::run_on_chain] try the next
+    /// device instead of failing the job.
+    fn run(&mut self, image: &[f32], mask: &[f32], cancel: &AtomicBool) -> device::Attempt<Vec<f32>>;
 }
 
-/// How a session is made: once per pipeline, on the first job that needs one.
-pub type Loader = Box<dyn Fn(&Path) -> Result<Box<dyn Session>> + Send + Sync>;
+/// How a session is made: once per pipeline, on the first job that needs one. The device is the one
+/// to build for - [crate::device] decides, this is the part that obeys.
+pub type Loader = Box<dyn Fn(&Path, Device) -> Result<Box<dyn Session>> + Send + Sync>;
 
 /// One installed model and the session it runs on. The session is made lazily and kept, so the
 /// ~1.2 s model load is paid once per process rather than once per job (MG-04 item 2).
@@ -568,7 +572,9 @@ pub struct Pipeline {
     /// which bytes made it (amendment 18). `None` when the pipeline was built straight from a path,
     /// which is what the tests and any caller without a catalog entry do.
     identity: Option<Identity>,
-    session: Mutex<Option<Box<dyn Session>>>,
+    /// The session that worked and the device it runs on. One at a time on purpose: a model is
+    /// gigabytes, so a chain that has just fallen back must not be holding a second copy of it.
+    session: Mutex<Option<(Device, Box<dyn Session>)>>,
     load: Loader,
 }
 
@@ -578,6 +584,18 @@ pub struct Pipeline {
 pub struct Identity {
     pub version: String,
     pub sha256: String,
+    /// What the catalog says the model needs, so the resolver can measure the card against it.
+    pub memory_mib: u64,
+    /// The catalog's per-backend states, which is how a model never run on a card stays off the chain.
+    pub backends: BTreeMap<String, String>,
+}
+
+impl Identity {
+    /// The manifest amendment 18's resolver reads for this model.
+    #[must_use]
+    pub fn manifest(&self) -> device::Manifest {
+        device::Manifest { id: LAMA_ID.to_string(), memory_mib: self.memory_mib, backends: self.backends.clone() }
+    }
 }
 
 /// A pipeline is described by its model file and whether the session has been loaded yet; the
@@ -605,23 +623,47 @@ impl Pipeline {
     /// A pipeline for a catalog entry, so its results carry the entry's version and hash.
     #[must_use]
     pub fn for_model(path: impl Into<PathBuf>, model: &Model) -> Arc<Pipeline> {
-        Self::with_identity_and_loader(path, Some(Identity { version: model.version.clone(), sha256: model.sha256.clone() }), Box::new(load_ort_session))
+        Self::with_identity_and_loader(
+            path,
+            Some(Identity { version: model.version.clone(), sha256: model.sha256.clone(), memory_mib: model.memory_mib, backends: model.backends.clone() }),
+            Box::new(load_ort_session),
+        )
     }
 
     #[must_use]
-    fn with_identity_and_loader(path: impl Into<PathBuf>, identity: Option<Identity>, load: Loader) -> Arc<Pipeline> {
+    pub(crate) fn with_identity_and_loader(path: impl Into<PathBuf>, identity: Option<Identity>, load: Loader) -> Arc<Pipeline> {
         Arc::new(Pipeline { path: path.into(), identity, session: Mutex::new(None), load })
     }
 
+    /// The manifest for this pipeline's model, when it was built from a catalog entry. The queue
+    /// resolves a device from it before the first job loads anything.
+    #[must_use]
+    pub fn manifest(&self) -> Option<device::Manifest> {
+        self.identity.as_ref().map(Identity::manifest)
+    }
+
     /// A finished fill from this pipeline, with amendment 18's account of what ran.
-    fn filled(&self, frame: Frame, elapsed_ms: u64, load_ms: u64, run_ms: u64) -> Filled {
-        let timings = Timings { elapsed_ms, load_ms, run_ms };
-        let mut filled = Filled::new(frame, timings, LAMA_MODEL, LAMA_DEVICE, LAMA_PROVIDER, OUTPUT_IMAGE);
+    ///
+    /// `decision` is what was asked for and what the resolver made of it; `ran_on` is the device that
+    /// actually ran, which is the only one allowed to name the hardware.
+    fn filled(
+        &self,
+        frame: Frame,
+        decision: &device::Decision,
+        ran_on: Device,
+        timings: Timings,
+        reason: Option<device::Reason>,
+        diagnostics: Option<String>,
+    ) -> Filled {
+        let mut filled = Filled::new(frame, timings, LAMA_MODEL, ran_on.token(), LAMA_PROVIDER, OUTPUT_IMAGE);
         if let Some(identity) = self.identity.as_ref() {
             filled.model_version = Some(identity.version.clone());
             filled.model_sha256 = Some(identity.sha256.clone());
         }
-        filled.device_name = Some(LAMA_DEVICE_NAME.to_string());
+        filled.device_requested = decision.requested.token().to_string();
+        filled.device_name = Some(decision.name_for(ran_on));
+        filled.fallback_reason = decision.fallback_reason(ran_on, reason).map(|reason| reason.token().to_string());
+        filled.diagnostics = diagnostics.or_else(|| decision.note.clone());
         filled
     }
 
@@ -630,6 +672,19 @@ impl Pipeline {
     /// `cancel` is checked between every stage, and the session itself is asked to stop when the
     /// job is cancelled while the run is going on.
     pub fn run_fill(&self, image: &Frame, mask: &[u8], cancel: &AtomicBool, progress: &mut dyn FnMut(f64, &str)) -> Result<Filled> {
+        self.run_fill_on(image, mask, &device::Decision::for_setting(device::Setting::Auto), cancel, progress)
+    }
+
+    /// Fill the masked area on the devices `decision` names, in order. This is where amendment 18's
+    /// fallback chain is walked, and the only place the stages are reported.
+    pub fn run_fill_on(
+        &self,
+        image: &Frame,
+        mask: &[u8],
+        decision: &device::Decision,
+        cancel: &AtomicBool,
+        progress: &mut dyn FnMut(f64, &str),
+    ) -> Result<Filled> {
         let started = Instant::now();
         if !CHANNELS.iter().any(|channels| usize::from(*channels) == image.channels) {
             return Err(Fail::bad_request("Craft AI Manager can only fill images with three or four channels."));
@@ -647,7 +702,8 @@ impl Pipeline {
         let Some(box_) = mask_box(width, height, mask) else {
             // Nothing is masked: the input comes back unchanged and the model never runs.
             progress(1.0, MSG_FINISH);
-            return Ok(self.filled(image.clone(), elapsed_ms(&started), 0, 0));
+            let timings = Timings { elapsed_ms: elapsed_ms(&started), load_ms: 0, run_ms: 0 };
+            return Ok(self.filled(image.clone(), decision, Device::Cpu, timings, None, None));
         };
         let window = crop_window(box_, width, height);
         let model_mask = dilate(&mask_plane(mask, window, width, MODEL_SIZE), MODEL_SIZE, DILATE_PX);
@@ -656,43 +712,36 @@ impl Pipeline {
         if stopped(cancel) {
             return Err(Fail::internal(CANCELLED));
         }
-        // The run's own outcome is carried out of the lock so the session can go back into the
-        // guard whether the run worked or not; `map` keeps the error type concrete.
-        let run = {
+        // The chain is walked inside the guard so the session goes back into it whether the run
+        // worked, failed, or fell back to another device. A run that died after a `DELETE` is a
+        // cancellation rather than a reason to try the next device, which [device::run_on_chain]
+        // answers the same way for both runners.
+        let outcome = {
             let mut guard = self.session.lock().unwrap_or_else(PoisonError::into_inner);
-            let mut load_ms = 0u64;
-            let mut session = match guard.take() {
-                Some(session) => session,
-                None => {
-                    progress(LOAD_PROGRESS, MSG_LOAD);
-                    let loading = Instant::now();
-                    let session = (self.load)(&self.path)?;
-                    load_ms = elapsed_ms(&loading);
-                    session
-                }
-            };
-            if stopped(cancel) {
-                *guard = Some(session);
-                return Err(Fail::internal(CANCELLED));
-            }
-            progress(RUN_PROGRESS, MSG_RUN);
-            let running = Instant::now();
-            let outcome = session.run(&model_image, &model_mask, cancel);
-            let run_ms = elapsed_ms(&running);
-            *guard = Some(session);
-            // A run ORT stopped because the job was cancelled is a cancellation, not a failure. The
-            // session is back in the guard by now, so the next job still finds it.
-            let outcome = outcome.map_err(|fail| if stopped(cancel) { Fail::internal(CANCELLED) } else { fail });
-            outcome.map(|samples| (samples, load_ms, run_ms))
-        };
-        let (output, load_ms, run_ms) = run?;
+            device::run_on_chain(
+                &decision.chain,
+                &mut *guard,
+                &mut |device| (self.load)(&self.path, device),
+                &mut |session, _device, progress| {
+                    if stopped(cancel) {
+                        return device::Attempt::Failed { reason: device::Reason::ExecutionFailed, diagnostics: CANCELLED.to_string() };
+                    }
+                    progress(RUN_PROGRESS, MSG_RUN);
+                    session.run(&model_image, &model_mask, cancel)
+                },
+                progress,
+                device::LoadStage { at: LOAD_PROGRESS, message: MSG_LOAD },
+                &|| stopped(cancel),
+            )
+        }?;
         if stopped(cancel) {
             return Err(Fail::internal(CANCELLED));
         }
         progress(RUN_END, MSG_FINISH);
-        let frame = blend(image, mask, window, &fill_back(&output, window));
+        let frame = blend(image, mask, window, &fill_back(&outcome.value, window));
         progress(1.0, MSG_FINISH);
-        Ok(self.filled(frame, elapsed_ms(&started), load_ms, run_ms))
+        let timings = Timings { elapsed_ms: elapsed_ms(&started), load_ms: outcome.load_ms, run_ms: outcome.run_ms };
+        Ok(self.filled(frame, decision, outcome.device, timings, outcome.reason, outcome.diagnostics))
     }
 }
 
@@ -710,10 +759,40 @@ pub struct OrtSession {
     /// Held so the environment outlives the session that was built from it.
     _environment: Arc<Environment>,
     session: ort::session::Session,
+    /// Whether this session was built for the card. It is what takes the one-GPU-job gate, and it
+    /// stays true after the placement has been read, so every card run is gated and not just the first.
+    on_card: bool,
+    /// Where to read the placement back, once. `None` for a CPU session, and again after a card
+    /// session's first run, which is the moment ONNX Runtime stops profiling.
+    placement: Option<cuda::Placement>,
 }
 
 impl Session for OrtSession {
-    fn run(&mut self, image: &[f32], mask: &[f32], cancel: &AtomicBool) -> Result<Vec<f32>> {
+    /// Run one crop, then check that the card really did any of it.
+    ///
+    /// MG-11 step 0 is why the check is here: ONNX Runtime registers the CUDA provider happily and
+    /// then runs every node on the CPU without saying so. A card session is only believed once its own
+    /// profile names a CUDA node; a session that placed nothing reports
+    /// [device::Reason::BackendInitFailed] so the chain retries on the CPU.
+    fn run(&mut self, image: &[f32], mask: &[f32], cancel: &AtomicBool) -> device::Attempt<Vec<f32>> {
+        let _job = cuda::job_gate(self.on_card);
+        let placement = self.placement.take();
+        let samples = match self.infer(image, mask, cancel) {
+            Ok(samples) => samples,
+            Err(fail) => return device::Attempt::Failed { reason: device::Reason::ExecutionFailed, diagnostics: fail.sentence },
+        };
+        if let Some(placement) = placement
+            && let cuda::Verdict::NotPlaced(text) = placement.verdict(&mut self.session)
+        {
+            return device::Attempt::Failed { reason: device::Reason::BackendInitFailed, diagnostics: text };
+        }
+        device::Attempt::Ran(samples)
+    }
+}
+
+impl OrtSession {
+    /// One inference, with MG-05's `terminate` watcher around it.
+    fn infer(&mut self, image: &[f32], mask: &[f32], cancel: &AtomicBool) -> Result<Vec<f32>> {
         let image_tensor = ort::value::Tensor::from_array(([1usize, 3, MODEL_SIZE, MODEL_SIZE], image.to_vec().into_boxed_slice())).map_err(ort_fail)?;
         let mask_tensor = ort::value::Tensor::from_array(([1usize, 1, MODEL_SIZE, MODEL_SIZE], mask.to_vec().into_boxed_slice())).map_err(ort_fail)?;
         let run_options = ort::session::RunOptions::new().map_err(ort_fail)?;
@@ -761,15 +840,34 @@ pub(crate) fn environment() -> Result<Arc<Environment>> {
     }
 }
 
-/// Load the graph at `path`. This is the ~1.2 s the first job pays.
-pub fn load_ort_session(path: &Path) -> Result<Box<dyn Session>> {
+/// Load the graph at `path` for one device. This is the ~1.2 s the first job pays.
+///
+/// A card session is where MG-11 lives: CAIM's own CUDA folder is handed to ONNX Runtime's
+/// `preload_dylibs`, the CUDA provider is asked for, and profiling is turned on so
+/// [OrtSession::run] can read back where the nodes actually went.
+pub fn load_ort_session(path: &Path, device: Device) -> Result<Box<dyn Session>> {
     let environment = environment()?;
-    let session = ort::session::Session::builder(&environment).map_err(ort_fail)?.commit_from_file(path).map_err(ort_fail)?;
-    Ok(Box::new(OrtSession { _environment: environment, session }))
+    let mut builder = ort::session::Session::builder(&environment).map_err(ort_fail)?;
+    let (mut on_card, mut placement) = (false, None);
+    if device == Device::Cuda {
+        let root = cuda::store_root().ok_or_else(|| Fail::internal("Craft AI Manager has no folder for the CUDA libraries: run `caim cuda install`."))?;
+        cuda::preload(&root)?;
+        on_card = true;
+        placement = cuda::placement(device);
+        if let Some(placement) = placement.as_ref() {
+            builder = builder.with_profiling(placement.prefix()).map_err(ort_fail)?;
+        }
+        builder = cuda::register(builder).map_err(|error| ort_fail(*error))?;
+    }
+    let session = builder.commit_from_file(path).map_err(ort_fail)?;
+    Ok(Box::new(OrtSession { _environment: environment, session, on_card, placement }))
 }
 
 /// Turn an ONNX Runtime error into the sentence a job fails with.
-fn ort_fail(error: ort::Error) -> Fail {
+///
+/// Generic because the builder's own errors carry the builder (`Error<SessionBuilder>`) while the
+/// ones before it carry nothing (`Error<()>`), and all of them become the same sentence.
+fn ort_fail<R>(error: ort::Error<R>) -> Fail {
     Fail::internal(format!("The LaMa model could not run: {error}"))
 }
 
@@ -810,15 +908,15 @@ pub(crate) struct StandIn {
 #[cfg(test)]
 impl Session for StandIn {
     /// Answers a flat grey, and notices a cancel partway through the run.
-    fn run(&mut self, image: &[f32], _mask: &[f32], cancel: &AtomicBool) -> Result<Vec<f32>> {
+    fn run(&mut self, image: &[f32], _mask: &[f32], cancel: &AtomicBool) -> device::Attempt<Vec<f32>> {
         for _ in 0..20 {
             if cancel.load(Ordering::Relaxed) {
-                return Err(Fail::internal(CANCELLED));
+                return device::Attempt::Failed { reason: device::Reason::ExecutionFailed, diagnostics: CANCELLED.to_string() };
             }
             std::thread::sleep(self.step);
         }
         self.runs.fetch_add(1, Ordering::SeqCst);
-        Ok(vec![self.fill; image.len()])
+        device::Attempt::Ran(vec![self.fill; image.len()])
     }
 }
 
@@ -832,7 +930,7 @@ pub(crate) fn stand_in_pipeline(
     runs: &Arc<std::sync::atomic::AtomicUsize>,
 ) -> Arc<Pipeline> {
     let (loads, runs) = (Arc::clone(loads), Arc::clone(runs));
-    let load: Loader = Box::new(move |_path: &Path| {
+    let load: Loader = Box::new(move |_path: &Path, _device: Device| {
         loads.fetch_add(1, Ordering::SeqCst);
         Ok(Box::new(StandIn { fill, step, runs: Arc::clone(&runs) }))
     });
@@ -886,10 +984,11 @@ mod tests {
     }
 
     use super::{
-        DILATE_PX, Filter, MODEL_SIZE, MSG_FINISH, MSG_LOAD, MSG_PREPARE, MSG_RUN, Window, blend, crop_window, dilate, fill_back, filter_for,
-        installed_pipeline, mask_box, mask_plane, model_input, pad_for, resize_plane, stand_in_pipeline,
+        DILATE_PX, Filter, Loader, MODEL_SIZE, MSG_FINISH, MSG_LOAD, MSG_PREPARE, MSG_RUN, Pipeline, StandIn, Window, blend, crop_window, dilate, fill_back,
+        filter_for, installed_pipeline, mask_box, mask_plane, model_input, pad_for, resize_plane, stand_in_pipeline,
     };
-    use crate::error::Status;
+    use crate::device::{Decision, Device, Setting};
+    use crate::error::{Fail, Status};
     use crate::image::Frame;
     use crate::store;
     use crate::testkit::{Scratch, test_model};
@@ -1186,9 +1285,9 @@ mod tests {
     }
 
     impl super::Session for Spy {
-        fn run(&mut self, image: &[f32], mask: &[f32], _cancel: &AtomicBool) -> crate::error::Result<Vec<f32>> {
+        fn run(&mut self, image: &[f32], mask: &[f32], _cancel: &AtomicBool) -> crate::device::Attempt<Vec<f32>> {
             *self.seen.lock().expect("the spy's lock") = mask.to_vec();
-            Ok(image.iter().map(|sample| sample * 255.0).collect())
+            crate::device::Attempt::Ran(image.iter().map(|sample| sample * 255.0).collect())
         }
     }
 
@@ -1224,7 +1323,7 @@ mod tests {
         let spy = Arc::clone(&seen);
         let pipeline = super::Pipeline::with_loader(
             "spy.onnx",
-            Box::new(move |_path: &std::path::Path| Ok(Box::new(Spy { seen: Arc::clone(&spy) }) as Box<dyn super::Session>)),
+            Box::new(move |_path: &std::path::Path, _device: Device| Ok(Box::new(Spy { seen: Arc::clone(&spy) }) as Box<dyn super::Session>)),
         );
         let frame = Frame { width, height, channels: 3, bit_depth: 8, samples: vec![100; (width * height * 3) as usize] };
         pipeline.run_fill(&frame, &mask, &AtomicBool::new(false), &mut |_, _| {}).expect("the spy session runs");
@@ -1265,5 +1364,84 @@ mod tests {
                 assert!(crop.x + crop.width >= box_.x + box_.width && crop.y + crop.height >= box_.y + box_.height, "{box_:?}: {crop:?}");
             }
         }
+    }
+
+    const CARD: &str = "NVIDIA GeForce RTX 4090";
+
+    /// A pipeline whose loader only succeeds on one device, so a fallback chain can be walked on a
+    /// machine with no card at all.
+    fn chain_pipeline(fill: f32, loads: &Arc<AtomicUsize>, runs: &Arc<AtomicUsize>, works_on: Device) -> Arc<Pipeline> {
+        let (loads, runs) = (Arc::clone(loads), Arc::clone(runs));
+        let load: Loader = Box::new(move |_path: &std::path::Path, device: Device| {
+            loads.fetch_add(1, Ordering::SeqCst);
+            if device != works_on {
+                return Err(Fail::internal("no CUDA session could be made on this machine"));
+            }
+            Ok(Box::new(StandIn { fill, step: Duration::ZERO, runs: Arc::clone(&runs) }))
+        });
+        Pipeline::with_loader("lama_fp32.onnx", load)
+    }
+
+    /// The decision a resolver makes for `--device cuda` on a machine with a card that has the room.
+    fn cuda_decision() -> Decision {
+        Decision { requested: Setting::Cuda, chain: vec![Device::Cuda, Device::Cpu], reason: None, device_name: Some(CARD.to_string()), note: None }
+    }
+
+    #[test]
+    fn a_fill_that_ran_on_the_card_names_the_card_and_gives_no_reason() {
+        let (loads, runs) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let pipeline = chain_pipeline(200.0, &loads, &runs, Device::Cuda);
+        let filled =
+            pipeline.run_fill_on(&image(3, 8), &centre_mask(255), &cuda_decision(), &AtomicBool::new(false), &mut |_, _| {}).expect("the card takes the job");
+        assert_eq!(filled.device, "cuda");
+        assert_eq!(filled.device_requested, "cuda", "amendment 18 reports what was asked for");
+        assert_eq!(filled.device_name.as_deref(), Some(CARD), "and the hardware that ran");
+        assert_eq!(filled.fallback_reason, None, "the requested backend ran, so there is no reason");
+        assert_eq!(filled.diagnostics, None);
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_fill_that_fell_back_says_so_in_amendment_18s_words() {
+        let (loads, runs) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let pipeline = chain_pipeline(200.0, &loads, &runs, Device::Cpu);
+        let filled = pipeline
+            .run_fill_on(&image(3, 8), &centre_mask(255), &cuda_decision(), &AtomicBool::new(false), &mut |_, _| {})
+            .expect("the CPU takes what the card could not");
+        assert_eq!(filled.device, "cpu");
+        assert_eq!(filled.device_requested, "cuda");
+        assert_eq!(filled.device_name.as_deref(), Some("CPU"), "a CPU run is a CPU run whatever was hoped for");
+        assert_eq!(filled.fallback_reason.as_deref(), Some("backend_init_failed"));
+        assert!(filled.diagnostics.as_deref().is_some_and(|text| text.contains("no CUDA session")), "{:?}", filled.diagnostics);
+        assert_eq!(loads.load(Ordering::SeqCst), 2, "one session per device in the chain");
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "only the device that worked ran the model");
+    }
+
+    #[test]
+    fn a_run_that_died_on_the_card_reports_execution_failed() {
+        let (loads, runs) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let pipeline = chain_pipeline(200.0, &loads, &runs, Device::Cpu);
+        let decision =
+            Decision { requested: Setting::Auto, chain: vec![Device::Cuda, Device::Cpu], reason: None, device_name: Some(CARD.to_string()), note: None };
+        let filled = pipeline
+            .run_fill_on(&image(3, 8), &centre_mask(255), &decision, &AtomicBool::new(false), &mut |_, _| {})
+            .expect("the retry still finishes the job");
+        assert_eq!(filled.device, "cpu");
+        assert_eq!(filled.device_requested, "auto");
+        assert_eq!(filled.fallback_reason.as_deref(), Some("backend_init_failed"));
+    }
+
+    #[test]
+    fn the_manifest_comes_from_the_catalog_entry() {
+        let scratch = Scratch::new("lama-manifest");
+        let bytes: &[u8] = b"the bytes a small model would be made of";
+        let model = test_model(bytes, None);
+        let pipeline = Pipeline::for_model(store::model_file(&scratch.path, &model), &model);
+        let manifest = pipeline.manifest().expect("a pipeline built from a catalog entry knows its model");
+        assert_eq!(manifest.id, "lama");
+        assert_eq!(manifest.memory_mib, model.memory_mib);
+        assert_eq!(manifest.state(Device::Cpu), Some("supported"));
+        assert!(Pipeline::new("lama_fp32.onnx").manifest().is_none(), "a pipeline built from a path alone has no manifest");
     }
 }

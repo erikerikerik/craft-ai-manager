@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 use crate::VERSION;
 use crate::activity;
 use crate::birefnet;
+use crate::device;
 use crate::endpoint::{self, ENDPOINT_ENV};
 use crate::error::{Fail, Result, Status, quoted};
 use crate::http::{self, Clock, Head, Response, read_head, write_error};
@@ -90,6 +91,9 @@ pub struct ServeOptions {
     pub write_timeout: Duration,
     /// Cap for image working data and results; excludes ORT session internals.
     pub memory_limit: usize,
+    /// MG-11: what device the jobs of this start are asked to run on. `Auto` unless
+    /// `caim serve --device` said otherwise.
+    pub device: device::Setting,
 }
 
 impl Default for ServeOptions {
@@ -107,6 +111,7 @@ impl Default for ServeOptions {
             drain_timeout: DRAIN_TIMEOUT,
             write_timeout: WRITE_TIMEOUT,
             memory_limit: job::DEFAULT_MEMORY_BYTES,
+            device: device::Setting::Auto,
         }
     }
 }
@@ -134,8 +139,9 @@ pub struct Server {
     port: u16,
     token: String,
     endpoint_path: Option<PathBuf>,
-    /// Which backend this start picked, for the line `caim serve` prints.
-    backend_note: &'static str,
+    /// Which backend this start picked, for the line `caim serve` prints. MG-11 makes it a
+    /// `String` because the line now names the device setting too.
+    backend_note: String,
     accept: Option<JoinHandle<()>>,
     runner: Arc<Runner>,
     /// MG-08: the stop for this start - the flag the accept loop watches, how often something has
@@ -162,8 +168,11 @@ impl Server {
         // the model behind it is installed and acknowledged. Nothing is re-hashed at start;
         // `verified.json` is the proof.
         let offered = if options.fake_backend { routing::Offered::fake() } else { routing::Offered::from_store(options.models_root.as_deref()) };
-        let backend =
-            if options.fake_backend { Backend::Fake { step_delay: options.step_delay } } else { real_backend(&offered, options.models_root.as_deref()) };
+        let backend = if options.fake_backend {
+            Backend::Fake { step_delay: options.step_delay }
+        } else {
+            real_backend(&offered, options.models_root.as_deref(), options.device)
+        };
         let backend_note = backend.note();
         let runner = Arc::new(Runner::with_memory_limit(backend, options.max_queue, options.memory_limit)?);
         // MG-08 review round 2: the handle gets the runner before the endpoint file exists, so a
@@ -228,8 +237,8 @@ impl Server {
 
     /// Which backend this start is running, for the terminal.
     #[must_use]
-    pub const fn backend_note(&self) -> &'static str {
-        self.backend_note
+    pub fn backend_note(&self) -> &str {
+        &self.backend_note
     }
 
     /// Where the endpoint file is, if this start wrote one.
@@ -283,7 +292,7 @@ impl Server {
 /// listed with `ready: false` rather than hidden (amendment 18). `NoModel` only when neither is
 /// installed and acknowledged, which keeps MG-01's answer for a machine with no models at all.
 #[must_use]
-fn real_backend(offered: &routing::Offered, root: Option<&Path>) -> Backend {
+fn real_backend(offered: &routing::Offered, root: Option<&Path>, device: device::Setting) -> Backend {
     let Some(root) = root.map(PathBuf::from).or_else(store::models_dir) else {
         return Backend::NoModel;
     };
@@ -292,7 +301,7 @@ fn real_backend(offered: &routing::Offered, root: Option<&Path>) -> Backend {
     if lama.is_none() && birefnet.is_none() {
         return Backend::NoModel;
     }
-    Backend::Real { lama, birefnet }
+    Backend::Real { lama, birefnet, device }
 }
 
 /// What one start owns for stopping: the flag the accept loop watches, the runner whose jobs get

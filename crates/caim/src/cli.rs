@@ -2,6 +2,7 @@
 //! fake backend, `caim open` starts the manager unless one is already answering, `caim models ...`
 //! looks after the model store, and `--version` / `--help` keep working without starting anything.
 
+use crate::device;
 use crate::error::{Fail, Result, quoted};
 
 /// What the binary should do with one set of arguments (the program name excluded).
@@ -15,6 +16,17 @@ pub enum Action {
     Serve {
         /// Use the built-in fake backend, which fills a mask with the mean colour of the image.
         fake_backend: bool,
+        /// MG-11: the device every job of this start is asked to run on. `auto` unless
+        /// `--device` said otherwise.
+        device: device::Setting,
+    },
+    /// Print what CUDA this machine could run: the four archives, the cards, and whether a CUDA job
+    /// is ready to start (MG-11).
+    CudaStatus,
+    /// Download the CUDA libraries the vendor's own licence covers, into the CUDA folder (MG-11).
+    CudaInstall {
+        /// Accept the vendor's note and go ahead with the download.
+        accept_note: bool,
     },
     /// Start the manager unless one is already answering (amendment 18). For now this serves; the
     /// window arrives in MG-13.
@@ -43,7 +55,7 @@ pub enum Action {
 }
 
 /// The usage lines, printed by `--help` and when the arguments do not parse.
-pub const USAGE: &str = "usage: caim [serve] [--fake-backend]\n       caim open\n       caim models list\n       caim models install <id> [--accept-note]\n       caim models verify <id>\n       caim models remove <id>\n       caim models where\n       caim --version | caim --help";
+pub const USAGE: &str = "usage: caim [serve] [--fake-backend] [--device auto|cuda|cpu]\n       caim open\n       caim models list\n       caim models install <id> [--accept-note]\n       caim models verify <id>\n       caim models remove <id>\n       caim models where\n       caim cuda status\n       caim cuda install [--accept-note]\n       caim --version | caim --help";
 
 /// Map the arguments after the program name to an [Action](crate::Action). Serving is the default, so
 /// the only positional words are the optional `serve` and the `models` commands. The error is a
@@ -53,13 +65,30 @@ pub fn classify(args: &[String]) -> Result<Action> {
     let mut accept_note = false;
     let mut version_seen = false;
     let mut help_seen = false;
+    let mut device: Option<device::Setting> = None;
     let mut words: Vec<&str> = Vec::new();
-    for arg in args {
-        match arg.as_str() {
+    // `--device` is the one option that takes a value, so the loop walks by index: the value is the
+    // next word, and `--device=cuda` is the same thing written in one word.
+    let mut index = 0;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        index += 1;
+        if let Some(text) = arg.strip_prefix("--device=") {
+            device = Some(parse_device(text)?);
+            continue;
+        }
+        match arg {
             "--version" | "-V" => version_seen = true,
             "--help" | "-h" => help_seen = true,
             "--fake-backend" => fake_backend = true,
             "--accept-note" => accept_note = true,
+            "--device" => {
+                let Some(text) = args.get(index) else {
+                    return Err(Fail::bad_request("Craft AI Manager needs a device after --device: auto, cuda or cpu."));
+                };
+                index += 1;
+                device = Some(parse_device(text)?);
+            }
             other if other.starts_with('-') => return Err(Fail::bad_request(format!("Craft AI Manager does not know the option {}.", quoted(other)))),
             other => words.push(other),
         }
@@ -71,7 +100,7 @@ pub fn classify(args: &[String]) -> Result<Action> {
         return Ok(Action::Version);
     }
     let action = match words.as_slice() {
-        [] | ["serve"] => Action::Serve { fake_backend },
+        [] | ["serve"] => Action::Serve { fake_backend, device: device.unwrap_or_default() },
         ["open"] => Action::Open,
         ["models"] => return Err(Fail::bad_request("Craft AI Manager needs a models command: list, install, verify, remove or where.")),
         ["models", "list"] => Action::ModelsList,
@@ -85,20 +114,37 @@ pub fn classify(args: &[String]) -> Result<Action> {
         ["models", other] => {
             return Err(Fail::bad_request(format!("Craft AI Manager does not know the models command {}. Try list, install or verify.", quoted(other))));
         }
+        ["cuda"] => return Err(Fail::bad_request("Craft AI Manager needs a cuda command: status or install.")),
+        ["cuda", "status"] => Action::CudaStatus,
+        ["cuda", "install"] => Action::CudaInstall { accept_note },
+        ["cuda", other] => {
+            return Err(Fail::bad_request(format!("Craft AI Manager does not know the cuda command {}. Try status or install.", quoted(other))));
+        }
         other => return Err(Fail::bad_request(format!("Craft AI Manager does not know what to do with {}.", quoted(&other.join(" "))))),
     };
     if fake_backend && !matches!(action, Action::Serve { .. }) {
         return Err(Fail::bad_request("The --fake-backend flag goes with caim serve, not with this command."));
     }
-    if accept_note && !matches!(action, Action::ModelsInstall { .. }) {
+    if accept_note && !matches!(action, Action::ModelsInstall { .. } | Action::CudaInstall { .. }) {
         return Err(Fail::bad_request("The --accept-note flag goes with caim models install <id>, not with this command."));
     }
+    if device.is_some() && !matches!(action, Action::Serve { .. }) {
+        return Err(Fail::bad_request("The --device flag goes with caim serve, not with this command."));
+    }
     Ok(action)
+}
+
+/// The word after `--device` as a setting. The sentence names the three words that work, because a
+/// wrong device is the easiest way to think the card is broken.
+fn parse_device(text: &str) -> Result<device::Setting> {
+    device::Setting::parse(text)
+        .ok_or_else(|| Fail::bad_request(format!("Craft AI Manager needs a device after --device: auto, cuda or cpu. It got {}.", quoted(text))))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{Action, USAGE, classify};
+    use crate::device;
     use crate::error::Status;
 
     fn args(values: &[&str]) -> Vec<String> {
@@ -107,15 +153,15 @@ mod tests {
 
     #[test]
     fn no_arguments_serves_without_the_fake_backend() {
-        assert!(matches!(classify(&[]), Ok(Action::Serve { fake_backend: false })));
-        assert!(matches!(classify(&args(&["serve"])), Ok(Action::Serve { fake_backend: false })));
+        assert!(matches!(classify(&[]), Ok(Action::Serve { fake_backend: false, .. })));
+        assert!(matches!(classify(&args(&["serve"])), Ok(Action::Serve { fake_backend: false, .. })));
     }
 
     #[test]
     fn the_fake_backend_flag_works_with_and_without_serve() {
-        assert!(matches!(classify(&args(&["--fake-backend"])), Ok(Action::Serve { fake_backend: true })));
-        assert!(matches!(classify(&args(&["serve", "--fake-backend"])), Ok(Action::Serve { fake_backend: true })));
-        assert!(matches!(classify(&args(&["--fake-backend", "serve"])), Ok(Action::Serve { fake_backend: true })));
+        assert!(matches!(classify(&args(&["--fake-backend"])), Ok(Action::Serve { fake_backend: true, .. })));
+        assert!(matches!(classify(&args(&["serve", "--fake-backend"])), Ok(Action::Serve { fake_backend: true, .. })));
+        assert!(matches!(classify(&args(&["--fake-backend", "serve"])), Ok(Action::Serve { fake_backend: true, .. })));
     }
 
     #[test]
@@ -194,6 +240,51 @@ mod tests {
         let fail = classify(&args(&["serve", "--accept-note"])).expect_err("the note belongs to an install");
         assert!(fail.sentence.contains("--accept-note"), "{fail}");
         assert!(classify(&args(&["models", "verify", "lama", "--accept-note"])).is_err());
+    }
+
+    #[test]
+    fn the_device_flag_takes_one_of_three_words() {
+        // MG-11: `caim serve --device` is how a test or a timing run pins the backend.
+        let auto = Action::Serve { fake_backend: false, device: device::Setting::Auto };
+        for (word, setting) in [("auto", device::Setting::Auto), ("cuda", device::Setting::Cuda), ("cpu", device::Setting::Cpu)] {
+            let wanted = Action::Serve { fake_backend: false, device: setting };
+            assert_eq!(classify(&args(&["serve", "--device", word])).expect("a device word"), wanted);
+            assert_eq!(classify(&args(&["--device", word])).expect("the flag works without the word serve"), wanted);
+            assert_eq!(classify(&args(&[&format!("--device={word}")[..]])).expect("the one-word form"), wanted);
+        }
+        assert_eq!(classify(&args(&["serve"])).expect("no flag means auto"), auto);
+        assert_eq!(
+            classify(&args(&["serve", "--device", "CUDA"])).expect("the word is case-insensitive"),
+            Action::Serve { fake_backend: false, device: device::Setting::Cuda }
+        );
+    }
+
+    #[test]
+    fn a_device_that_is_not_one_of_the_three_words_says_so() {
+        for values in [args(&["serve", "--device", "gpu"]), args(&["serve", "--device=gpu"]), args(&["serve", "--device"])] {
+            let fail = classify(&values).expect_err("not a device");
+            assert_eq!(fail.status, Status::BadRequest);
+            assert!(fail.sentence.contains("auto, cuda or cpu"), "the sentence names what works: {fail}");
+        }
+        let fail = classify(&args(&["models", "list", "--device", "cuda"])).expect_err("the device belongs to serve");
+        assert!(fail.sentence.contains("--device"), "{fail}");
+    }
+
+    #[test]
+    fn the_cuda_commands_parse() {
+        assert_eq!(classify(&args(&["cuda", "status"])).expect("status takes nothing else"), Action::CudaStatus);
+        assert_eq!(classify(&args(&["cuda", "install"])).expect("install takes a flag"), Action::CudaInstall { accept_note: false });
+        assert_eq!(
+            classify(&args(&["cuda", "install", "--accept-note"])).expect("the note flag is accepted here too"),
+            Action::CudaInstall { accept_note: true }
+        );
+        let fail = classify(&args(&["cuda"])).expect_err("a cuda command is needed");
+        assert!(fail.sentence.contains("status or install"), "{fail}");
+        let fail = classify(&args(&["cuda", "remove"])).expect_err("remove is not a cuda command");
+        assert!(fail.sentence.contains("remove"), "the sentence names the command: {fail}");
+        assert!(USAGE.contains("cuda status"));
+        assert!(USAGE.contains("cuda install"));
+        assert!(USAGE.contains("--device"), "the usage line mentions the device flag");
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! The `caim` binary: `caim serve` (also the default) runs the loopback server, `--fake-backend`
-//! runs jobs on the built-in fake fill, `caim open` starts the manager unless one is already
-//! answering, `caim models ...` looks after the model store, and `--version` / `--help` answer
-//! without starting anything.
+//! runs jobs on the built-in fake fill, `--device` asks for a backend, `caim open` starts the manager
+//! unless one is already answering, `caim models ...` looks after the model store, `caim cuda ...`
+//! looks after the CUDA libraries, and `--version` / `--help` answer without starting anything.
 
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
@@ -9,6 +9,8 @@
 use std::io::IsTerminal;
 use std::io::Write;
 
+use craft_ai_manager::cuda;
+use craft_ai_manager::device;
 use craft_ai_manager::endpoint::{self, Launch};
 use craft_ai_manager::error::{Fail, Status};
 use craft_ai_manager::models;
@@ -31,13 +33,15 @@ fn main() -> std::process::ExitCode {
             help();
             std::process::ExitCode::SUCCESS
         }
-        Ok(Action::Serve { fake_backend }) => serve(fake_backend),
+        Ok(Action::Serve { fake_backend, device }) => serve(fake_backend, device),
         Ok(Action::Open) => open(),
         Ok(Action::ModelsList) => models_list(),
         Ok(Action::ModelsInstall { id, accept_note }) => models_install(&id, accept_note),
         Ok(Action::ModelsVerify { id }) => models_verify(&id),
         Ok(Action::ModelsRemove { id }) => models_remove(&id),
         Ok(Action::ModelsWhere) => models_where(),
+        Ok(Action::CudaStatus) => cuda_status(),
+        Ok(Action::CudaInstall { accept_note }) => cuda_install(accept_note),
     }
 }
 
@@ -47,26 +51,29 @@ fn help() {
     println!("  serve             run the loopback server (this is also the default)");
     println!("  open              start the manager, or say that one is already running");
     println!("  --fake-backend    run jobs on the built-in mean-colour fill, to try the protocol out");
+    println!("  --device          ask for a backend for every job: auto, cuda or cpu (default auto)");
     println!("  models list       one line per catalog entry: task, size, licences, and whether it is installed");
     println!("  models install    download one model, hashing it while it arrives");
     println!("  --accept-note     accept a flagged model's licence note and go ahead with the download");
     println!("  models verify     re-hash an installed model against the catalog");
     println!("  models remove     delete one model's files from disk (refused while a manager is running)");
     println!("  models where      print the models folder");
+    println!("  cuda status       the CUDA libraries, the cards this machine has, and whether a CUDA job could run");
+    println!("  cuda install      download the CUDA libraries NVIDIA's own licence covers (about 1.9 GB)");
     println!("exit codes: 0 everything is fine, 1 something went wrong, 2 the arguments do not make sense,");
     println!("            3 the model is unknown, is not installed, or its note needs acknowledging");
     println!("Craft AI Manager {VERSION}: https://github.com/erikerikerik/craft-ai-manager");
 }
 
 /// Run the server until something asks it to stop, then shut down cleanly.
-fn serve(fake_backend: bool) -> std::process::ExitCode {
-    serve_and_release(fake_backend, None)
+fn serve(fake_backend: bool, device: device::Setting) -> std::process::ExitCode {
+    serve_and_release(fake_backend, device, None)
 }
 
 /// [serve], handing over the launch lock this run took as `caim open`. The lock goes as soon as
 /// the server is listening and `endpoint.json` names this port, which is the moment a second
 /// `caim open` can stop waiting and see a running manager instead of starting another one.
-fn serve_and_release(fake_backend: bool, launch_lock: Option<endpoint::LaunchLock>) -> std::process::ExitCode {
+fn serve_and_release(fake_backend: bool, device: device::Setting, launch_lock: Option<endpoint::LaunchLock>) -> std::process::ExitCode {
     // MG-08 review round 2: the signal handler goes in before `Server::start` writes the endpoint
     // file, so a supervisor that stops the process the moment it can find the port still gets the
     // clean stop instead of the operating system's default handling.
@@ -76,7 +83,7 @@ fn serve_and_release(fake_backend: bool, launch_lock: Option<endpoint::LaunchLoc
         // removes the endpoint file, so this is a note rather than a reason not to run.
         eprintln!("{}", fail.sentence);
     }
-    let mut server = match Server::start_with_stop(ServeOptions { fake_backend, ..ServeOptions::default() }, &stop) {
+    let mut server = match Server::start_with_stop(ServeOptions { fake_backend, device, ..ServeOptions::default() }, &stop) {
         Ok(server) => server,
         Err(fail) => return report(fail),
     };
@@ -128,7 +135,7 @@ fn open() -> std::process::ExitCode {
             println!("Craft AI Manager is already running on 127.0.0.1:{port}. Nothing was started.");
             std::process::ExitCode::SUCCESS
         }
-        Launch::Start => serve_and_release(false, launch_lock),
+        Launch::Start => serve_and_release(false, device::Setting::Auto, launch_lock),
     }
 }
 
@@ -186,6 +193,35 @@ fn models_remove(id: &str) -> std::process::ExitCode {
 /// `caim models where`: the models folder, and nothing else.
 fn models_where() -> std::process::ExitCode {
     match models::where_folder() {
+        Ok(message) => {
+            println!("{message}");
+            std::process::ExitCode::SUCCESS
+        }
+        Err(fail) => report(fail),
+    }
+}
+
+/// `caim cuda status`: the four archives, the cards the probe found, and whether a CUDA job could
+/// actually run here (MG-11).
+fn cuda_status() -> std::process::ExitCode {
+    match cuda::status_lines() {
+        Ok(lines) => {
+            for line in lines {
+                println!("{line}");
+            }
+            std::process::ExitCode::SUCCESS
+        }
+        Err(fail) => report(fail),
+    }
+}
+
+/// `caim cuda install [--accept-note]`: the same progress line a model download prints, and the same
+/// exit code when the vendor's note has not been accepted yet.
+fn cuda_install(accept_note: bool) -> std::process::ExitCode {
+    let mut progress = Progress::default();
+    let outcome = cuda::install_all(accept_note, &mut |read, total| progress.report(read, total));
+    progress.finish();
+    match outcome {
         Ok(message) => {
             println!("{message}");
             std::process::ExitCode::SUCCESS

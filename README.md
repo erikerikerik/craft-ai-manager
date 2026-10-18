@@ -24,13 +24,17 @@ colour fill - is still there behind `--fake-backend`; since BF-01 it follows the
 MG-10 added the second model and the second task: `subject_mask` puts `birefnet_lite.onnx` through the same runtime and
 answers with an 8-bit soft-edge matte (`crates/caim/src/birefnet.rs`), and `crates/caim/src/routing.rs` is now the one
 place that maps a task to the model that serves it. The fake backend gained a matching mask mode - a centred soft
-ellipse - so PhotoCraft's mask tests can run with no model installed.
+ellipse - so PhotoCraft's mask tests can run with no model installed. MG-11 added the card: `crates/caim/src/device.rs` is the one resolver that decides which backend a job runs on, `crates/caim/src/cuda.rs` holds every CUDA and VRAM word in the crate, and `caim serve --device auto|cuda|cpu` pins the choice for a test or a timing run. Both models still answer on the CPU here, because their catalog entries still mark `cuda` `untested`: a CUDA golden has to pass on the card before that word changes.
 
 ## Running it
 
 ```text
 caim                        # the same as: caim serve
 caim serve --fake-backend   # jobs run on the built-in fill (fill) and ellipse (mask)
+caim serve --device cuda    # ask for the card; the CPU is the fallback, and the result says why
+caim cuda status            # the card, its free VRAM, and whether the CUDA libraries are installed
+caim cuda install           # name the NVIDIA libraries and their licences, then stop
+caim cuda install --accept-note   # and download them (about 1.9 GB)
 caim open                     # start the manager, or say that one is already running
 caim models list            # what the catalog offers, what is installed, and what it costs on disk
 caim models install <id>    # download one model, hashing it while it arrives
@@ -210,14 +214,46 @@ peak with it on and 6.40 GiB with it off, for about 4% more run time. The catalo
 lower figure. Measured here, debug build, Ryzen 9 7950X: 3.7 s to load the session, 9.8 s for the first job, 8.5 s warm;
 a release build is roughly half that (RS-01: 3.6-3.8 s load, 4.06-4.29 s warm).
 
+### The card (CUDA)
+
+MG-11 gives CAIM a second backend, in two files. `crates/caim/src/device.rs` is the one resolver: it takes the task, the
+model's catalog entry, the `--device` setting and what the machine has, and answers with the backend, the device name and
+the fallback chain. `crates/caim/src/cuda.rs` holds every CUDA and VRAM word in the crate - the `nvidia-smi` probe, the four
+pinned NVIDIA archives, the DLL preloading, the one-GPU-job gate, and the placement check. The runners are handed a device;
+they never choose one.
+
+`--device auto` (the default) picks the best backend the catalog marks `supported` for that model and falls back to the CPU.
+`untested` and `experimental` are never picked, and both models are `cuda = untested` today, so every job still runs on the
+CPU here. `--device cuda` asks for the card and still never fails a job the CPU can run: the job runs on the CPU and the
+result says why, with `fallback_reason` exactly one of `backend_unavailable`, `backend_init_failed`,
+`insufficient_memory`, `unsupported_model` or `execution_failed`, and the runtime's own words in `diagnostics`.
+
+Two rules decide whether CUDA is tried at all. **Memory:** before a CUDA session is created CAIM compares the model's
+`memory_mib` against the VRAM **free right now**, measured with `nvidia-smi`, never the card's total - PhotoCraft has its
+own GPU Memory preference and holds VRAM of its own on the same card. **One GPU job at a time.**
+
+CAIM does not believe the runtime when it says CUDA is available. A CUDA session is created with ONNX Runtime's own
+profiling on, and the node events are counted: a run with no CUDA-execution-provider event fell back inside the runtime,
+which is `backend_init_failed`, and the job re-runs on the CPU. Only a run that shows CUDA events is reported as
+`device: cuda`.
+
+The NVIDIA libraries are not shipped and not fetched quietly. `caim cuda status` prints the four pinned archives, the cards
+the probe found, and whether a CUDA job could run here. `caim cuda install` names the two NVIDIA agreements and stops;
+`caim cuda install --accept-note` records the acknowledgment and downloads 1,915,559,656 bytes into CAIM's own CUDA folder
+(`%LOCALAPPDATA%\CraftAI\cuda`, moved by `CRAFT_AI_CUDA`), each archive checked for size and SHA-256 through the same store
+MG-02 built for models, and only the library files CAIM names are unpacked from each archive. `ATTRIBUTION.md` records what
+those two agreements cover.
+
 ### What a result says about itself
 
 The result of a job reports the real provenance. The five keys MG-01 shipped keep their names and their meaning -
-`model` (`lama`, `birefnet-lite`, `fake-fill` or `fake-mask`), `device` (the backend that ran, `cpu` today), `provider`
+`model` (`lama`, `birefnet-lite`, `fake-fill` or `fake-mask`), `device` (the backend that ran, `cpu` or `cuda`), `provider`
 `local`, `elapsed_ms` (the total) and `image_size` - so an old client reads exactly what it always did. Amendment 18
 adds the rest of the account: `kind` (`image` or `mask`), `model_version` and `model_sha256` (which catalog entry, which
-bytes), `device_requested` (`auto` until a device setting exists), `device_name` (`CPU`), `fallback_reason` (`null` when
-the requested backend ran), `load_ms` and `run_ms`. `diagnostics`, the runtime's own error text, is for the log only. A
+bytes), `device_requested` (`auto`, `cuda` or `cpu` - what `--device` asked for), `device_name` (`CPU`, or the card's own
+name, `NVIDIA GeForce RTX 4090`), `fallback_reason` (`null` when the requested backend ran, otherwise exactly one of
+`backend_unavailable`, `backend_init_failed`, `insufficient_memory`, `unsupported_model`, `execution_failed`), `load_ms`
+and `run_ms`. `diagnostics`, the runtime's own error text, is for the log only. A
 field with nothing to say is left out rather than sent empty, which is why a fake run has no `model_version`.
 
 ### Stopping it
