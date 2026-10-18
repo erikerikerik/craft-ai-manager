@@ -1,5 +1,7 @@
 # HANDOFF: Craft AI Manager
 
+PARKED: CAIM PR #8 (MG-10) has used its two review fix rounds. Codex-cloud's round-2 review of `d40b2fe` added one more P2 - `crates/caim/src/birefnet.rs:102`: the public resamplers cap each axis (MAX_RESAMPLE_AXIS) but not the product, so a 1,048,576 x 1,048,576 `Frame` still reaches a ~4 TiB source-plane allocation (the protocol path validates the pixel product; these public APIs do not). Erik's choice: authorise a third fix round (as with MG-12 under D14), or merge as-is and log the P2 for BH-02.
+
 ## 2026-10-17: Codex-Strata (autopilot) - MG-10 task routing, mask results and the BiRefNet Select Subject runner
 
 - Branch `ai/mg-10-subject-mask` from `origin/main` `e8a8cda` (MG-08), commit `a924421`; **PR #8** (draft) against `main`. 16 files changed (+1356 / -186), five of them new. Receipt: `agents/receipts/MG-10.md`. Contract: fork `agents/SPEC.md` v1.1 **amendment 18**. **No new dependencies** - `Cargo.toml` and `Cargo.lock` are untouched, so the dependency graph is byte-identical to `main`.
