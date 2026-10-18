@@ -47,9 +47,27 @@ pub const PROBE_POLL: Duration = Duration::from_millis(50);
 /// The word that marks one graph node as placed on the CUDA provider in ONNX Runtime's own profile.
 pub const CUDA_NODE_MARK: &str = "CUDA Execution Provider";
 
+/// Is this a platform CAIM has CUDA libraries pinned for? The four archives below are NVIDIA's
+/// `windows-x86_64` redist set and nothing else: MG-11's CUDA path is the Windows 4090 PC, and a
+/// download list is not something to widen by accident. Off Windows there is nothing pinned, so
+/// [components] is empty, [is_ready] can never be true, and a user is told the platform is not
+/// covered rather than being pointed at a command that would fetch `.dll` files this machine cannot
+/// load. The NVIDIA index does carry `linux-x86_64` entries; pinning them is its own task with its
+/// own evidence, not a side effect of a CI run.
+#[must_use]
+pub fn supported_here() -> bool {
+    cfg!(windows)
+}
+
+/// The sentence for the case above, shared by the resolver's note and `caim cuda status`.
+#[must_use]
+pub fn unpinned_sentence() -> String {
+    format!("Craft AI Manager has no CUDA library download pinned for {} yet.", std::env::consts::OS)
+}
+
 /// The libraries each archive gives CAIM, in the order ONNX Runtime wants them loaded (a dependency
 /// before its dependent). These are the names ONNX Runtime itself looks for, which the
-/// `the_extraction_covers_what_onnx_runtime_needs` test pins against the runtime's own lists.
+/// `ort_only_asks_for_names_caim_unpacks` test pins against the runtime's own lists.
 const WANTED: [(&str, &[&str]); 4] = [
     ("cuda_cudart", &["cudart64_13.dll"]),
     ("libcublas", &["cublasLt64_13.dll", "cublas64_13.dll", "nvblas64_13.dll"]),
@@ -129,8 +147,13 @@ fn pinned(id: &str, version: &str, file: &str, url: &str, size: u64, sha256: &st
 ///
 /// Every URL was fetched and hashed on the machine this was written on; the sizes and SHA-256s are
 /// what those downloads produced.
+///
+/// The set is Windows-only, so off Windows the answer is an empty list: see [supported_here].
 #[must_use]
 pub fn components() -> Vec<Model> {
+    if !supported_here() {
+        return Vec::new();
+    }
     vec![
         pinned(
             "cuda_cudart",
@@ -209,11 +232,14 @@ pub fn library_dir(root: &Path) -> PathBuf {
 }
 
 /// Are all nineteen libraries on disk? This is a cheap existence check, not a hash check: the archives
-/// were hashed when they arrived, and the extraction verified each file's own CRC.
+/// were hashed when they arrived, and the extraction verified each file's own CRC. A platform with
+/// nothing pinned has an empty catalog ([supported_here]), and an empty catalog is never ready: a
+/// CUDA job needs libraries, not the absence of anything left to check.
 #[must_use]
 pub fn is_ready(root: &Path) -> bool {
     let dir = library_dir(root);
-    components().iter().all(|model| wanted(model).iter().all(|(_, name)| dir.join(name).is_file()))
+    let parts = components();
+    !parts.is_empty() && parts.iter().all(|model| wanted(model).iter().all(|(_, name)| dir.join(name).is_file()))
 }
 
 /// Fetch the four archives and unpack the libraries CAIM needs, into [library_dir].
@@ -224,6 +250,9 @@ pub fn is_ready(root: &Path) -> bool {
 /// archive that is already verified is not fetched again, and a library that is already on disk with
 /// the right size is not written again.
 pub fn install(root: &Path, accept_note: bool, fetcher: &dyn fetch::Fetch, progress: &mut dyn FnMut(u64, u64)) -> Result<String> {
+    if !supported_here() {
+        return Err(Fail::internal(format!("{} There is nothing to install.", unpinned_sentence())));
+    }
     let dir = library_dir(root);
     std::fs::create_dir_all(&dir).map_err(|error| Fail::internal(format!("Craft AI Manager could not create {}: {error}", dir.display())))?;
     let mut downloaded = 0usize;
@@ -275,7 +304,14 @@ pub fn status_lines() -> Result<Vec<String>> {
     for card in found {
         lines.push(format!("  device: {} ({} MiB free of {} MiB)", card.name, card.free_mib, card.total_mib));
     }
-    lines.push(if is_ready(&root) { "  ready: a CUDA job can run here".to_string() } else { "  not ready: run caim cuda install --accept-note".to_string() });
+    let state = if !supported_here() {
+        format!("  not ready: {}", unpinned_sentence())
+    } else if is_ready(&root) {
+        "  ready: a CUDA job can run here".to_string()
+    } else {
+        "  not ready: run caim cuda install --accept-note".to_string()
+    };
+    lines.push(state);
     Ok(lines)
 }
 
@@ -364,13 +400,8 @@ pub fn accelerators() -> Vec<device::Accelerator> {
         return Vec::new();
     };
     let ready = store_root().is_some_and(|root| is_ready(&root));
-    vec![device::Accelerator {
-        device: device::Device::Cuda,
-        name: card.name,
-        free_mib: Some(card.free_mib),
-        ready,
-        note: (!ready).then(|| "the CUDA libraries are not installed: run caim cuda install --accept-note".to_string()),
-    }]
+    let why_not = if supported_here() { "the CUDA libraries are not installed: run caim cuda install --accept-note".to_string() } else { unpinned_sentence() };
+    vec![device::Accelerator { device: device::Device::Cuda, name: card.name, free_mib: Some(card.free_mib), ready, note: (!ready).then_some(why_not) }]
 }
 
 /// One preload per folder per process. ONNX Runtime's own loader leaks the libraries by design -
@@ -778,6 +809,10 @@ mod tests {
         }
     }
 
+    /// The cross-check against ONNX Runtime's own list is a Windows invariant, because the pinned
+    /// catalog is NVIDIA's Windows redist set ([supported_here]). Off Windows CAIM unpacks nothing,
+    /// while the runtime's list names `.so` files that are in no archive CAIM pins.
+    #[cfg(windows)]
     #[test]
     fn ort_only_asks_for_names_caim_unpacks() {
         let mut held: Vec<&str> = Vec::new();
@@ -787,6 +822,28 @@ mod tests {
         for name in ort::ep::cuda::CUDA_DYLIBS.iter().chain(ort::ep::cuda::CUDNN_DYLIBS.iter()) {
             assert!(held.contains(name), "ONNX Runtime asks for {name}, which CAIM does not unpack");
         }
+    }
+
+    #[test]
+    fn the_pinned_catalog_exists_only_on_the_platform_it_is_pinned_for() {
+        assert_eq!(components().is_empty(), !supported_here(), "the catalog and the platform agree");
+        for model in components() {
+            assert!(model.file.contains("windows-x86_64"), "{} is pinned for Windows, not for {}", model.file, std::env::consts::OS);
+        }
+    }
+
+    #[test]
+    fn a_folder_full_of_the_pinned_names_is_ready_only_where_they_are_pinned() {
+        let scratch = Scratch::new("cuda-pinned-here");
+        let dir = library_dir(&scratch.path);
+        std::fs::create_dir_all(&dir).expect("the library folder can be made");
+        for (_, names) in WANTED {
+            for name in names {
+                std::fs::write(dir.join(name), b"not a real library").expect("a library slot can be filled");
+            }
+        }
+        assert_eq!(is_ready(&scratch.path), supported_here(), "an empty catalog is never ready, even with every name on disk");
+        drop(scratch);
     }
 
     #[test]
@@ -898,20 +955,18 @@ mod tests {
 
     #[test]
     fn the_cuda_folder_is_a_sibling_of_the_models_folder() {
+        // Built out of PathBuf rather than a literal: the rule under test is "a folder named cuda
+        // beside the models folder", which is the same rule on every platform, and a Windows-shaped
+        // literal is a single component with no parent on a Unix one.
+        let beside = std::env::temp_dir().join("caim-cuda-sibling");
+        let models = beside.join("models");
+        assert_eq!(store_root_in(None, Some(models.clone())), Some(beside.join("cuda")), "cuda is a sibling of models, not a child of it");
         assert_eq!(
-            store_root_in(None, Some(PathBuf::from(r"C:\Users\Erik\AppData\Local\craft-ai-manager\models"))),
-            Some(PathBuf::from(r"C:\Users\Erik\AppData\Local\craft-ai-manager\cuda"))
-        );
-        assert_eq!(
-            store_root_in(Some(std::ffi::OsString::from(r"D:\cuda-libs")), Some(PathBuf::from(r"C:\Users\Erik\models"))),
-            Some(PathBuf::from(r"D:\cuda-libs")),
+            store_root_in(Some(std::ffi::OsString::from("picked-cuda-libs")), Some(models.clone())),
+            Some(PathBuf::from("picked-cuda-libs")),
             "CRAFT_AI_CUDA wins"
         );
-        assert_eq!(
-            store_root_in(Some(std::ffi::OsString::from("")), Some(PathBuf::from(r"C:\Users\Erik\models"))),
-            Some(PathBuf::from(r"C:\Users\Erik\cuda")),
-            "an empty CRAFT_AI_CUDA is no answer"
-        );
+        assert_eq!(store_root_in(Some(std::ffi::OsString::from("")), Some(models)), Some(beside.join("cuda")), "an empty CRAFT_AI_CUDA is no answer");
         assert_eq!(store_root_in(None, None), None, "a machine with no models folder has no CUDA folder either");
     }
 
