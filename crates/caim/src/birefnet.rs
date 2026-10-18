@@ -41,6 +41,14 @@ pub const MODEL_SIZE: usize = 1024;
 /// bounded before it decides an allocation: `3 * size * size` f32 is 50 MB at 2048, and past the
 /// point where that length wraps it is an abort rather than an error a caller can catch.
 pub const MAX_PREPROCESS_SIDE: usize = 2048;
+/// The longest axis the resamplers will take, in pixels. The widened tent keeps one entry per
+/// covered source sample, so an axis only the caller chooses is an allocation only the caller
+/// chooses: `axis_weights(u32::MAX as usize, 1)` would collect about four billion tuples and abort
+/// the process, which no caller can catch. Every real call is far inside the cap - the widest axis
+/// a mask job can present is that task's own `max_pixels` (1,048,576, checked in
+/// `protocol::JobRequest::validate`) with a one-pixel other axis, and the model's own side is
+/// [MODEL_SIZE]. Raising it is a deliberate decision, not an accident of the caller's input.
+pub const MAX_RESAMPLE_AXIS: usize = 1_048_576;
 /// The catalog id of the model this runner can run.
 pub const BIREFNET_ID: &str = "birefnet-lite";
 /// What `/result` reports when a job ran here.
@@ -91,7 +99,7 @@ pub fn preprocess_to(image: &Frame, size: usize) -> Vec<f32> {
         return Vec::new();
     };
     let max = f64::from(image.max_sample()).max(1.0);
-    if size == 0 || size > MAX_PREPROCESS_SIDE {
+    if size == 0 || size > MAX_PREPROCESS_SIDE || width > MAX_RESAMPLE_AXIS || height > MAX_RESAMPLE_AXIS {
         return Vec::new();
     }
     // Every length here is derived from what the caller sent, so every one is checked: a wrapped
@@ -139,6 +147,9 @@ fn copy_plane(plane: &[f32], out: &mut [f32], start: usize) {
 /// 1,048,576 pixels admits a 4096x256 image, so a 4096-wide axis comes down to 1024. Two taps there
 /// would alias high detail straight into the model input. On an axis that grows the rule is the same
 /// two samples [lama::axis_weights] uses.
+///
+/// An axis outside `1..=MAX_RESAMPLE_AXIS` answers empty rather than allocating: the widened tent
+/// holds one entry per covered source sample, so the axes are bounded before they decide a length.
 #[must_use]
 pub fn axis_weights(source: usize, target: usize) -> Vec<Vec<(usize, f64)>> {
     axis_taps(source, target, true)
@@ -156,7 +167,9 @@ pub fn axis_weights_two_tap(source: usize, target: usize) -> Vec<Vec<(usize, f64
 /// The taps for one axis. `widened` is the antialiased rule; the tent's half-width is one source
 /// sample when an axis grows and the reduction factor when it shrinks, which is PIL's rule too.
 fn axis_taps(source: usize, target: usize, widened: bool) -> Vec<Vec<(usize, f64)>> {
-    if target == 0 {
+    // Bounded before anything is collected: `target` is the number of tap lists and, on a shrink,
+    // each of those lists holds up to `source` entries.
+    if target == 0 || source > MAX_RESAMPLE_AXIS || target > MAX_RESAMPLE_AXIS {
         return Vec::new();
     }
     if source == 0 {
@@ -189,6 +202,9 @@ fn axis_taps(source: usize, target: usize, widened: bool) -> Vec<Vec<(usize, f64
 
 /// Resize one channel plane, row-major, bilinearly on both axes, widening the filter on an axis that
 /// shrinks ([axis_weights]).
+///
+/// A plane or a target with an axis outside `1..=MAX_RESAMPLE_AXIS` answers empty rather than
+/// allocating, for the same reason [axis_weights] bounds its axes.
 #[must_use]
 pub fn resize_bilinear(plane: &[f32], width: usize, height: usize, target_width: usize, target_height: usize) -> Vec<f32> {
     resize_plane(plane, width, height, target_width, target_height, true)
@@ -201,7 +217,13 @@ pub fn resize_two_tap(plane: &[f32], width: usize, height: usize, target_width: 
 }
 
 fn resize_plane(plane: &[f32], width: usize, height: usize, target_width: usize, target_height: usize, widened: bool) -> Vec<f32> {
-    if target_width == 0 || target_height == 0 {
+    if target_width == 0
+        || target_height == 0
+        || width > MAX_RESAMPLE_AXIS
+        || height > MAX_RESAMPLE_AXIS
+        || target_width > MAX_RESAMPLE_AXIS
+        || target_height > MAX_RESAMPLE_AXIS
+    {
         return Vec::new();
     }
     let across = resample_across(plane, height, width, target_width, widened);
@@ -563,9 +585,9 @@ pub(crate) fn stand_in_pipeline(
 #[cfg(test)]
 mod tests {
     use super::{
-        BIREFNET_DEVICE, BIREFNET_ID, BIREFNET_MODEL, BIREFNET_PROVIDER, Identity, LOAD_PROGRESS, Loader, MAX_PREPROCESS_SIDE, MODEL_SIZE, MSG_FINISH,
-        MSG_LOAD, MSG_PREPARE, MSG_RUN, PREPARE_PROGRESS, Pipeline, RUN_END, RUN_PROGRESS, StandIn, axis_weights, axis_weights_two_tap, installed_pipeline,
-        matte, preprocess_to, resize_bilinear, resize_two_tap, sigmoid, stand_in_pipeline,
+        BIREFNET_DEVICE, BIREFNET_ID, BIREFNET_MODEL, BIREFNET_PROVIDER, Identity, LOAD_PROGRESS, Loader, MAX_PREPROCESS_SIDE, MAX_RESAMPLE_AXIS, MODEL_SIZE,
+        MSG_FINISH, MSG_LOAD, MSG_PREPARE, MSG_RUN, PREPARE_PROGRESS, Pipeline, RUN_END, RUN_PROGRESS, StandIn, axis_weights, axis_weights_two_tap,
+        installed_pipeline, matte, preprocess_to, resize_bilinear, resize_two_tap, sigmoid, stand_in_pipeline,
     };
     use crate::catalog::Model;
     use crate::error::Status;
@@ -670,6 +692,28 @@ mod tests {
         assert!(preprocess_to(&frame, 0).is_empty(), "nothing to build");
         assert!(preprocess_to(&frame, MAX_PREPROCESS_SIDE + 1).is_empty(), "a caller must not get to choose the allocation");
         assert_eq!(preprocess_to(&frame, MODEL_SIZE).len(), 3 * MODEL_SIZE * MODEL_SIZE, "the model's own size is inside the bound");
+    }
+
+    #[test]
+    fn the_public_resamplers_bound_their_axes_before_allocating_taps() {
+        // The widened tent holds one entry per covered source sample, so an axis only the caller
+        // chooses is an allocation only the caller chooses: 4,294,967,295 -> 1 would collect about
+        // four billion tuples and abort the process.
+        assert!(axis_weights(MAX_RESAMPLE_AXIS + 1, 1).is_empty(), "the source axis is bounded");
+        assert!(axis_weights(1, MAX_RESAMPLE_AXIS + 1).is_empty(), "the target axis is bounded");
+        assert!(axis_weights_two_tap(MAX_RESAMPLE_AXIS + 1, 1).is_empty(), "the narrow rule is bounded too");
+        // ... and the same path seen through the resizer, which is what the finding named.
+        assert!(resize_bilinear(&[1.0f32; 4], MAX_RESAMPLE_AXIS + 1, 1, 2, 1).is_empty(), "a plane wider than the cap");
+        assert!(resize_bilinear(&[1.0f32; 4], 1, 1, MAX_RESAMPLE_AXIS + 1, 1).is_empty(), "a target wider than the cap");
+        assert!(resize_two_tap(&[1.0f32; 4], 1, MAX_RESAMPLE_AXIS + 1, 1, 2).is_empty());
+        // A frame wider than the cap never reaches the resizer at all, so the bound is not only on
+        // the two functions the finding named.
+        let wide = flat(3, u32::try_from(MAX_RESAMPLE_AXIS + 1).unwrap_or(u32::MAX), 1, 128);
+        assert!(preprocess_to(&wide, MODEL_SIZE).is_empty(), "the resizer is not the only way in");
+        // The cap is not in the way of anything real: a mask job's widest legal image axis is
+        // exactly MAX_RESAMPLE_AXIS, and the model's own side is far inside it.
+        assert_eq!(axis_weights(MAX_RESAMPLE_AXIS, 1).len(), 1, "the cap itself is inside the cap");
+        assert_eq!(resize_bilinear(&[0.5f32; 4], 2, 2, MAX_RESAMPLE_AXIS, 1).len(), MAX_RESAMPLE_AXIS);
     }
 
     #[test]
