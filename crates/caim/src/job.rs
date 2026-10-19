@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use crate::activity;
 use crate::backend::{self, Filled};
+use crate::device;
 use crate::error::{Fail, Result};
 use crate::image::{self, Frame};
 use crate::lama;
@@ -84,25 +85,50 @@ pub enum Backend {
     Fake { step_delay: Duration },
     /// The real ONNX runners, one slot per task, each with its session loaded on the first job and
     /// kept after that. MG-10 added the second slot, so a store that holds only one of the two
-    /// models still serves the task it holds.
-    Real { lama: Option<Arc<lama::Pipeline>>, birefnet: Option<Arc<crate::birefnet::Pipeline>> },
+    /// models still serves the task it holds. MG-11 adds `device`: the setting every job on this
+    /// start resolves against. It is resolved again per job, not once per start, because the memory
+    /// free on the card changes between jobs.
+    Real { lama: Option<Arc<lama::Pipeline>>, birefnet: Option<Arc<crate::birefnet::Pipeline>>, device: device::Setting },
 }
 
 impl Backend {
-    /// One line for the terminal: which backend this start is running.
+    /// One line for the terminal: which backend this start is running and which device it was
+    /// asked for. MG-11 drops the promise that the run is on the CPU, because it may not be.
     #[must_use]
-    pub fn note(&self) -> &'static str {
+    pub fn note(&self) -> String {
         match self {
-            Backend::NoModel => "none: no model is installed yet",
-            Backend::Fake { .. } => "fake-fill and fake-mask (the built-in fill and ellipse)",
-            Backend::Real { lama: Some(_), birefnet: None } => "lama (LaMa on the local CPU, loaded on the first job)",
-            Backend::Real { lama: None, birefnet: Some(_) } => "birefnet-lite (BiRefNet on the local CPU, loaded on the first job)",
-            Backend::Real { lama: Some(_), birefnet: Some(_) } => "lama and birefnet-lite (both on the local CPU, loaded on the first job)",
+            Backend::NoModel => "none: no model is installed yet".to_string(),
+            Backend::Fake { .. } => "fake-fill and fake-mask (the built-in fill and ellipse)".to_string(),
+            Backend::Real { lama: Some(_), birefnet: None, device } => format!("lama (device {}, loaded on the first job)", device.token()),
+            Backend::Real { lama: None, birefnet: Some(_), device } => format!("birefnet-lite (device {}, loaded on the first job)", device.token()),
+            Backend::Real { lama: Some(_), birefnet: Some(_), device } => {
+                format!("lama and birefnet-lite (device {}, loaded on the first job)", device.token())
+            }
             // The start only makes `Real` when it found a model, so this is defensive rather than
             // reachable; it keeps the line honest if that ever changes.
-            Backend::Real { .. } => "none: no model is installed yet",
+            Backend::Real { .. } => "none: no model is installed yet".to_string(),
         }
     }
+}
+
+/// The device chain for one job (MG-11), decided from the model that is about to run.
+///
+/// The manifest comes from the pipeline itself, so the resolver measures the card against the same
+/// `memory_mib` and the same `backends` table the catalog gave that model. A pipeline built straight
+/// from a path claims no backend at all, which the resolver reads as CPU only - what such a pipeline
+/// has always done. `--device cpu` and a model with no tested CUDA build never probe the machine,
+/// so a serve on a machine with no GPU never runs the vendor's tool. `session_card` comes from the
+/// pipeline that is about to run: when it already keeps this model on the card the probe has just
+/// named, the resolver must not measure that memory as something still to be found. It names a card,
+/// not merely "a CUDA session", because on two cards a session on one says nothing about the other.
+#[must_use]
+fn decision_for(setting: device::Setting, manifest: Option<device::Manifest>, task: &str, model: &str, session_card: Option<i32>) -> device::Decision {
+    let manifest = manifest.unwrap_or_else(|| device::Manifest::cpu_only(model, 0));
+    device::Resolver::new(setting).resolve_lazy(task, &manifest, &move || {
+        let mut machine = device::Machine::probe();
+        machine.mark_resident(device::Device::Cuda, session_card);
+        machine
+    })
 }
 
 /// What `GET /v1/jobs/{id}/result` reports: amendment 14 wants this pinned to the layer later.
@@ -511,9 +537,15 @@ fn run_one(shared: &Arc<Mutex<Shared>>, id: &str, backend: &Backend) {
         (Backend::NoModel, _) => Err(Fail::bad_request(routing::not_ready_sentence(&task))),
         (Backend::Fake { step_delay }, TASK_MASK) => backend::run_mask(&image, &mask, &cancel, *step_delay, &mut progress),
         (Backend::Fake { step_delay }, _) => backend::run_fill(&image, &mask, &cancel, *step_delay, &mut progress),
-        (Backend::Real { birefnet: Some(pipeline), .. }, TASK_MASK) => pipeline.run_mask(&image, &mask, &cancel, &mut progress),
+        (Backend::Real { birefnet: Some(pipeline), device: setting, .. }, TASK_MASK) => {
+            let decision = decision_for(*setting, pipeline.manifest(), TASK_MASK, crate::birefnet::BIREFNET_ID, pipeline.session_card());
+            pipeline.run_mask_on(&image, &mask, &decision, &cancel, &mut progress)
+        }
         (Backend::Real { birefnet: None, .. }, TASK_MASK) => Err(Fail::bad_request(routing::not_ready_sentence(TASK_MASK))),
-        (Backend::Real { lama: Some(pipeline), .. }, _) => pipeline.run_fill(&image, &mask, &cancel, &mut progress),
+        (Backend::Real { lama: Some(pipeline), device: setting, .. }, _) => {
+            let decision = decision_for(*setting, pipeline.manifest(), &task, lama::LAMA_ID, pipeline.session_card());
+            pipeline.run_fill_on(&image, &mask, &decision, &cancel, &mut progress)
+        }
         (Backend::Real { lama: None, .. }, _) => Err(Fail::bad_request(routing::not_ready_sentence(&task))),
     };
     drop(image);
@@ -599,18 +631,21 @@ fn finish(shared: &Arc<Mutex<Shared>>, id: &str, cancel: &std::sync::atomic::Ato
     log_activity(path.as_deref(), &record);
 }
 
-/// The line the activity log gets for a finished job (amendment 18, "Activity log"). The fields
-/// MG-10 and MG-11 will fill in are `None` today, which is what the amendment asks for.
+/// The line the activity log gets for a finished job: amendment 18's "task, model, version,
+/// device, requested, fallback, timings, state". Every field comes from the same provenance the
+/// result reports, so the log and the answer cannot disagree about which device ran or why. A job
+/// that never reached a backend has no provenance, so its line says so with nulls rather than
+/// inventing a device.
 fn activity_record(entry: &Entry) -> activity::Record {
     let provenance = entry.provenance.as_ref();
     activity::Record {
         time: activity::now_stamp(),
         task: Some(entry.task.clone()),
         model: provenance.map(|source| source.model.clone()),
-        version: None,
+        version: provenance.and_then(|source| source.model_version.clone()),
         device: provenance.map(|source| source.device.clone()),
-        device_requested: None,
-        fallback_reason: None,
+        device_requested: provenance.map(|source| source.device_requested.clone()),
+        fallback_reason: provenance.and_then(|source| source.fallback_reason.clone()),
         elapsed_ms: provenance.map(|source| source.elapsed_ms),
         state: entry.state.wire().to_string(),
     }
@@ -693,8 +728,9 @@ mod tests {
         }
         runner.admit(0).expect("expired records free admission");
     }
-    use super::{Backend, MAX_QUEUE, Provenance, Runner, State, find, lock};
+    use super::{Backend, MAX_QUEUE, Provenance, Runner, State, decision_for, find, lock};
     use crate::backend;
+    use crate::device;
     use crate::image::Frame;
     use crate::lama;
     use std::sync::Arc;
@@ -906,13 +942,109 @@ mod tests {
         let loads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let runs = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let pipeline = lama::stand_in_pipeline(128.0, Duration::ZERO, &loads, &runs);
-        let runner = Runner::new(Backend::Real { lama: Some(pipeline), birefnet: None }, MAX_QUEUE).expect("the worker starts");
+        let runner = Runner::new(Backend::Real { lama: Some(pipeline), birefnet: None, device: device::Setting::Auto }, MAX_QUEUE).expect("the worker starts");
         let id = runner.submit(TASK_MASK, frame(), mask()).expect("the job is queued");
         assert_eq!(finish(&runner, &id), State::Failed, "the queue accepted it, so the worker says why it cannot run");
         let (_, _, message) = runner.state(&id).expect("the job exists");
         assert_eq!(message, "The Select Subject model isn't installed.", "{message}");
         assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 0, "LaMa never ran");
         runner.stop();
+    }
+
+    #[test]
+    fn the_start_line_names_the_device_that_was_asked_for() {
+        // MG-11: the line no longer promises the CPU, because the run may land on the card.
+        let (loads, runs) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let pipeline = lama::stand_in_pipeline(128.0, Duration::ZERO, &loads, &runs);
+        let backend = Backend::Real { lama: Some(pipeline), birefnet: None, device: device::Setting::Cpu };
+        assert_eq!(backend.note(), "lama (device cpu, loaded on the first job)");
+        assert_eq!(Backend::Fake { step_delay: Duration::ZERO }.note(), "fake-fill and fake-mask (the built-in fill and ellipse)");
+    }
+
+    #[test]
+    fn a_card_the_manifest_has_never_tested_is_a_cpu_job_with_amendment_18s_word() {
+        // MG-11: the queue decides per job from the model's own manifest. A model the catalog has
+        // never run on the card never reaches the card, and the result says so in one of the five
+        // allowed words. The machine is not even probed: the manifest already said no.
+        let mut backends = std::collections::BTreeMap::new();
+        backends.insert("cpu".to_string(), "supported".to_string());
+        backends.insert("cuda".to_string(), "untested".to_string());
+        let identity = lama::Identity { version: "1.0".to_string(), sha256: "ab".repeat(32), memory_mib: 1_500, backends };
+        let (loads, runs) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let (loads_in, runs_in) = (Arc::clone(&loads), Arc::clone(&runs));
+        let load: lama::Loader = Box::new(move |_path, _device| {
+            loads_in.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(lama::StandIn { fill: 0.5, step: Duration::ZERO, runs: Arc::clone(&runs_in) }))
+        });
+        let pipeline = lama::Pipeline::with_identity_and_loader("lama_fp32.onnx", Some(identity), load);
+        let runner = Runner::new(Backend::Real { lama: Some(pipeline), birefnet: None, device: device::Setting::Cuda }, MAX_QUEUE).expect("the worker starts");
+        let id = runner.submit(TASK_FILL, frame(), mask()).expect("the job is accepted");
+        assert_eq!(finish(&runner, &id), State::Done);
+        let provenance = runner.provenance(&id).expect("a done job has provenance");
+        assert_eq!(provenance.device_requested, "cuda", "the start asked for the card");
+        assert_eq!(provenance.device, "cpu", "and the CPU ran it");
+        assert_eq!(provenance.device_name.as_deref(), Some("CPU"));
+        assert_eq!(provenance.fallback_reason.as_deref(), Some("unsupported_model"));
+        assert!(provenance.diagnostics.as_deref().unwrap_or_default().contains("no tested CUDA build"), "{:?}", provenance.diagnostics);
+        assert_eq!((loads.load(Ordering::SeqCst), runs.load(Ordering::SeqCst)), (1, 1), "one session, loaded on the CPU, and it ran");
+        runner.stop();
+    }
+
+    #[test]
+    fn the_activity_line_carries_the_same_device_account_as_the_result() {
+        // MG-11: amendment 18 wants the log to carry the requested device and the fallback reason,
+        // not just the one that ran. A fallback is the case that matters: a log that says only
+        // "cpu" cannot tell you the card was asked for and refused the job.
+        let entry = super::Entry {
+            id: "job-1".to_string(),
+            task: TASK_FILL.to_string(),
+            state: State::Done,
+            progress: 1.0,
+            message: "Done.".to_string(),
+            cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            input: None,
+            png: None,
+            delivering: false,
+            memory: None,
+            provenance: Some(Provenance {
+                model: "lama".to_string(),
+                device: "cpu".to_string(),
+                provider: "local".to_string(),
+                elapsed_ms: 1_234,
+                image_size: [2, 2],
+                kind: OUTPUT_IMAGE,
+                model_version: Some("1.0".to_string()),
+                model_sha256: Some("ab".repeat(32)),
+                device_requested: "cuda".to_string(),
+                device_name: Some("CPU".to_string()),
+                fallback_reason: Some("unsupported_model".to_string()),
+                load_ms: 100,
+                run_ms: 1_100,
+                diagnostics: Some("the card would not start".to_string()),
+            }),
+            finished_at: Some(std::time::Instant::now()),
+        };
+        let record = super::activity_record(&entry);
+        assert_eq!(record.task.as_deref(), Some(TASK_FILL));
+        assert_eq!(record.model.as_deref(), Some("lama"));
+        assert_eq!(record.version.as_deref(), Some("1.0"), "the model version MG-10 put on the result reaches the log");
+        assert_eq!(record.device.as_deref(), Some("cpu"), "the backend that ran");
+        assert_eq!(record.device_requested.as_deref(), Some("cuda"), "the backend that was asked for");
+        assert_eq!(record.fallback_reason.as_deref(), Some("unsupported_model"), "and why they differ");
+        assert_eq!(record.elapsed_ms, Some(1_234), "the timings are still there");
+        assert_eq!(record.state, "done");
+    }
+
+    #[test]
+    fn a_pipeline_with_no_catalog_entry_is_a_cpu_job_too() {
+        // A pipeline built straight from a path - what the tests and any caller without a catalog
+        // entry makes - claims no backend, so amendment 18 still gets a word rather than silence.
+        let decision = decision_for(device::Setting::Cuda, None, "fill_masked_area", "lama", None);
+        assert_eq!(decision.chain, vec![device::Device::Cpu]);
+        assert_eq!(decision.head(), device::Device::Cpu);
+        assert_eq!(decision.fallback_reason(device::Device::Cpu, None), Some(device::Reason::UnsupportedModel));
+        let auto = decision_for(device::Setting::Auto, None, "fill_masked_area", "lama", None);
+        assert!(auto.reason.is_none() && auto.note.is_none(), "`auto` landing on the CPU asked for the CPU");
     }
 
     #[test]
@@ -973,7 +1105,7 @@ mod tests {
     /// loaded and run.
     fn lama_runner(step: Duration, loads: &Arc<AtomicUsize>, runs: &Arc<AtomicUsize>) -> Runner {
         let pipeline = lama::stand_in_pipeline(128.0, step, loads, runs);
-        Runner::new(Backend::Real { lama: Some(pipeline), birefnet: None }, MAX_QUEUE).expect("the worker starts")
+        Runner::new(Backend::Real { lama: Some(pipeline), birefnet: None, device: device::Setting::Auto }, MAX_QUEUE).expect("the worker starts")
     }
 
     #[test]
@@ -1101,9 +1233,15 @@ mod tests {
     fn a_job_cancelled_mid_stage_says_cancelled_and_stops_reporting() {
         // C4: the stage that was running when the DELETE arrived used to overwrite "Cancelled.".
         let (loads, runs) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
-        let runner =
-            Runner::new(Backend::Real { lama: Some(lama::stand_in_pipeline(128.0, Duration::from_millis(1), &loads, &runs)), birefnet: None }, MAX_QUEUE)
-                .expect("the worker starts");
+        let runner = Runner::new(
+            Backend::Real {
+                lama: Some(lama::stand_in_pipeline(128.0, Duration::from_millis(1), &loads, &runs)),
+                birefnet: None,
+                device: device::Setting::Auto,
+            },
+            MAX_QUEUE,
+        )
+        .expect("the worker starts");
         // Big enough that preparing the crop takes a while, so the cancel lands inside that stage.
         let (width, height) = (3000u32, 3000u32);
         let image = Frame { width, height, channels: 3, bit_depth: 8, samples: vec![9; (width * height * 3) as usize] };

@@ -21,6 +21,10 @@ pub mod birefnet;
 pub mod catalog;
 /// The command line.
 pub mod cli;
+/// CUDA: the vendor's libraries, the card probe, and the ONNX Runtime provider (MG-11).
+pub mod cuda;
+/// The one device resolver: which backend a job runs on, and what to do when it cannot (MG-11).
+pub mod device;
 /// `endpoint.json`: where the port and token are published, atomically.
 pub mod endpoint;
 /// Errors, and the status each one is answered with.

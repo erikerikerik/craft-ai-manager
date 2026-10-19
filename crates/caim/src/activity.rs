@@ -1,9 +1,11 @@
 //! The activity log: one JSON line per finished job, in `activity.jsonl` next to
 //! `endpoint.json` (SPEC v1.1 amendment 18, "Activity log").
 //!
-//! The line carries what MG-10 and MG-11 will add later - the model version, the requested device
-//! and the fallback reason - as `null` today, so a reader can pick the fields up without the file
-//! changing shape. Only a finished job is written: `done`, `failed` or `cancelled`, once each.
+//! The line carries amendment 18's list - task, model, version, device, requested device, fallback
+//! reason, timings, state - and every one of them comes from the finished job's own provenance.
+//! `null` means there was nothing to report, which is the case for a job cancelled before it
+//! reached a backend and for a model version the backend does not have. Only a finished job is
+//! written: `done`, `failed` or `cancelled`, once each.
 //!
 //! The log is a convenience, never a dependency: a line that cannot be written is a sentence on
 //! stderr, and the job that finished still reports what it reported.
@@ -49,13 +51,13 @@ pub struct Record {
     pub task: Option<String>,
     /// The model that ran, as the backend reports it.
     pub model: Option<String>,
-    /// The model version. `null` until MG-10 puts a version on the result.
+    /// The model version, from the result. `null` when no model ran.
     pub version: Option<String>,
     /// The device the job ran on.
     pub device: Option<String>,
-    /// The device that was asked for. `null` until MG-11 takes a `--device`.
+    /// The device that was asked for: `auto`, `cuda` or `cpu`.
     pub device_requested: Option<String>,
-    /// Why the device changed. `null` until MG-11 has fallbacks to report.
+    /// Why a backend other than the requested one ran. `null` when the requested one did.
     pub fallback_reason: Option<String>,
     /// How long the fill itself took.
     pub elapsed_ms: Option<u64>,
