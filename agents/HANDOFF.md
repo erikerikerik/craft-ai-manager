@@ -1,5 +1,11 @@
 # HANDOFF: Craft AI Manager
 
+## 2026-10-19: Codex-cloud - MG-11b
+
+- **Done:** all pinned CUDA DLLs preload by absolute path; provider placement check and automatic golden-test setup; 3/3 real 4090 goldens without PATH changes or manual copies; CPU fallback and missing-provider diagnostics verified; both model manifests now support CUDA. Receipt: `agents/receipts/MG-11b.md`.
+- **Not done:** Claude independent review, green PR CI and merge. Built on PR #10's head because it was open at task start.
+- **Next:** Claude reviews this one MG-11b PR; merge after its checks pass and #10 lands. Erik can restart Strata after the GPU runs finish.
+
 ## 2026-10-19: Codex desktop - real 4090 goldens pass with DLL lookup workaround
 
 - Investigated Erik's three failed CUDA goldens. Provider registration silently hid a missing `release/deps/onnxruntime_providers_shared.dll`; strict registration now exposes the error. Build copies provider DLLs to `release`, while Cargo tests execute in `release/deps`.
