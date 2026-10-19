@@ -1,5 +1,13 @@
 # HANDOFF: Craft AI Manager
 
+## 2026-10-19: Codex desktop - real 4090 goldens pass with DLL lookup workaround
+
+- Investigated Erik's three failed CUDA goldens. Provider registration silently hid a missing `release/deps/onnxruntime_providers_shared.dll`; strict registration now exposes the error. Build copies provider DLLs to `release`, while Cargo tests execute in `release/deps`.
+- Copying provider DLLs beside the test and prepending `E:\CraftML\work\cuda\bin` to the child PATH fixes provider lookup and cuDNN's tensor-IR engine lookup. No permanent PATH change.
+- Fixed the golden's manually forced decision to use the probed card name and ordinal rather than asserting NVIDIA against an unspecified name.
+- All three actual GPU accuracy goldens pass, 39.34 s. Receipt: `agents/receipts/MG-11-4090-followup.md`, with load/first/warm and CPU comparison timings.
+- Catalog unchanged: normal startup still needs robust dependent DLL loading and test provider placement. Local changes only, no commit/push/merge.
+
 ## 2026-10-18: Codex-Strata (autopilot) - MG-11 review round 2 is the last round allowed: both findings fixed, PR #9 parked
 
 - **PARKED: CAIM PR #9 (`ai/mg-11-cuda`) is two rounds in, so I cannot ask for the third review - what is left is a third independent read of `11f4abe`, and Erik's choice is (a) have Claude or Codex-cloud review and merge it, (b) merge it as-is with done-when items 6 and 7 still open, or (c) close it.** All four checks are green and every gate passes locally.
