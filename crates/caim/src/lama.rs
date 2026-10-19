@@ -558,6 +558,14 @@ pub trait Session: Send {
     /// reason, and the runtime's own text, which is what lets [device::run_on_chain] try the next
     /// device instead of failing the job.
     fn run(&mut self, image: &[f32], mask: &[f32], cancel: &AtomicBool) -> device::Attempt<Vec<f32>>;
+
+    /// Which card this session runs on, in ONNX Runtime's own numbering. `None` for a CPU session,
+    /// and for a session whose card nobody could prove. It is what lets [Pipeline::run_fill_on] tell
+    /// a warm session on the card the resolver has just chosen from a warm session on some other
+    /// card, which is what the second review round asked for.
+    fn card(&self) -> Option<i32> {
+        None
+    }
 }
 
 /// How a session is made: once per pipeline, on the first job that needs one. The device is the one
@@ -642,11 +650,13 @@ impl Pipeline {
         self.identity.as_ref().map(Identity::manifest)
     }
 
-    /// Does this pipeline already keep its session on the card? The queue asks before resolving the
-    /// next job, so the resolver does not charge the memory that session is holding a second time.
+    /// Which card this pipeline's session sits on, in ONNX Runtime's own numbering, or `None` when it
+    /// holds no card session. The queue asks before resolving the next job, so the resolver excuses
+    /// only the memory that session really holds, on the card that really holds it.
     #[must_use]
-    pub fn holds_card_session(&self) -> bool {
-        self.session.lock().is_ok_and(|guard| guard.as_ref().is_some_and(|(device, _)| *device == Device::Cuda))
+    pub fn session_card(&self) -> Option<i32> {
+        let guard = self.session.lock().ok()?;
+        guard.as_ref().filter(|(device, _)| *device == Device::Cuda).and_then(|(_, session)| session.card())
     }
 
     /// A finished fill from this pipeline, with amendment 18's account of what ran.
@@ -725,6 +735,13 @@ impl Pipeline {
         // answers the same way for both runners.
         let outcome = {
             let mut guard = self.session.lock().unwrap_or_else(PoisonError::into_inner);
+            // A warm session belongs to one card. If the resolver has since chosen a different one,
+            // the session for the old card has to go: reusing it would run this job on a card nobody
+            // measured and report the wrong hardware. Only a card session is dropped, so a warm CPU
+            // session that survived a fallback stays warm.
+            if guard.as_ref().is_some_and(|(device, session)| *device == Device::Cuda && decision.head() == Device::Cuda && session.card() != decision.card) {
+                *guard = None;
+            }
             device::run_on_chain(
                 &decision.chain,
                 &mut *guard,
@@ -772,9 +789,16 @@ pub struct OrtSession {
     /// Where to read the placement back, once. `None` for a CPU session, and again after a card
     /// session's first run, which is the moment ONNX Runtime stops profiling.
     placement: Option<cuda::Placement>,
+    /// Which card this session was built for, in ONNX Runtime's own numbering. `None` for a CPU
+    /// session, and for a card session the probe could not name.
+    card: Option<i32>,
 }
 
 impl Session for OrtSession {
+    fn card(&self) -> Option<i32> {
+        self.card
+    }
+
     /// Run one crop, then check that the card really did any of it.
     ///
     /// MG-11 step 0 is why the check is here: ONNX Runtime registers the CUDA provider happily and
@@ -867,7 +891,11 @@ pub fn load_ort_session(path: &Path, device: Device) -> Result<Box<dyn Session>>
         builder = cuda::register(builder).map_err(|error| ort_fail(*error))?;
     }
     let session = builder.commit_from_file(path).map_err(ort_fail)?;
-    Ok(Box::new(OrtSession { _environment: environment, session, on_card, placement }))
+    // The card is the one the resolver chose for this job, which is the same number [cuda::register]
+    // bound the provider to. Keeping it on the session is what lets a later job tell whether its
+    // warm session is on the card that job has been pointed at.
+    let card = if on_card { cuda::chosen_card() } else { None };
+    Ok(Box::new(OrtSession { _environment: environment, session, on_card, placement, card }))
 }
 
 /// Turn an ONNX Runtime error into the sentence a job fails with.
@@ -991,8 +1019,8 @@ mod tests {
     }
 
     use super::{
-        DILATE_PX, Filter, Loader, MODEL_SIZE, MSG_FINISH, MSG_LOAD, MSG_PREPARE, MSG_RUN, Pipeline, StandIn, Window, blend, crop_window, dilate, fill_back,
-        filter_for, installed_pipeline, mask_box, mask_plane, model_input, pad_for, resize_plane, stand_in_pipeline,
+        DILATE_PX, Filter, Loader, MODEL_SIZE, MSG_FINISH, MSG_LOAD, MSG_PREPARE, MSG_RUN, Pipeline, Session, StandIn, Window, blend, crop_window, dilate,
+        fill_back, filter_for, installed_pipeline, mask_box, mask_plane, model_input, pad_for, resize_plane, stand_in_pipeline,
     };
     use crate::device::{Decision, Device, Setting};
     use crate::error::{Fail, Status};
@@ -1000,7 +1028,7 @@ mod tests {
     use crate::store;
     use crate::testkit::{Scratch, test_model};
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
     use std::time::Duration;
 
     /// A 4x4 image, one brightness per pixel, so a blend is easy to read.
@@ -1391,7 +1419,7 @@ mod tests {
 
     /// The decision a resolver makes for `--device cuda` on a machine with a card that has the room.
     fn cuda_decision() -> Decision {
-        Decision { requested: Setting::Cuda, chain: vec![Device::Cuda, Device::Cpu], reason: None, device_name: Some(CARD.to_string()), note: None }
+        Decision { requested: Setting::Cuda, chain: vec![Device::Cuda, Device::Cpu], reason: None, device_name: Some(CARD.to_string()), card: None, note: None }
     }
 
     #[test]
@@ -1429,14 +1457,84 @@ mod tests {
     fn a_run_that_died_on_the_card_reports_execution_failed() {
         let (loads, runs) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
         let pipeline = chain_pipeline(200.0, &loads, &runs, Device::Cpu);
-        let decision =
-            Decision { requested: Setting::Auto, chain: vec![Device::Cuda, Device::Cpu], reason: None, device_name: Some(CARD.to_string()), note: None };
+        let decision = Decision {
+            requested: Setting::Auto,
+            chain: vec![Device::Cuda, Device::Cpu],
+            reason: None,
+            device_name: Some(CARD.to_string()),
+            card: None,
+            note: None,
+        };
         let filled = pipeline
             .run_fill_on(&image(3, 8), &centre_mask(255), &decision, &AtomicBool::new(false), &mut |_, _| {})
             .expect("the retry still finishes the job");
         assert_eq!(filled.device, "cpu");
         assert_eq!(filled.device_requested, "auto");
         assert_eq!(filled.fallback_reason.as_deref(), Some("backend_init_failed"));
+    }
+
+    /// A session that says which card it sits on, so a pipeline can be asked what it is holding.
+    struct OnCard {
+        inner: StandIn,
+        card: Option<i32>,
+    }
+
+    impl Session for OnCard {
+        fn run(&mut self, image: &[f32], mask: &[f32], cancel: &AtomicBool) -> crate::device::Attempt<Vec<f32>> {
+            self.inner.run(image, mask, cancel)
+        }
+
+        fn card(&self) -> Option<i32> {
+            self.card
+        }
+    }
+
+    /// The other half of the second review round's finding: a warm CUDA session belongs to the card
+    /// it was built for. When the probe names a different card next time round, the old session must
+    /// not run the job - it would be a card the resolver never measured.
+    #[test]
+    fn a_warm_session_on_another_card_is_not_reused() {
+        let (loads, runs, hands_out) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)), Arc::new(AtomicI32::new(1)));
+        let (count_loads, count_runs, which_card) = (Arc::clone(&loads), Arc::clone(&runs), Arc::clone(&hands_out));
+        let load: Loader = Box::new(move |_path: &std::path::Path, device: Device| {
+            count_loads.fetch_add(1, Ordering::SeqCst);
+            if device != Device::Cuda {
+                return Err(Fail::internal("this machine has no CPU session"));
+            }
+            Ok(Box::new(OnCard {
+                inner: StandIn { fill: 200.0, step: Duration::ZERO, runs: Arc::clone(&count_runs) },
+                card: Some(which_card.load(Ordering::SeqCst)),
+            }))
+        });
+        let pipeline = Pipeline::with_loader("lama_fp32.onnx", load);
+        let on_card = |card: i32| Decision {
+            requested: Setting::Cuda,
+            chain: vec![Device::Cuda, Device::Cpu],
+            reason: None,
+            device_name: Some(CARD.to_string()),
+            card: Some(card),
+            note: None,
+        };
+        // First job: the resolver chose card 1, and the session it loaded says it is on card 1.
+        let first =
+            pipeline.run_fill_on(&image(3, 8), &centre_mask(255), &on_card(1), &AtomicBool::new(false), &mut |_, _| {}).expect("the card takes the job");
+        assert_eq!(first.device, "cuda");
+        // Second job, same card: the warm session is kept, which is the whole point of the chain.
+        let second = pipeline
+            .run_fill_on(&image(3, 8), &centre_mask(255), &on_card(1), &AtomicBool::new(false), &mut |_, _| {})
+            .expect("the warm session takes the job");
+        assert_eq!(second.device, "cuda");
+        assert_eq!(loads.load(Ordering::SeqCst), 1, "the session for the card the resolver named is reused");
+        assert_eq!(pipeline.session_card(), Some(1), "and the queue can see which card that was");
+        // Third job: the probe now names card 0, so the card 1 session is no evidence about card 0
+        // and must not be the thing that runs this job.
+        hands_out.store(0, Ordering::SeqCst);
+        let third =
+            pipeline.run_fill_on(&image(3, 8), &centre_mask(255), &on_card(0), &AtomicBool::new(false), &mut |_, _| {}).expect("the new card takes the job");
+        assert_eq!(third.device, "cuda");
+        assert_eq!(loads.load(Ordering::SeqCst), 2, "the session for the other card is dropped and a fresh one is made");
+        assert_eq!(runs.load(Ordering::SeqCst), 3, "and every job still ran the model exactly once");
+        assert_eq!(pipeline.session_card(), Some(0), "the warm session now belongs to the card that was chosen");
     }
 
     #[test]

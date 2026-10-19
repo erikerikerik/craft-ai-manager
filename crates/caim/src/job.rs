@@ -117,15 +117,16 @@ impl Backend {
 /// `memory_mib` and the same `backends` table the catalog gave that model. A pipeline built straight
 /// from a path claims no backend at all, which the resolver reads as CPU only - what such a pipeline
 /// has always done. `--device cpu` and a model with no tested CUDA build never probe the machine,
-/// so a serve on a machine with no GPU never runs the vendor's tool. `holds_card_session` comes from
-/// the pipeline that is about to run: when it already keeps this model on the card, the resolver must
-/// not measure that memory as something still to be found.
+/// so a serve on a machine with no GPU never runs the vendor's tool. `session_card` comes from the
+/// pipeline that is about to run: when it already keeps this model on the card the probe has just
+/// named, the resolver must not measure that memory as something still to be found. It names a card,
+/// not merely "a CUDA session", because on two cards a session on one says nothing about the other.
 #[must_use]
-fn decision_for(setting: device::Setting, manifest: Option<device::Manifest>, task: &str, model: &str, holds_card_session: bool) -> device::Decision {
+fn decision_for(setting: device::Setting, manifest: Option<device::Manifest>, task: &str, model: &str, session_card: Option<i32>) -> device::Decision {
     let manifest = manifest.unwrap_or_else(|| device::Manifest::cpu_only(model, 0));
     device::Resolver::new(setting).resolve_lazy(task, &manifest, &move || {
         let mut machine = device::Machine::probe();
-        machine.mark_resident(device::Device::Cuda, holds_card_session);
+        machine.mark_resident(device::Device::Cuda, session_card);
         machine
     })
 }
@@ -537,12 +538,12 @@ fn run_one(shared: &Arc<Mutex<Shared>>, id: &str, backend: &Backend) {
         (Backend::Fake { step_delay }, TASK_MASK) => backend::run_mask(&image, &mask, &cancel, *step_delay, &mut progress),
         (Backend::Fake { step_delay }, _) => backend::run_fill(&image, &mask, &cancel, *step_delay, &mut progress),
         (Backend::Real { birefnet: Some(pipeline), device: setting, .. }, TASK_MASK) => {
-            let decision = decision_for(*setting, pipeline.manifest(), TASK_MASK, crate::birefnet::BIREFNET_ID, pipeline.holds_card_session());
+            let decision = decision_for(*setting, pipeline.manifest(), TASK_MASK, crate::birefnet::BIREFNET_ID, pipeline.session_card());
             pipeline.run_mask_on(&image, &mask, &decision, &cancel, &mut progress)
         }
         (Backend::Real { birefnet: None, .. }, TASK_MASK) => Err(Fail::bad_request(routing::not_ready_sentence(TASK_MASK))),
         (Backend::Real { lama: Some(pipeline), device: setting, .. }, _) => {
-            let decision = decision_for(*setting, pipeline.manifest(), &task, lama::LAMA_ID, pipeline.holds_card_session());
+            let decision = decision_for(*setting, pipeline.manifest(), &task, lama::LAMA_ID, pipeline.session_card());
             pipeline.run_fill_on(&image, &mask, &decision, &cancel, &mut progress)
         }
         (Backend::Real { lama: None, .. }, _) => Err(Fail::bad_request(routing::not_ready_sentence(&task))),
@@ -1038,11 +1039,11 @@ mod tests {
     fn a_pipeline_with_no_catalog_entry_is_a_cpu_job_too() {
         // A pipeline built straight from a path - what the tests and any caller without a catalog
         // entry makes - claims no backend, so amendment 18 still gets a word rather than silence.
-        let decision = decision_for(device::Setting::Cuda, None, "fill_masked_area", "lama", false);
+        let decision = decision_for(device::Setting::Cuda, None, "fill_masked_area", "lama", None);
         assert_eq!(decision.chain, vec![device::Device::Cpu]);
         assert_eq!(decision.head(), device::Device::Cpu);
         assert_eq!(decision.fallback_reason(device::Device::Cpu, None), Some(device::Reason::UnsupportedModel));
-        let auto = decision_for(device::Setting::Auto, None, "fill_masked_area", "lama", false);
+        let auto = decision_for(device::Setting::Auto, None, "fill_masked_area", "lama", None);
         assert!(auto.reason.is_none() && auto.note.is_none(), "`auto` landing on the CPU asked for the CPU");
     }
 

@@ -353,6 +353,14 @@ pub trait Session: Send {
     /// reason, and the runtime's own text, which is what lets [device::run_on_chain] try the next
     /// device instead of failing the job.
     fn run(&mut self, image: &[f32], cancel: &AtomicBool) -> device::Attempt<Vec<f32>>;
+
+    /// Which card this session runs on, in ONNX Runtime's own numbering. `None` for a CPU session,
+    /// and for a session whose card nobody could prove. It is what lets [Pipeline::run_mask_on] tell
+    /// a warm session on the card the resolver has just chosen from a warm session on some other
+    /// card, which is what the second review round asked for.
+    fn card(&self) -> Option<i32> {
+        None
+    }
 }
 
 /// How a session is made: once per pipeline, on the first job that needs one. The device is the one
@@ -436,11 +444,13 @@ impl Pipeline {
         self.identity.as_ref().map(Identity::manifest)
     }
 
-    /// Does this pipeline already keep its session on the card? The queue asks before resolving the
-    /// next job, so the resolver does not charge the memory that session is holding a second time.
+    /// Which card this pipeline's session sits on, in ONNX Runtime's own numbering, or `None` when it
+    /// holds no card session. The queue asks before resolving the next job, so the resolver excuses
+    /// only the memory that session really holds, on the card that really holds it.
     #[must_use]
-    pub fn holds_card_session(&self) -> bool {
-        self.session.lock().is_ok_and(|guard| guard.as_ref().is_some_and(|(device, _)| *device == Device::Cuda))
+    pub fn session_card(&self) -> Option<i32> {
+        let guard = self.session.lock().ok()?;
+        guard.as_ref().filter(|(device, _)| *device == Device::Cuda).and_then(|(_, session)| session.card())
     }
 
     /// A finished mask from this pipeline, with amendment 18's account of what ran.
@@ -513,6 +523,13 @@ impl Pipeline {
         // answers the same way for both runners.
         let outcome = {
             let mut guard = self.session.lock().unwrap_or_else(PoisonError::into_inner);
+            // A warm session belongs to one card. If the resolver has since chosen a different one,
+            // the session for the old card has to go: reusing it would run this job on a card nobody
+            // measured and report the wrong hardware. Only a card session is dropped, so a warm CPU
+            // session that survived a fallback stays warm.
+            if guard.as_ref().is_some_and(|(device, session)| *device == Device::Cuda && decision.head() == Device::Cuda && session.card() != decision.card) {
+                *guard = None;
+            }
             device::run_on_chain(
                 &decision.chain,
                 &mut *guard,
@@ -577,9 +594,16 @@ pub struct OrtSession {
     /// Where to read the placement back, once. `None` for a CPU session, and again after a card
     /// session's first run, which is the moment ONNX Runtime stops profiling.
     placement: Option<cuda::Placement>,
+    /// Which card this session was built for, in ONNX Runtime's own numbering. `None` for a CPU
+    /// session, and for a card session the probe could not name.
+    card: Option<i32>,
 }
 
 impl Session for OrtSession {
+    fn card(&self) -> Option<i32> {
+        self.card
+    }
+
     /// Run one image, then check that the card really did any of it.
     ///
     /// MG-11 step 0: ONNX Runtime registers the CUDA provider happily and then runs every node on the
@@ -663,7 +687,11 @@ pub fn load_ort_session(path: &Path, device: Device) -> Result<Box<dyn Session>>
         builder = builder.with_execution_providers([ort::ep::CPU::default().with_arena_allocator(false).build()]).map_err(ort_fail)?;
     }
     let session = builder.commit_from_file(path).map_err(ort_fail)?;
-    Ok(Box::new(OrtSession { _environment: environment, session, on_card, placement }))
+    // The card is the one the resolver chose for this job, which is the same number [cuda::register]
+    // bound the provider to. Keeping it on the session is what lets a later job tell whether its
+    // warm session is on the card that job has been pointed at.
+    let card = if on_card { cuda::chosen_card() } else { None };
+    Ok(Box::new(OrtSession { _environment: environment, session, on_card, placement, card }))
 }
 
 /// Turn an ONNX Runtime error into the sentence a job fails with. Generic over the recoverable
@@ -1130,7 +1158,7 @@ mod tests {
 
     /// The decision a resolver makes for `--device cuda` on a machine with a card that has the room.
     fn cuda_decision() -> Decision {
-        Decision { requested: Setting::Cuda, chain: vec![Device::Cuda, Device::Cpu], reason: None, device_name: Some(CARD.to_string()), note: None }
+        Decision { requested: Setting::Cuda, chain: vec![Device::Cuda, Device::Cpu], reason: None, device_name: Some(CARD.to_string()), card: None, note: None }
     }
 
     #[test]

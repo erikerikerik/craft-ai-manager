@@ -176,6 +176,11 @@ impl Manifest {
 pub struct Accelerator {
     /// Which provider this accelerator serves.
     pub device: Device,
+    /// Which card this is in the runtime's own numbering, or `None` when the probe could not prove
+    /// which card it is. A session belongs to one card, not to "a CUDA device", so this is what
+    /// [Machine::mark_resident] and the runners compare - the second review round found that a
+    /// session on one card was excusing a memory check on another.
+    pub card: Option<i32>,
     /// The hardware in plain words, for `device_name`: `NVIDIA GeForce RTX 4090`.
     pub name: String,
     /// Memory free *now*, in MiB. `None` when the machine could not say, which the resolver reads as
@@ -221,12 +226,18 @@ impl Machine {
         self.accelerators.iter().find(|accelerator| accelerator.device == device)
     }
 
-    /// Record that the pipeline about to run this job already holds its session for `device`, so the
-    /// resolver must not charge that memory a second time. The queue knows which pipeline is running;
-    /// the probe cannot.
-    pub fn mark_resident(&mut self, device: Device, resident: bool) {
-        if let Some(accelerator) = self.accelerators.iter_mut().find(|accelerator| accelerator.device == device) {
-            accelerator.resident = resident;
+    /// Record that the pipeline about to run this job already holds its session on the card `card`,
+    /// so the resolver must not charge that memory a second time. The queue knows which pipeline is
+    /// running and which card its session sits on; the probe cannot.
+    ///
+    /// The card has to match, not just the device. On a machine with two cards, a session sitting on
+    /// card 1 says nothing about how much of card 0 is free, and excusing card 0 on that evidence
+    /// would let a job be measured against one card and run on another - which is what the second
+    /// review round found. A session whose card nobody proved excuses nothing either.
+    pub fn mark_resident(&mut self, device: Device, card: Option<i32>) {
+        let Some(card) = card else { return };
+        if let Some(accelerator) = self.accelerators.iter_mut().find(|accelerator| accelerator.device == device && accelerator.card == Some(card)) {
+            accelerator.resident = true;
         }
     }
 }
@@ -247,6 +258,10 @@ pub struct Decision {
     pub reason: Option<Reason>,
     /// The hardware the chain's first device is, when it is an accelerator: `NVIDIA GeForce RTX 4090`.
     pub device_name: Option<String>,
+    /// Which card that device is, in the runtime's own numbering, or `None` when the decision named
+    /// no card. The runners compare it with the card their cached session is on, so a session built
+    /// for one card is never reused for a decision about another.
+    pub card: Option<i32>,
     /// The same decision as a sentence for the log, when there is one to make.
     pub note: Option<String>,
 }
@@ -262,7 +277,7 @@ impl Decision {
     /// backend, or a `--device cpu` serve.
     #[must_use]
     pub fn for_setting(setting: Setting) -> Self {
-        Self { requested: setting, chain: vec![Device::Cpu], reason: None, device_name: None, note: None }
+        Self { requested: setting, chain: vec![Device::Cpu], reason: None, device_name: None, card: None, note: None }
     }
 
     /// The CPU decision the old code effectively hardcoded, kept for callers that have no manifest.
@@ -341,6 +356,7 @@ impl Resolver {
             chain: vec![Device::Cpu],
             reason: (self.setting == Setting::Cuda).then_some(reason),
             device_name: None,
+            card: None,
             note: (self.setting == Setting::Cuda).then_some(note),
         };
         if !self.buildable(manifest) {
@@ -370,7 +386,14 @@ impl Resolver {
                 ),
             );
         }
-        Decision { requested: self.setting, chain: vec![Device::Cuda, Device::Cpu], reason: None, device_name: Some(card.name.clone()), note: None }
+        Decision {
+            requested: self.setting,
+            chain: vec![Device::Cuda, Device::Cpu],
+            reason: None,
+            device_name: Some(card.name.clone()),
+            card: card.card,
+            note: None,
+        }
     }
 
     /// Decide, probing the machine only when the setting could want CUDA *and* the manifest says the
@@ -531,6 +554,7 @@ mod tests {
         Machine {
             accelerators: vec![Accelerator {
                 device: Device::Cuda,
+                card: Some(0),
                 name: CARD.to_string(),
                 free_mib,
                 ready,
@@ -688,15 +712,41 @@ mod tests {
         // The 4090 after one CUDA job: 991 MiB free is what is left over the session this pipeline is
         // holding, and the next job for that same model reuses it rather than loading a second copy.
         let mut held = machine(Some(991), true);
-        held.mark_resident(Device::Cuda, true);
+        held.mark_resident(Device::Cuda, Some(0));
         assert_eq!(Resolver::new(Setting::Cuda).resolve("subject_mask", &manifest(CUDA_SUPPORTED, 6_600), &held).chain, vec![Device::Cuda, Device::Cpu]);
         // A model the pipeline has not loaded yet still has to fit in what is actually free.
         assert_eq!(Resolver::new(Setting::Cuda).resolve("subject_mask", &manifest(CUDA_SUPPORTED, 6_600), &machine(Some(991), true)).chain, vec![Device::Cpu]);
         // Only the accelerator the session sits on is excused; marking a device the machine does not
         // have changes nothing.
         let mut other = machine(Some(991), true);
-        other.mark_resident(Device::Cpu, true);
+        other.mark_resident(Device::Cpu, Some(0));
         assert_eq!(Resolver::new(Setting::Cuda).resolve("subject_mask", &manifest(CUDA_SUPPORTED, 6_600), &other).reason, Some(Reason::InsufficientMemory));
+    }
+
+    /// The second review round's finding: a warm session says something about the card it sits on,
+    /// and about no other card. Getting this wrong measures one card and runs the job on another.
+    #[test]
+    fn a_session_on_another_card_does_not_excuse_this_one() {
+        // The probe now names card 0 as the one to use, and it has 991 MiB free. The pipeline's warm
+        // session is on card 1, which says nothing at all about card 0.
+        let mut two_cards = machine(Some(991), true);
+        two_cards.accelerators.push(Accelerator {
+            device: Device::Cuda,
+            card: Some(1),
+            name: "NVIDIA GeForce RTX 3060".to_string(),
+            free_mib: Some(11_234),
+            ready: true,
+            resident: false,
+            note: None,
+        });
+        two_cards.mark_resident(Device::Cuda, Some(1));
+        let decision = Resolver::new(Setting::Cuda).resolve("subject_mask", &manifest(CUDA_SUPPORTED, 6_600), &two_cards);
+        assert_eq!(decision.chain, vec![Device::Cpu], "card 0 has 991 MiB free, and the session on card 1 is not evidence about it");
+        assert_eq!(decision.reason, Some(Reason::InsufficientMemory));
+        // A session whose card nobody proved excuses nothing either.
+        let mut unproven = machine(Some(991), true);
+        unproven.mark_resident(Device::Cuda, None);
+        assert_eq!(Resolver::new(Setting::Cuda).resolve("subject_mask", &manifest(CUDA_SUPPORTED, 6_600), &unproven).reason, Some(Reason::InsufficientMemory));
     }
 
     #[test]
@@ -707,8 +757,14 @@ mod tests {
 
     #[test]
     fn a_chain_failure_beats_what_the_resolver_thought() {
-        let decision =
-            Decision { requested: Setting::Cuda, chain: vec![Device::Cuda, Device::Cpu], reason: None, device_name: Some(CARD.to_string()), note: None };
+        let decision = Decision {
+            requested: Setting::Cuda,
+            chain: vec![Device::Cuda, Device::Cpu],
+            reason: None,
+            device_name: Some(CARD.to_string()),
+            card: None,
+            note: None,
+        };
         assert_eq!(decision.fallback_reason(Device::Cuda, None), None);
         assert_eq!(decision.fallback_reason(Device::Cpu, Some(Reason::ExecutionFailed)), Some(Reason::ExecutionFailed));
         assert_eq!(decision.fallback_reason(Device::Cpu, None), None, "a chain that started at the CPU and worked has no reason");
@@ -748,8 +804,14 @@ mod tests {
     #[test]
     fn a_session_that_cannot_be_made_falls_back_and_says_backend_init_failed() {
         let loads = Arc::new(AtomicUsize::new(0));
-        let decision =
-            Decision { requested: Setting::Cuda, chain: vec![Device::Cuda, Device::Cpu], reason: None, device_name: Some(CARD.to_string()), note: None };
+        let decision = Decision {
+            requested: Setting::Cuda,
+            chain: vec![Device::Cuda, Device::Cpu],
+            reason: None,
+            device_name: Some(CARD.to_string()),
+            card: None,
+            note: None,
+        };
         let mut cache: Option<(Device, Box<()>)> = None;
         let outcome: ChainOutcome<usize> = run_on_chain(
             &decision.chain,

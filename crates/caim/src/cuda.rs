@@ -37,8 +37,21 @@ pub const TASK_LIBRARIES: &str = "cuda_libraries";
 /// The vendor's own tool, which is the only way to ask a Windows machine what GPU it has and how
 /// much of the card is free right now.
 pub const PROBE: &str = "nvidia-smi";
-/// What to ask it: name, free memory, total memory, one line per card, no units to parse.
-pub const PROBE_ARGS: [&str; 2] = ["--query-gpu=name,memory.free,memory.total", "--format=csv,noheader,nounits"];
+/// What to ask it: the probe's own index, the two identities that let a card be recognised whatever
+/// order the runtime enumerates in, the name, and the two memory numbers - one line per card, no
+/// header, no units to parse. The identities are what [ordinals] needs: the order `nvidia-smi`
+/// answers in is not the order ONNX Runtime numbers cards in once `CUDA_VISIBLE_DEVICES` or
+/// `CUDA_DEVICE_ORDER` is in play, which is what the second review round found.
+pub const PROBE_ARGS: [&str; 2] = ["--query-gpu=index,uuid,pci.bus_id,name,memory.free,memory.total", "--format=csv,noheader,nounits"];
+/// The environment variable that decides which cards CUDA sees at all *and* the order it numbers
+/// them in. Its entries are the ids `nvidia-smi` prints, or a card's UUID.
+pub const VISIBLE_DEVICES: &str = "CUDA_VISIBLE_DEVICES";
+/// The environment variable that decides what order CUDA numbers the cards it sees. NVIDIA's own
+/// default is `FASTEST_FIRST`, which is not the order `nvidia-smi` answers in.
+pub const DEVICE_ORDER: &str = "CUDA_DEVICE_ORDER";
+/// The one `CUDA_DEVICE_ORDER` whose order CAIM can work out: `nvidia-smi` and CUDA then both go by
+/// the PCI bus id, which the probe reports.
+pub const PCI_BUS_ID: &str = "PCI_BUS_ID";
 /// How long the probe may take. `nvidia-smi` answers in tens of milliseconds; a card that has fallen
 /// off the bus hangs, and a job must not hang with it.
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -309,7 +322,13 @@ pub fn status_lines() -> Result<Vec<String>> {
         lines.push(format!("  device: none found ({} did not answer)", PROBE));
     }
     for card in found {
-        lines.push(format!("  device: {} ({} MiB free of {} MiB)", card.name, card.free_mib, card.total_mib));
+        // The number ONNX Runtime uses, when the probe could work it out. Naming the wrong one would
+        // be a worse lie than naming none, which is why an unknown number is said out loud.
+        let which = match card.ordinal {
+            Some(ordinal) => format!("device {ordinal}"),
+            None => "device number unknown".to_string(),
+        };
+        lines.push(format!("  {which}: {} ({} MiB free of {} MiB)", card.name, card.free_mib, card.total_mib));
     }
     let state = if !supported_here() {
         format!("  not ready: {}", unpinned_sentence())
@@ -325,10 +344,19 @@ pub fn status_lines() -> Result<Vec<String>> {
 /// One card the probe found.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Card {
-    /// Which card this is in the probe's own order, counting from 0. `nvidia-smi` lists cards in the
-    /// order the CUDA runtime numbers them, so this is the id ONNX Runtime's provider has to be told
-    /// to use - see [chosen_card].
-    pub index: i32,
+    /// The number `nvidia-smi` printed for this card. It is the *probe's* number, which is not the
+    /// number ONNX Runtime uses as soon as `CUDA_VISIBLE_DEVICES` or `CUDA_DEVICE_ORDER` is in play.
+    pub probe_index: i32,
+    /// The card's own stable name, `GPU-821602ea-...`, which survives a reboot and a card moving
+    /// slot. `None` when the driver would not say.
+    pub uuid: Option<String>,
+    /// Where the card sits on the bus, `00000000:01:00.0`, which is what `CUDA_DEVICE_ORDER` set to
+    /// `PCI_BUS_ID` numbers by. `None` when the probe would not say.
+    pub bus_id: Option<String>,
+    /// The number ONNX Runtime's provider has to be told to use, or `None` when the probe cannot
+    /// prove which number this card is. Nothing is ever run on a card whose number is unknown - see
+    /// [ordinals] and [chosen_among].
+    pub ordinal: Option<i32>,
     /// The vendor's own words, which is what amendment 18 wants in `device_name`.
     pub name: String,
     /// Free memory *now*, in MiB - never the card's total.
@@ -337,7 +365,8 @@ pub struct Card {
     pub total_mib: u64,
 }
 
-/// Every card on the machine, in the order the probe listed them.
+/// Every card the probe found, each with the number ONNX Runtime uses for it - or with no number at
+/// all when the probe cannot prove which one it is.
 ///
 /// The probe is a short-lived child process with a deadline: `nvidia-smi` answers in tens of
 /// milliseconds, and a card that has fallen off the bus hangs, which must not hang a job. A missing
@@ -376,31 +405,138 @@ pub fn cards() -> Vec<Card> {
     if stdout.read_to_string(&mut text).is_err() {
         return Vec::new();
     }
-    parse_cards(&text)
+    let (visible, order) = cuda_environment();
+    ordinals(parse_cards(&text), visible.as_deref(), order.as_deref())
 }
 
-/// Read the probe's own CSV: `name, free, total` per line, no header and no units. The two numbers
-/// are read from the end of the line so a card name that contains a comma survives.
+/// A field the probe may answer with nothing, or with `N/A`: both mean "the driver would not say",
+/// and neither is an identity to match a card on.
+#[must_use]
+fn named(field: Option<&str>) -> Option<String> {
+    let value = field.map(str::trim).filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("N/A"))?;
+    Some(value.to_string())
+}
+
+/// What the two CUDA numbering variables say for this process. `None` means "not set", which is not
+/// the same as "set to nothing": an empty `CUDA_VISIBLE_DEVICES` hides every card.
+#[must_use]
+fn cuda_environment() -> (Option<String>, Option<String>) {
+    (std::env::var(VISIBLE_DEVICES).ok(), std::env::var(DEVICE_ORDER).ok())
+}
+
+/// Read the probe's own CSV: `index, uuid, bus id, name, free, total` per line, no header and no
+/// units. The two numbers are read from the end of the line and the name from everything between the
+/// bus id and them, so a card name that contains a comma survives. A line that is not a card - the
+/// driver's complaint, a blank line, a row whose numbers or index are not numbers - is skipped.
 #[must_use]
 fn parse_cards(text: &str) -> Vec<Card> {
     let mut found = Vec::new();
     for line in text.lines() {
         let fields: Vec<&str> = line.split(',').map(str::trim).collect();
-        if fields.len() < 3 {
+        if fields.len() < 6 {
             continue;
         }
-        let (Some(free), Some(total)) =
-            (fields.get(fields.len() - 2).and_then(|field| field.parse::<u64>().ok()), fields.last().and_then(|field| field.parse::<u64>().ok()))
-        else {
+        // A row whose own index is not a number cannot be matched to a CUDA ordinal, so it is not a
+        // card CAIM is willing to name.
+        let (Some(probe_index), Some(free), Some(total)) = (
+            fields.first().and_then(|field| field.parse::<i32>().ok()),
+            fields.get(fields.len() - 2).and_then(|field| field.parse::<u64>().ok()),
+            fields.last().and_then(|field| field.parse::<u64>().ok()),
+        ) else {
             continue;
         };
-        let Some(name) = fields.get(..fields.len() - 2).map(|rest| rest.join(", ")) else { continue };
+        let Some(name) = fields.get(3..fields.len() - 2).map(|rest| rest.join(", ")) else { continue };
         if name.is_empty() {
             continue;
         }
-        found.push(Card { index: i32::try_from(found.len()).unwrap_or(i32::MAX), name, free_mib: free, total_mib: total });
+        found.push(Card {
+            probe_index,
+            uuid: named(fields.get(1).copied()),
+            bus_id: named(fields.get(2).copied()),
+            ordinal: None,
+            name,
+            free_mib: free,
+            total_mib: total,
+        });
     }
     found
+}
+
+/// Give the cards the numbers ONNX Runtime will use, in the order they were decided.
+#[must_use]
+fn numbered(mut cards: Vec<Card>) -> Vec<Card> {
+    for (position, card) in cards.iter_mut().enumerate() {
+        card.ordinal = Some(i32::try_from(position).unwrap_or(i32::MAX));
+    }
+    cards
+}
+
+/// Leave every card unnumbered: the probe cannot say which one CUDA calls device 0, and a card
+/// nobody can name is a card nothing may be run on.
+#[must_use]
+fn unnumbered(mut cards: Vec<Card>) -> Vec<Card> {
+    for card in cards.iter_mut() {
+        card.ordinal = None;
+    }
+    cards
+}
+
+/// Turn the probe's rows into cards carrying the number ONNX Runtime uses, or no number at all when
+/// that number cannot be proved.
+///
+/// `nvidia-smi` answers in its own order. NVIDIA documents that `CUDA_VISIBLE_DEVICES` decides both
+/// which cards CUDA sees and the order it numbers them in, and that `CUDA_DEVICE_ORDER` decides the
+/// order of the ones it sees - so the row position is the CUDA ordinal only by accident. The three
+/// cases where it can be proved are: one card, which is device 0 whatever the order;
+/// `CUDA_DEVICE_ORDER=PCI_BUS_ID` with a bus id for every card, where both sides sort by the same
+/// thing; and `CUDA_VISIBLE_DEVICES` set, where the list *is* the order. Anything else - above all
+/// NVIDIA's own default, `FASTEST_FIRST`, on a machine with two cards - leaves every card unnumbered,
+/// and [chosen_among] then refuses to choose one rather than binding a job to a card nobody
+/// measured. That is what the second review round asked for.
+#[must_use]
+fn ordinals(rows: Vec<Card>, visible: Option<&str>, order: Option<&str>) -> Vec<Card> {
+    if let Some(list) = visible {
+        let list = list.trim();
+        if list.is_empty() {
+            // An empty list is an answer, not a missing one: CUDA sees no card at all.
+            return Vec::new();
+        }
+        let mut picked: Vec<Card> = Vec::new();
+        for entry in list.split(',').map(str::trim).filter(|entry| !entry.is_empty()) {
+            // An entry is either the id `nvidia-smi` printed or a UUID, which is the spelling that
+            // survives the card moving slot.
+            let Some(found) = rows.iter().find(|card| {
+                entry.parse::<i32>().is_ok_and(|number| number == card.probe_index) || card.uuid.as_deref().is_some_and(|uuid| uuid.eq_ignore_ascii_case(entry))
+            }) else {
+                // The list names a card the probe did not answer for, so nothing in it can be
+                // numbered. Say so by leaving every card unnumbered rather than guessing.
+                return unnumbered(rows);
+            };
+            if !picked.contains(found) {
+                picked.push(found.clone());
+            }
+        }
+        return numbered(picked);
+    }
+    // One card, and the probe calls it 0: it is device 0 whatever the order is.
+    if rows.len() == 1 && rows.iter().all(|card| card.probe_index == 0) {
+        return numbered(rows);
+    }
+    let by_bus_id = order.is_some_and(|value| value.eq_ignore_ascii_case(PCI_BUS_ID)) && rows.iter().all(|card| card.bus_id.is_some());
+    if !by_bus_id {
+        return unnumbered(rows);
+    }
+    let mut sorted = rows;
+    sorted.sort_by(|left, right| left.bus_id.cmp(&right.bus_id));
+    numbered(sorted)
+}
+
+/// The card to run this job on: the one with the most free memory among the cards whose CUDA number
+/// is known, together with that number. `None` when no card's number is known, which the resolver
+/// has to be told about rather than being handed a card its provider cannot be bound to.
+#[must_use]
+fn chosen_among(cards: &[Card]) -> Option<(Card, i32)> {
+    cards.iter().filter_map(|card| card.ordinal.map(|ordinal| (card.clone(), ordinal))).max_by_key(|(card, _)| card.free_mib)
 }
 
 /// Which card the probe chose for the job it was asked about, in ONNX Runtime's numbering, or
@@ -414,27 +550,54 @@ static CHOSEN_CARD: AtomicI32 = AtomicI32::new(NO_CARD);
 /// default alone.
 const NO_CARD: i32 = -1;
 
-/// The card a CUDA session for this job has to use, when the probe named one.
+/// The card a CUDA session for this job has to use, when the probe named one. [register] binds the
+/// provider to it, and the two runners keep it on the session so a later job can tell whether its
+/// warm session is on the card the resolver has just chosen.
 #[must_use]
-fn chosen_card() -> Option<i32> {
+pub fn chosen_card() -> Option<i32> {
     let index = CHOSEN_CARD.load(Ordering::Relaxed);
     (index != NO_CARD).then_some(index)
 }
 
 /// What the machine has, in the words [crate::device] asks for. The resolver calls this once per job
-/// that could want CUDA; it is the only place the vendor's tool runs for a job. The card with the
-/// most free memory wins, and choosing it is also what [register] later binds the provider to.
+/// that could want CUDA; it is the only place the vendor's tool runs for a job. Of the cards whose
+/// CUDA number is known, the one with the most free memory wins, and choosing it is also what
+/// [register] later binds the provider to and what the session records on itself.
 #[must_use]
 pub fn accelerators() -> Vec<device::Accelerator> {
-    let Some(card) = cards().into_iter().max_by_key(|card| card.free_mib) else {
+    let found = cards();
+    let Some((card, ordinal)) = chosen_among(&found) else {
         CHOSEN_CARD.store(NO_CARD, Ordering::Relaxed);
-        return Vec::new();
+        if found.is_empty() {
+            return Vec::new();
+        }
+        // The probe found cards but cannot say which one ONNX Runtime numbers 0, so a CUDA job here
+        // would run on a card nobody measured and be reported under a name that is not its own. The
+        // honest answer is that no CUDA device can be used here, which keeps the job on the CPU and
+        // tells the user what to set.
+        let names = found.iter().map(|card| card.name.as_str()).collect::<Vec<_>>().join(", ");
+        let why = format!(
+            "This machine has {} CUDA devices ({}), and Craft AI Manager cannot tell which one ONNX Runtime numbers 0, so this job runs on the CPU. \
+                Set {DEVICE_ORDER}={PCI_BUS_ID}, or name the card with {VISIBLE_DEVICES}, to say which one to use.",
+            found.len(),
+            names
+        );
+        return vec![device::Accelerator {
+            device: device::Device::Cuda,
+            card: None,
+            name: names,
+            free_mib: None,
+            ready: false,
+            resident: false,
+            note: Some(why),
+        }];
     };
-    CHOSEN_CARD.store(card.index, Ordering::Relaxed);
+    CHOSEN_CARD.store(ordinal, Ordering::Relaxed);
     let ready = store_root().is_some_and(|root| is_ready(&root));
     let why_not = if supported_here() { "the CUDA libraries are not installed: run caim cuda install --accept-note".to_string() } else { unpinned_sentence() };
     vec![device::Accelerator {
         device: device::Device::Cuda,
+        card: Some(ordinal),
         name: card.name,
         free_mib: Some(card.free_mib),
         ready,
@@ -987,14 +1150,24 @@ mod tests {
         drop(scratch);
     }
 
+    /// One probe answer for two cards, the 4090 first, exactly as `nvidia-smi` prints it.
+    const TWO_CARDS: &str = "0, GPU-aaaaaaaa-0000-0000-0000-000000000000, 00000000:01:00.0, NVIDIA GeForce RTX 4090, 991, 24564\n\
+        1, GPU-bbbbbbbb-0000-0000-0000-000000000000, 00000000:02:00.0, NVIDIA GeForce RTX 3060, 11234, 12288";
+    /// The same for the one-card machine MG-11 was built on.
+    const ONE_CARD: &str = "0, GPU-aaaaaaaa-0000-0000-0000-000000000000, 00000000:01:00.0, NVIDIA GeForce RTX 4090, 991, 24564";
+
     #[test]
     fn the_probe_answer_is_read_from_the_end_of_each_line() {
-        let found = parse_cards("NVIDIA GeForce RTX 4090, 991, 24564\nNVIDIA GeForce RTX 3060, 11234, 12288\n");
+        let found = parse_cards(TWO_CARDS);
         assert_eq!(found.len(), 2);
-        assert_eq!(found[0].name, "NVIDIA GeForce RTX 4090");
-        assert_eq!(found[0].free_mib, 991);
-        assert_eq!(found[0].total_mib, 24564);
-        assert_eq!(found[1].free_mib, 11234);
+        assert_eq!(found.first().map(|card| (card.name.as_str(), card.free_mib, card.total_mib)), Some(("NVIDIA GeForce RTX 4090", 991, 24564)));
+        assert_eq!(found.get(1).map(|card| card.free_mib), Some(11234), "the second number is read from the end of the line too");
+        assert_eq!(found.first().and_then(|card| card.uuid.as_deref()), Some("GPU-aaaaaaaa-0000-0000-0000-000000000000"));
+        assert_eq!(found.first().and_then(|card| card.bus_id.as_deref()), Some("00000000:01:00.0"));
+        // A name with a comma in it is still one name, because the numbers come from the end of the
+        // line and the index and bus id from the front.
+        let odd = parse_cards("0, GPU-a, 00000000:01:00.0, NVIDIA GeForce RTX 4090, Gaming Edition, 991, 24564");
+        assert_eq!(odd.first().map(|card| card.name.as_str()), Some("NVIDIA GeForce RTX 4090, Gaming Edition"));
     }
 
     #[test]
@@ -1002,6 +1175,9 @@ mod tests {
         assert!(parse_cards("").is_empty());
         assert!(parse_cards("[NVIDIA-SMI has failed because it could not communicate with the driver]").is_empty());
         assert!(parse_cards("GeForce RTX, 12").is_empty(), "a line without both numbers is not a card");
+        assert!(parse_cards("x, GPU-a, 00000000:01:00.0, GeForce RTX, 12, 24564").is_empty(), "a row with no index cannot be matched to a device");
+        let shy = parse_cards("0, N/A, N/A, GeForce RTX, 12, 24564");
+        assert!(shy.first().is_some_and(|card| card.uuid.is_none() && card.bus_id.is_none()), "N/A is the driver's way of saying nothing");
     }
 
     #[test]
@@ -1055,17 +1231,50 @@ mod tests {
     }
 
     #[test]
-    fn the_probe_lists_cards_in_the_order_the_runtime_numbers_them() {
-        let found = parse_cards("NVIDIA GeForce RTX 4090, 991, 24564\nNVIDIA GeForce RTX 3060, 11234, 12288\n");
+    fn one_card_is_the_card_onnx_runtime_numbers_zero() {
+        let alone = ordinals(parse_cards(ONE_CARD), None, None);
+        assert_eq!(alone.iter().map(|card| card.ordinal).collect::<Vec<_>>(), vec![Some(0)], "one card is device 0 whatever the order is");
+        assert_eq!(chosen_among(&alone).map(|(card, ordinal)| (card.name, ordinal)), Some(("NVIDIA GeForce RTX 4090".to_string(), 0)));
+    }
+
+    /// The finding of the second review round: `nvidia-smi` row order is not CUDA enumeration order.
+    /// NVIDIA's own default is `FASTEST_FIRST`, so on two cards neither number can be proved, and
+    /// CAIM says so rather than binding a job to a card nobody measured.
+    #[test]
+    fn two_cards_with_no_order_set_are_not_numbered_at_all() {
+        let both = ordinals(parse_cards(TWO_CARDS), None, None);
+        assert_eq!(both.iter().map(|card| card.ordinal).collect::<Vec<_>>(), vec![None, None]);
+        assert!(chosen_among(&both).is_none(), "and nothing is chosen, rather than the wrong card");
+    }
+
+    #[test]
+    fn pci_bus_id_order_numbers_the_cards_by_their_slot() {
+        let both = ordinals(parse_cards(TWO_CARDS), None, Some(PCI_BUS_ID));
+        assert_eq!(both.iter().map(|card| card.ordinal).collect::<Vec<_>>(), vec![Some(0), Some(1)], "both sides then sort by the same bus id");
+        // The 3060 has more free memory, so it is the card the job runs on - and it is device 1, not
+        // the device 0 ONNX Runtime would have used had nobody said which.
+        assert_eq!(chosen_among(&both).map(|(card, ordinal)| (card.name, ordinal)), Some(("NVIDIA GeForce RTX 3060".to_string(), 1)));
+    }
+
+    #[test]
+    fn a_visible_devices_list_is_the_order_the_runtime_numbers_in() {
+        let swapped = ordinals(parse_cards(TWO_CARDS), Some("1, 0"), None);
         assert_eq!(
-            found.iter().map(|card| card.index).collect::<Vec<_>>(),
-            vec![0, 1],
-            "the first line is device 0, which is what ONNX Runtime uses when nobody tells it otherwise"
+            swapped.iter().map(|card| (card.name.as_str(), card.ordinal)).collect::<Vec<_>>(),
+            vec![("NVIDIA GeForce RTX 3060", Some(0)), ("NVIDIA GeForce RTX 4090", Some(1))],
+            "the list is the order, and it renumbers the cards it lists"
         );
-        assert_eq!(
-            found.iter().max_by_key(|card| card.free_mib).map(|card| card.index),
-            Some(1),
-            "and the card the resolver picks is the other one, which is why [register] has to say which"
-        );
+        // A card the list leaves out is not a CUDA device at all.
+        let one = ordinals(parse_cards(TWO_CARDS), Some("0"), None);
+        assert_eq!(one.iter().map(|card| card.name.as_str()).collect::<Vec<_>>(), vec!["NVIDIA GeForce RTX 4090"]);
+        // By UUID, which is the spelling that survives the card moving slot.
+        let by_uuid = ordinals(parse_cards(TWO_CARDS), Some("gpu-bbbbbbbb-0000-0000-0000-000000000000"), None);
+        assert_eq!(by_uuid.iter().map(|card| (card.name.as_str(), card.ordinal)).collect::<Vec<_>>(), vec![("NVIDIA GeForce RTX 3060", Some(0))]);
+        // An empty list hides every card, which is an answer rather than a missing one.
+        assert!(ordinals(parse_cards(TWO_CARDS), Some("   "), None).is_empty());
+        // A list naming a card the probe did not answer for cannot be numbered, so nothing is chosen.
+        let unknown = ordinals(parse_cards(TWO_CARDS), Some("7"), None);
+        assert_eq!(unknown.iter().map(|card| card.ordinal).collect::<Vec<_>>(), vec![None, None]);
+        assert!(chosen_among(&unknown).is_none());
     }
 }

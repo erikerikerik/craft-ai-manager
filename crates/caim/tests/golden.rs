@@ -238,7 +238,7 @@ fn birefnet_finds_the_person_and_keeps_the_hair() {
 /// evidence means asking for the card by hand, chain and all: CUDA first, and the CPU behind it so
 /// a card that cannot start the graph still answers rather than failing the job.
 fn card_decision() -> Decision {
-    Decision { requested: Setting::Cuda, chain: vec![Device::Cuda, Device::Cpu], reason: None, device_name: None, note: None }
+    Decision { requested: Setting::Cuda, chain: vec![Device::Cuda, Device::Cpu], reason: None, device_name: None, card: None, note: None }
 }
 
 /// A CUDA run that came back on the CPU is not evidence: say which of amendment 18's reasons it
