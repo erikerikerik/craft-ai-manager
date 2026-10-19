@@ -743,7 +743,7 @@ pub fn register(
     if let Some(index) = chosen_card() {
         provider = provider.with_device_id(index);
     }
-    builder.with_execution_providers([provider.build()]).map_err(Box::new)
+    builder.with_execution_providers([provider.build().error_on_failure()]).map_err(Box::new)
 }
 
 // The archives
