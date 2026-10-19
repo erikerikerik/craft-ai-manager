@@ -530,6 +530,7 @@ provenance = 'Built by hand for a test.'
         assert_eq!(lama.max_pixels, 64_000_000, "amendment 18: the entry carries its own pixel cap");
         assert_eq!(lama.memory_mib, 1_500, "and a working-memory figure, stated rather than measured");
         assert_eq!(lama.backends.get("cpu").map(String::as_str), Some("supported"), "the CPU is its home backend: {:?}", lama.backends);
+        assert_eq!(lama.backends.get("cuda").map(String::as_str), Some("supported"), "MG-11b's 4090 golden passed: {:?}", lama.backends);
         assert_eq!(lama.licence_code, "Apache-2.0");
         assert_eq!(lama.licence_weights, "Apache-2.0");
         assert_eq!(lama.licence_training_data, "research-only");
@@ -560,7 +561,7 @@ provenance = 'Built by hand for a test.'
         assert_eq!(mask.max_pixels, 1_048_576, "the mask task has its own, smaller cap");
         assert_eq!(mask.memory_mib, 6_600, "RS-01 measured 6.40 GiB with the CPU memory arena off");
         assert_eq!(mask.backends.get("cpu").map(String::as_str), Some("supported"), "{:?}", mask.backends);
-        assert_eq!(mask.backends.get("cuda").map(String::as_str), Some("untested"), "MG-11 measures the GPU later: {:?}", mask.backends);
+        assert_eq!(mask.backends.get("cuda").map(String::as_str), Some("supported"), "MG-11b's 4090 goldens passed: {:?}", mask.backends);
         assert_eq!(mask.licence_code, "MIT");
         assert_eq!(mask.licence_weights, "MIT");
         assert_eq!(mask.licence_training_data, "research-only");

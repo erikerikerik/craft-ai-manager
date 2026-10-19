@@ -10,7 +10,7 @@
 //! own redistribution server only when someone runs `caim cuda install`. They are **not** shipped in
 //! CAIM's binary, and a CPU-only machine never asks for them: the CUDA execution provider is
 //! registered only for a session the resolver chose CUDA for, and its dependencies are preloaded
-//! from CAIM's own folder with ONNX Runtime's own `preload_dylibs`, so `PATH` stays untouched.
+//! from CAIM's own folder with ONNX Runtime's `preload_dylib`, so `PATH` stays untouched.
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -251,7 +251,7 @@ pub fn library_dir(root: &Path) -> PathBuf {
     root.join("bin")
 }
 
-/// Are all nineteen libraries on disk? This is a cheap existence check, not a hash check: the archives
+/// Are all pinned libraries on disk? This is a cheap existence check, not a hash check: the archives
 /// were hashed when they arrived, and the extraction verified each file's own CRC. A platform with
 /// nothing pinned has an empty catalog ([supported_here]), and an empty catalog is never ready: a
 /// CUDA job needs libraries, not the absence of anything left to check.
@@ -333,7 +333,10 @@ pub fn status_lines() -> Result<Vec<String>> {
     let state = if !supported_here() {
         format!("  not ready: {}", unpinned_sentence())
     } else if is_ready(&root) {
-        "  ready: a CUDA job can run here".to_string()
+        match provider_directory().and_then(|dir| check_provider_files(&dir)) {
+            Ok(()) => "  ready: a CUDA job can run here".to_string(),
+            Err(fail) => format!("  not ready: {}", fail.sentence),
+        }
     } else {
         "  not ready: run caim cuda install --accept-note".to_string()
     };
@@ -612,22 +615,49 @@ pub fn accelerators() -> Vec<device::Accelerator> {
 /// retried on every job.
 static PRELOADED: OnceLock<Mutex<BTreeMap<PathBuf, std::result::Result<(), String>>>> = OnceLock::new();
 
+/// Provider DLLs are distributed beside the executable by ort-sys, independently of NVIDIA's store.
+pub const PROVIDER_FILES: [&str; 2] = ["onnxruntime_providers_shared.dll", "onnxruntime_providers_cuda.dll"];
+
+fn provider_directory() -> Result<PathBuf> {
+    let exe = std::env::current_exe().map_err(|error| Fail::internal(format!("Craft AI Manager could not locate its executable: {error}")))?;
+    exe.parent().map(Path::to_path_buf).ok_or_else(|| Fail::internal("Craft AI Manager could not locate its executable folder."))
+}
+
+/// Check an explicit folder so incomplete installs can be tested without changing the executable.
+pub fn check_provider_files(dir: &Path) -> Result<()> {
+    if supported_here() {
+        for name in PROVIDER_FILES {
+            if !dir.join(name).is_file() {
+                return Err(Fail::internal(format!("Craft AI Manager is missing {name} in {}.", dir.display())));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Point ONNX Runtime's CUDA provider at CAIM's own library folder.
 ///
 /// This is the "load the provider and its libraries at run time" half of step 0: CAIM's binary stays
 /// small, `PATH` is never touched, and a machine that has no CUDA folder never loads anything.
 pub fn preload(root: &Path) -> Result<()> {
+    check_provider_files(&provider_directory()?)?;
+    let root =
+        std::path::absolute(root).map_err(|error| Fail::internal(format!("Craft AI Manager could not locate the CUDA folder {}: {error}", root.display())))?;
     let table = PRELOADED.get_or_init(|| Mutex::new(BTreeMap::new()));
     let mut table = table.lock().unwrap_or_else(PoisonError::into_inner);
-    if let Some(remembered) = table.get(root) {
+    if let Some(remembered) = table.get(&root) {
         return match remembered {
             Ok(()) => Ok(()),
             Err(sentence) => Err(Fail::internal(sentence.clone())),
         };
     }
-    let dir = library_dir(root);
-    let outcome = ort::ep::cuda::preload_dylibs(Some(&dir), Some(&dir))
-        .map_err(|error| Fail::internal(format!("Craft AI Manager could not load the CUDA libraries in {}: {error}", dir.display())));
+    let dir = library_dir(&root);
+    // The aggregate ort helper omits cuDNN's tensor-IR engine and extension library.
+    // Its individual safe helper retains each successful handle for the process lifetime.
+    let outcome = WANTED.iter().flat_map(|(_, names)| names.iter()).try_for_each(|name| {
+        let path = dir.join(name);
+        ort::util::preload_dylib(&path).map_err(|error| Fail::internal(format!("Craft AI Manager could not load {}: {error}", path.display())))
+    });
     let remembered = match &outcome {
         Ok(()) => Ok(()),
         Err(fail) => Err(fail.sentence.clone()),
@@ -1036,6 +1066,23 @@ mod tests {
         for name in ort::ep::cuda::CUDA_DYLIBS.iter().chain(ort::ep::cuda::CUDNN_DYLIBS.iter()) {
             assert!(held.contains(name), "ONNX Runtime asks for {name}, which CAIM does not unpack");
         }
+    }
+
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    #[test]
+    fn missing_provider_diagnostics_name_each_file_and_its_folder() {
+        let scratch = Scratch::new("cuda-provider-files");
+        for name in PROVIDER_FILES {
+            let fail = check_provider_files(&scratch.path).expect_err("a missing provider is diagnosed");
+            assert!(fail.sentence.contains(name), "{}", fail.sentence);
+            assert!(fail.sentence.contains(&scratch.path.display().to_string()), "{}", fail.sentence);
+            // A directory with the DLL's name is not an installed provider either.
+            std::fs::create_dir(scratch.path.join(name)).expect("create misleading directory");
+            assert!(check_provider_files(&scratch.path).is_err());
+            std::fs::remove_dir(scratch.path.join(name)).expect("remove misleading directory");
+            std::fs::write(scratch.path.join(name), b"fixture").expect("write provider fixture");
+        }
+        check_provider_files(&scratch.path).expect("both providers are present");
     }
 
     #[test]

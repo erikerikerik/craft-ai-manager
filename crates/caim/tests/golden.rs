@@ -233,11 +233,11 @@ fn birefnet_finds_the_person_and_keeps_the_hair() {
     mask_golden("person", "input-person.png", "mask-person.png", 768, 512);
 }
 
-/// The decision that forces the card. The catalog keeps `cuda = "untested"` until these two tests
-/// have passed, so the resolver would - correctly - keep such a model off the card. Gathering the
+/// The decision that forces the card, regardless of the catalog's backend state. Gathering the
 /// evidence means asking for the card by hand, chain and all: CUDA first, and the CPU behind it so
 /// a card that cannot start the graph still answers rather than failing the job.
 fn card_decision() -> Decision {
+    prepare_card_provider_files();
     let machine = craft_ai_manager::device::Machine::probe();
     let accelerator = machine.accelerator(Device::Cuda).expect("the card golden needs a CUDA card");
     Decision {
@@ -247,6 +247,23 @@ fn card_decision() -> Decision {
         device_name: Some(accelerator.name.clone()),
         card: accelerator.card,
         note: None,
+    }
+}
+
+/// ort-sys copies to the profile folder when Windows cannot create symlinks; tests live in deps.
+/// This is test setup only. Product startup checks its own executable folder and never copies DLLs.
+fn prepare_card_provider_files() {
+    #[cfg(windows)]
+    {
+        let exe = std::env::current_exe().expect("the test executable has a path");
+        let dir = exe.parent().expect("the test executable has a folder");
+        let profile = dir.parent().expect("the deps folder has a profile parent");
+        for name in craft_ai_manager::cuda::PROVIDER_FILES {
+            let destination = dir.join(name);
+            if !destination.is_file() {
+                std::fs::copy(profile.join(name), &destination).unwrap_or_else(|error| panic!("could not prepare {}: {error}", destination.display()));
+            }
+        }
     }
 }
 

@@ -28,7 +28,8 @@ max_pixels = 64000000
 # weights plus the activations of one 512x512 crop, rounded up. MG-11 measures it on the 4090 and
 # on a laptop; nothing acts on this number until then except amendment 18's memory check.
 memory_mib = 1500
-backends = { cpu = "supported", cuda = "untested", coreml = "untested" }
+# MG-11b: Windows RTX 4090 goldens passed without DLL search-path workarounds.
+backends = { cpu = "supported", cuda = "supported", coreml = "untested" }
 provenance = "An ONNX port (Hugging Face Carve/LaMa-ONNX) of advimman's big-lama, trained on Places365; downloaded and checked on the CraftML PC on Oct 13, 2026 (docs/models/lama.md)."
 
 # Erik's override (decision D2, Oct 13, 2026): the weights are Apache-2.0 but Places365 is licensed
@@ -62,7 +63,8 @@ licence_weights = "MIT"
 licence_training_data = "research-only"
 max_pixels = 1048576
 memory_mib = 6600
-backends = { cpu = "supported", cuda = "untested", coreml = "untested" }
+# MG-11b: both subject mattes passed the RTX 4090 accuracy and CPU-comparison gates.
+backends = { cpu = "supported", cuda = "supported", coreml = "untested" }
 provenance = "BiRefNet_lite (swin_v1_tiny backbone, epoch 232), the ONNX export published by onnx-community and byte for byte the ZhengPeng7/BiRefNet GitHub release asset BiRefNet-general-bb_swin_v1_tiny-epoch_232.onnx; pinned to Hugging Face revision de15b22ba131738a16dff04aab8bdf8dc32e3ac1 and hashed on the CraftML PC on Oct 17, 2026 (agents/models/birefnet.md and agents/receipts/RS-01.md in the PhotoCraft fork, decision D12). Input 1024x1024 fixed, output logits; sigmoid * 255 gives an 8-bit soft-edge mask where 255 is the subject."
 
 # Erik's override (decision D11, signed Oct 17, 2026 as D12 (a)): the weights are MIT, the training
