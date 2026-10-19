@@ -9,7 +9,7 @@
 - Fresh CARGO_TARGET_DIR: target/agent-mg-11b, inside E:\CraftML\work\wt\mg-11b.
 - Models: E:\CraftML\work\models; CUDA store: E:\CraftML\work\cuda.
 - Before the first card run: 22,495 MiB free / 24,564 MiB total. Ollama `ps` listed no models; no Strata inference process was present. No inference process was killed or restarted.
-- PR, CI, merge: PR to be opened after local gates; CI and Claude approval pending. Not merged.
+- PR: https://github.com/erikerikerik/craft-ai-manager/pull/11. CI and Claude approval pending. Not merged.
 
 ## Cause and fix
 
