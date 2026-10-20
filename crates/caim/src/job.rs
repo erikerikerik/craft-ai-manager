@@ -1464,7 +1464,11 @@ mod tests {
         let runner = Runner::new(Backend::NoModel, MAX_QUEUE).expect("the worker starts");
         let before = runner.submit(TASK_FILL, frame(), mask()).expect("the queue takes the job");
         assert_eq!(finish(&runner, &before), State::Failed, "nothing is installed yet");
-        assert_eq!(runner.state(&before).expect("the job exists").2, crate::routing::not_ready_sentence(TASK_FILL), "the same sentence an uninstalled model gets");
+        assert_eq!(
+            runner.state(&before).expect("the job exists").2,
+            crate::routing::not_ready_sentence(TASK_FILL),
+            "the same sentence an uninstalled model gets"
+        );
         runner.set_backend(Backend::Fake { step_delay: Duration::ZERO });
         let id = runner.submit(TASK_FILL, frame(), mask()).expect("the model the window just installed");
         assert_eq!(finish(&runner, &id), State::Done, "the next job runs on the backend the refresh pointed at");
