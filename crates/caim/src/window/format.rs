@@ -271,6 +271,12 @@ pub const OPEN_FOLDER_WORDS: &str = "Open folder";
 pub const OPEN_ACTIVITY_WORDS: &str = "Open activity log";
 /// Section 4.5: the copy button, offered only on a needs-you state.
 pub const COPY_DETAILS_WORDS: &str = "Copy details for a bug report";
+/// Erik's acceptance review (Oct 20, 2026): the device statement, which the main column now says in
+/// its own words instead of leaving a bare hardware name in the footer. The label is the point - a
+/// reader has to know they are being told what runs the AI, not what machine this is.
+pub const DEVICE_LABEL: &str = "AI device";
+/// The processor, in the same plain words the brief's Details line uses.
+pub const DEVICE_CPU: &str = "Processor (CPU)";
 
 /// The primary button of a licence note: "Download \u{b7} 198 MB".
 #[must_use]
@@ -300,14 +306,32 @@ pub fn downloading_line(done: u64, total: u64, suffix: &str) -> String {
 pub fn footer_without_details(footer: &str) -> &str {
     footer.strip_suffix(" \u{b7} Details").unwrap_or(footer)
 }
+
+/// The card as the window names it: the probe's own name in brackets, so the person can see which
+/// hardware the manager found.
+#[must_use]
+pub fn device_gpu(name: &str) -> String {
+    format!("Graphics card ({name})")
+}
+
+/// The whole device line: `AI device: Graphics card (NVIDIA GeForce RTX 4090)` when this run would
+/// use the card, and `AI device: Processor (CPU)` when it would not.
+///
+/// `None` covers every case where the card is not the answer - no card, a card whose NVIDIA
+/// libraries are not installed, and a run started with `--device cpu`. The state model works that
+/// out; this function only says it.
+#[must_use]
+pub fn device_line(gpu_name: Option<&str>) -> String {
+    format!("{DEVICE_LABEL}: {}", gpu_name.map_or_else(|| DEVICE_CPU.to_string(), device_gpu))
+}
 #[cfg(test)]
 mod tests {
     use super::{
         ACKNOWLEDGE_WORDS, CANCEL, CHECK_AGAIN_WORDS, CLOSE_QUESTION, CLOSE_WORDS, COPY_DETAILS_WORDS, CUDA_ACCEPT_WORDS, CUDA_DOWNLOADING_SUFFIX,
-        CUDA_LINK_WORDS, CUDA_TERMS, DETAILS_WORDS, HIDE_DETAILS_WORDS, KEEP_OPEN_WORDS, MODEL_DOWNLOADING_SUFFIX, NOT_NOW, NOTE_HEADING, OPEN_ACTIVITY_WORDS,
-        OPEN_FOLDER_WORDS, REMOVE_WORDS, WINDOW_TITLE, about_words, ago_words, date_words, device_words, display_name, download_button, downloading_line,
-        elapsed_words, fallback_words, feature, footer_without_details, gib_words, group, of_words, percent, running_words, size, size_parts, task_words,
-        uptime_words,
+        CUDA_LINK_WORDS, CUDA_TERMS, DETAILS_WORDS, DEVICE_CPU, DEVICE_LABEL, HIDE_DETAILS_WORDS, KEEP_OPEN_WORDS, MODEL_DOWNLOADING_SUFFIX, NOT_NOW,
+        NOTE_HEADING, OPEN_ACTIVITY_WORDS, OPEN_FOLDER_WORDS, REMOVE_WORDS, WINDOW_TITLE, about_words, ago_words, date_words, device_gpu, device_line,
+        device_words, display_name, download_button, downloading_line, elapsed_words, fallback_words, feature, footer_without_details, gib_words, group,
+        of_words, percent, running_words, size, size_parts, task_words, uptime_words,
     };
 
     /// Section 3 of the brief, exactly: the three sizes it names and the rule behind them.
@@ -465,8 +489,18 @@ mod tests {
     /// Section 3 item 5: the footer's own word is drawn as a control, not as part of the sentence.
     #[test]
     fn the_footer_keeps_its_words_when_the_toggle_is_drawn_beside_it() {
-        let footer = "This computer only \u{b7} on the processor \u{b7} Closing this window turns AI features off \u{b7} Details";
-        assert_eq!(footer_without_details(footer), "This computer only \u{b7} on the processor \u{b7} Closing this window turns AI features off");
+        let footer = "This computer only \u{b7} Closing this window turns AI features off \u{b7} Details";
+        assert_eq!(footer_without_details(footer), "This computer only \u{b7} Closing this window turns AI features off");
         assert_eq!(footer_without_details("a footer with no toggle"), "a footer with no toggle");
+    }
+
+    /// Erik's acceptance review, finding 2: the device is said in a labeled sentence, in the main
+    /// column, and the two answers are the person's words for the hardware rather than a driver name.
+    #[test]
+    fn the_device_line_says_which_hardware_runs_the_ai() {
+        assert_eq!(device_line(None), "AI device: Processor (CPU)");
+        assert_eq!(device_line(Some("NVIDIA GeForce RTX 4090")), "AI device: Graphics card (NVIDIA GeForce RTX 4090)");
+        assert_eq!(device_gpu("NVIDIA GeForce RTX 4090"), "Graphics card (NVIDIA GeForce RTX 4090)");
+        assert_eq!((DEVICE_LABEL, DEVICE_CPU), ("AI device", "Processor (CPU)"));
     }
 }

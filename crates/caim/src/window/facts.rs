@@ -321,6 +321,7 @@ impl Source {
                 up_secs: self.started.elapsed().as_secs(),
             }),
             folder: Some(state::FolderFacts { path: self.root.display().to_string(), bytes: store::folder_usage(&self.root).map(|usage| usage.bytes) }),
+            device_setting: self.runner.device_setting().map_or_else(String::new, |setting| setting.token().to_string()),
             error: work.error.clone(),
         }
     }

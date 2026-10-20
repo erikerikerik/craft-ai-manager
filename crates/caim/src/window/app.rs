@@ -318,6 +318,12 @@ impl Window {
         ui.add(Label::new(job));
         ui.add_space(6.0);
         ui.add(Label::new(RichText::new(self.view.meta.clone()).size(META).color(GREY)));
+        // Erik's acceptance review (Oct 20, 2026) found the CPU/GPU question unclear: the only
+        // hint was a bare hardware name inside the footer sentence, and it came from whether the
+        // NVIDIA libraries were installed rather than from what this run would actually use. The
+        // status block says it in words, from the queue's own device setting and the card together.
+        ui.add_space(6.0);
+        ui.add(Label::new(RichText::new(self.view.device_line.clone()).size(META).color(INK)));
     }
 
     /// Section 4, rule 4: the one question asked when a job is running.
@@ -416,6 +422,7 @@ impl Window {
                 } else {
                     ui.add(Label::new(RichText::new(words).size(BODY).color(INK)));
                 }
+                self.row_manage(ui, row);
             }
         }
     }
@@ -428,6 +435,50 @@ impl Window {
             self.note_ticked = false;
         } else {
             self.press(task::Task::Install { id: row.id.clone(), accept_note: false });
+        }
+    }
+
+    /// The two operations an installed model offers on its own row.
+    ///
+    /// Erik's acceptance review (Oct 20, 2026) found that `Check again` and `Remove` existed
+    /// only in Details, so a row reading `Ready` looked like a dead end. These are the same words
+    /// doing the same tasks, drawn where the row can be seen; nothing here is a new operation.
+    fn row_manage(&mut self, ui: &mut Ui, row: &state::Row) {
+        let words = row.manage.clone();
+        if words.is_empty() {
+            return;
+        }
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            for (index, word) in words.iter().enumerate() {
+                if index > 0 {
+                    ui.add_space(4.0);
+                }
+                if self.tertiary(ui, word).clicked() {
+                    self.manage_pressed(row, word);
+                }
+            }
+        });
+    }
+
+    /// A management word does something only when its row offers it, which is what `row.manage`
+    /// says. `Check again` re-hashes the bytes the catalog pins and `Remove` deletes the
+    /// model, exactly as in Details. There is no reload or rebuild to offer: the library has no such
+    /// operation, since a session is loaded when the next job runs.
+    fn manage_pressed(&mut self, row: &state::Row, words: &str) {
+        let task = if row.manage.iter().any(|offered| offered == words) {
+            if words == format::CHECK_AGAIN_WORDS {
+                Some(task::Task::Check { id: row.id.clone() })
+            } else if words == format::REMOVE_WORDS {
+                Some(task::Task::Remove { id: row.id.clone() })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(task) = task {
+            self.press(task);
         }
     }
 
@@ -806,6 +857,7 @@ fn reveal(path: Option<&Path>) -> Option<String> {
 mod tests {
     use super::*;
     use crate::server::{ServeOptions, Server};
+    use crate::store;
     use crate::testkit::Scratch;
     use std::ffi::OsString;
 
@@ -912,5 +964,75 @@ mod tests {
         assert!(window.message.is_none(), "an accepted press says nothing");
         let mut running = window.running.take().expect("the worker started");
         running.join();
+    }
+
+    /// Put LaMa on disk the way a finished download leaves it: the file at the size the catalog
+    /// promises, a verification record that matches it, and the licence note read.
+    fn install_lama(window: &Window) {
+        let root = window.source.root().to_path_buf();
+        let model = window.source.model("lama").expect("the catalog has LaMa");
+        std::fs::create_dir_all(store::model_folder(&root, &model)).expect("the model folder");
+        let file = std::fs::File::create(store::model_file(&root, &model)).expect("the model file");
+        file.set_len(model.size).expect("a file the size the catalog promises");
+        store::write_verified(&root, &model, &model.sha256, model.size).expect("the verification record");
+        store::write_acknowledgement(&root, &model).expect("the note has been read");
+        window.source.refresh_routing();
+    }
+
+    /// MG-13 review round 6 (Erik's acceptance review, Oct 20, 2026): an installed model's row ends
+    /// at `Ready`, and its two operations were only in Details, so they read as absent. The row
+    /// offers them itself, and only the words its own state offers can start a worker.
+    #[test]
+    fn an_installed_row_offers_check_again_and_remove_without_opening_details() {
+        let scratch = Scratch::new("window-row-management");
+        let (_server, mut window) = window_at(scratch.path.clone());
+        install_lama(&window);
+        window.facts = window.source.gather();
+        window.view = state::view(&window.facts);
+        assert!(!window.details, "the window is not showing Details");
+        let row = window.view.rows.iter().find(|row| row.id == "lama").expect("the catalog lists Generative Fill").clone();
+        assert_eq!(row.state, state::RowState::Ready, "the model is installed and acknowledged");
+        assert_eq!(row.manage, vec![format::CHECK_AGAIN_WORDS.to_string(), format::REMOVE_WORDS.to_string()], "and the row says what it offers");
+        window.manage_pressed(&row, format::CHECK_AGAIN_WORDS);
+        let mut running = window.running.take().expect("Check again starts its worker");
+        running.join();
+        window.manage_pressed(&row, "Reload");
+        assert!(window.running.is_none(), "a word the row does not offer starts nothing - there is no reload to offer");
+    }
+
+    /// The same finding seen on the screen: the words are painted with Details closed, and the
+    /// labeled device line is where the status block can be read.
+    #[test]
+    fn the_window_paints_the_rows_management_and_its_device_line() {
+        let scratch = Scratch::new("window-painted-management");
+        let (_server, mut window) = window_at(scratch.path.clone());
+        install_lama(&window);
+        window.facts = window.source.gather();
+        window.view = state::view(&window.facts);
+        assert!(!window.details, "nothing here is behind Details");
+        let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(640.0, 800.0))), ..Default::default() };
+        // The status sentence is drawn in the semibold face the window asks for, so the test's own
+        // context has to bind that family name to something - here, the fonts egui ships with.
+        let context = Context::default();
+        let mut fonts = FontDefinitions::default();
+        let proportional = fonts.families.get(&FontFamily::Proportional).cloned().unwrap_or_default();
+        fonts.families.insert(FontFamily::Name(SEMIBOLD.into()), proportional);
+        context.set_fonts(fonts);
+        let mut output = context.run_ui(input, |ui| window.column(ui));
+        let painted: Vec<String> = output
+            .shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text) => Some(text.galley.text().to_string()),
+                _ => None,
+            })
+            .collect();
+        // The font texture belongs to a real renderer, and this test only reads what was
+        // painted, so it says it is done with those deltas rather than letting egui complain.
+        output.textures_delta.clear();
+        let says = |words: &str| painted.iter().any(|line| line.contains(words));
+        assert!(says(format::CHECK_AGAIN_WORDS), "the row paints `Check again`: {painted:?}");
+        assert!(says(format::REMOVE_WORDS), "and `Remove`: {painted:?}");
+        assert!(says("AI device: Processor (CPU)"), "and the labeled device line: {painted:?}");
     }
 }

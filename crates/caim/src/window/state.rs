@@ -103,6 +103,13 @@ pub struct Facts {
     pub endpoint: Option<EndpointFacts>,
     /// The models folder, if this machine has one.
     pub folder: Option<FolderFacts>,
+    /// What this run was asked to run its jobs on, as the queue reports it: `auto`, `cpu` or
+    /// `cuda`. Empty when the backend has no device of its own, which is read as "not asked".
+    ///
+    /// Erik's acceptance review (Oct 20, 2026) asked the window to say which hardware the AI runs
+    /// on, and the card alone is not the answer: a run started with `--device cpu` uses the
+    /// processor whatever the machine has.
+    pub device_setting: String,
     /// The raw error behind a needs-you state, for Details.
     pub error: Option<String>,
 }
@@ -157,6 +164,13 @@ pub struct Row {
     pub purpose: String,
     pub meta: String,
     pub state: RowState,
+    /// The operations this row offers on itself, in the order the window draws them.
+    ///
+    /// These are the two Details already offers for an installed model - `Check again` and
+    /// `Remove` - said again where the row can be seen. Erik's acceptance review (Oct 20, 2026)
+    /// found a row that ended at `Ready` and nothing else: the operations existed, but only behind
+    /// Details, so they read as absent. Nothing here is a new operation.
+    pub manage: Vec<String>,
 }
 
 /// The action block, which only the needs-you states and the inline licence notes show.
@@ -214,7 +228,10 @@ pub struct View {
     pub offer: Option<Offer>,
     /// The footer sentence.
     pub footer: String,
-    /// The device the footer names, which Details repeats.
+    /// The labeled device statement of the status block: `AI device: Processor (CPU)` or
+    /// `AI device: Graphics card (<name>)`.
+    pub device_line: String,
+    /// The device Details and the bug report name, which the device line says in full.
     pub device: String,
     /// The Details list.
     pub details: Vec<Detail>,
@@ -250,7 +267,8 @@ pub fn view(facts: &Facts) -> View {
         action,
         rows,
         offer: offer(facts),
-        footer: footer(facts),
+        footer: footer(),
+        device_line: format::device_line(device_choice(facts)),
         device: device_word(facts),
         details: details(facts),
         copy_details: facts.iter_problem_model().is_some(),
@@ -274,7 +292,8 @@ fn rows(facts: &Facts) -> Vec<Row> {
                 // Section 3: the licence words are text in the meta line, never a badge.
                 meta.push_str(" \u{b7} non-commercial use only");
             }
-            Row { id: model.id.clone(), task: model.task.clone(), title, purpose, meta, state: row_state(model, running_task.as_deref(), running_percent) }
+            let state = row_state(model, running_task.as_deref(), running_percent);
+            Row { id: model.id.clone(), task: model.task.clone(), title, purpose, meta, manage: manage_words(&state), state }
         })
         .collect()
 }
@@ -465,13 +484,46 @@ fn offer(facts: &Facts) -> Option<Offer> {
     })
 }
 
-/// The device the footer names: the card once its libraries are here, the processor until then.
-fn device_word(facts: &Facts) -> String {
-    facts.gpu.as_ref().filter(|gpu| gpu.ready).map_or_else(|| "Processor".to_string(), |gpu| gpu.name.clone())
+/// The card this run would use for an AI job, or `None` when it would use the processor.
+///
+/// Two facts have to agree, which is what the footer's bare hardware name used to hide (Erik's
+/// acceptance review, Oct 20, 2026): what this run was asked to use, and what the machine actually
+/// has. `--device cpu` is the processor whatever the machine has; a card whose NVIDIA libraries are
+/// not installed is not a device this manager can run on yet, which is what section 4.3's offer is
+/// for. Only a card that is both here and usable is the graphics card.
+#[must_use]
+fn device_choice(facts: &Facts) -> Option<&str> {
+    if facts.device_setting == crate::device::Setting::Cpu.token() {
+        return None;
+    }
+    facts.gpu.as_ref().filter(|gpu| gpu.ready).map(|gpu| gpu.name.as_str())
 }
 
-fn footer(facts: &Facts) -> String {
-    format!("This computer only \u{b7} {} \u{b7} Closing this window turns AI features off \u{b7} Details", device_word(facts))
+/// The device Details and the bug report name, in the short form the brief's table uses.
+fn device_word(facts: &Facts) -> String {
+    device_choice(facts).map_or_else(|| "Processor".to_string(), |name| name.to_string())
+}
+
+/// The footer, which no longer carries a device: the labeled line in the status block says that in
+/// plain words, and one sentence saying it twice is how it got missed in the first place.
+fn footer() -> String {
+    "This computer only \u{b7} Closing this window turns AI features off \u{b7} Details".to_string()
+}
+
+/// The operations an installed model offers on its own row.
+///
+/// Both words are the brief's own (section 4.5), and both mean what they say: `Check again` re-hashes
+/// the bytes the catalog pins, and `Remove` deletes the model. There is no reload or rebuild to
+/// offer, because the library has no such operation - a session is loaded on the next job. A model
+/// that is not installed has nothing to check or remove, and a download in flight is not a model yet.
+#[must_use]
+fn manage_words(state: &RowState) -> Vec<String> {
+    match state {
+        RowState::Ready | RowState::Working { .. } | RowState::NeedsRepair | RowState::NeedsYourOk => {
+            vec![format::CHECK_AGAIN_WORDS.to_string(), format::REMOVE_WORDS.to_string()]
+        }
+        RowState::Add { .. } | RowState::Downloading { .. } | RowState::Paused { .. } => Vec::new(),
+    }
 }
 
 /// The Details list of section 4.5, in the brief's order.
@@ -749,7 +801,8 @@ mod tests {
         assert_eq!(offer.meta, "NVIDIA CUDA and cuDNN libraries \u{b7} 1.8 GB \u{b7} NVIDIA's licences");
         assert_eq!(offer.button, "Add \u{b7} 1.8 GB");
         assert_eq!(offer.accept_words, "I accept NVIDIA's licence terms.");
-        assert_eq!(view.footer, "This computer only \u{b7} Processor \u{b7} Closing this window turns AI features off \u{b7} Details");
+        assert_eq!(view.footer, "This computer only \u{b7} Closing this window turns AI features off \u{b7} Details");
+        assert_eq!(view.device_line, "AI device: Processor (CPU)");
         facts.gpu = Some(state::GpuFacts {
             name: "NVIDIA GeForce RTX 4090".to_string(),
             free_mib: 22_118,
@@ -758,10 +811,8 @@ mod tests {
             libraries_bytes: 1_915_544_656,
         });
         assert!(state::view(&facts).offer.is_none());
-        assert_eq!(
-            state::view(&facts).footer,
-            "This computer only \u{b7} NVIDIA GeForce RTX 4090 \u{b7} Closing this window turns AI features off \u{b7} Details"
-        );
+        assert_eq!(state::view(&facts).footer, "This computer only \u{b7} Closing this window turns AI features off \u{b7} Details");
+        assert_eq!(state::view(&facts).device_line, "AI device: Graphics card (NVIDIA GeForce RTX 4090)");
         facts.gpu = None;
         assert!(state::view(&facts).offer.is_none());
     }
@@ -898,6 +949,129 @@ mod tests {
             libraries_bytes: 1_915_544_656,
         });
         assert_eq!(details_value(&facts, "Graphics card"), "NVIDIA GeForce RTX 4090 \u{b7} libraries not added, so features run on the processor");
+    }
+
+    /// Erik's acceptance review (Oct 20, 2026) found the CPU/GPU question unclear: the footer carried
+    /// a bare hardware name, with no label and no sentence. The status block now says it in words,
+    /// and the footer no longer says it twice.
+    #[test]
+    fn the_device_line_names_the_processor_when_the_machine_has_no_card() {
+        let view = view(&both_installed());
+        assert_eq!(view.device_line, "AI device: Processor (CPU)");
+        assert_eq!(view.device, "Processor");
+        assert_eq!(view.footer, "This computer only \u{b7} Closing this window turns AI features off \u{b7} Details");
+    }
+
+    /// A card is not a device this manager can run on until its NVIDIA libraries are here, which is
+    /// what section 4.3's offer is for, so the line still says the processor.
+    #[test]
+    fn the_device_line_waits_for_the_cards_libraries_before_naming_it() {
+        let mut facts = both_installed();
+        facts.gpu = Some(state::GpuFacts {
+            name: "NVIDIA GeForce RTX 4090".to_string(),
+            free_mib: 22_118,
+            total_mib: 24_576,
+            ready: false,
+            libraries_bytes: 1_915_544_656,
+        });
+        assert_eq!(view(&facts).device_line, "AI device: Processor (CPU)");
+        facts.gpu = Some(state::GpuFacts {
+            name: "NVIDIA GeForce RTX 4090".to_string(),
+            free_mib: 22_118,
+            total_mib: 24_576,
+            ready: true,
+            libraries_bytes: 1_915_544_656,
+        });
+        assert_eq!(view(&facts).device_line, "AI device: Graphics card (NVIDIA GeForce RTX 4090)");
+        assert_eq!(view(&facts).device, "NVIDIA GeForce RTX 4090");
+    }
+
+    /// A run started with `--device cpu` uses the processor whatever the machine has, and the
+    /// line has to say that rather than name the card sitting in the box.
+    #[test]
+    fn a_run_asked_for_the_processor_says_so_whatever_the_machine_has() {
+        let mut facts = both_installed();
+        facts.gpu = Some(state::GpuFacts {
+            name: "NVIDIA GeForce RTX 4090".to_string(),
+            free_mib: 22_118,
+            total_mib: 24_576,
+            ready: true,
+            libraries_bytes: 1_915_544_656,
+        });
+        facts.device_setting = crate::device::Setting::Cpu.token().to_string();
+        assert_eq!(view(&facts).device_line, "AI device: Processor (CPU)");
+        assert_eq!(view(&facts).device, "Processor");
+        facts.device_setting = crate::device::Setting::Auto.token().to_string();
+        assert_eq!(state::view(&facts).device_line, "AI device: Graphics card (NVIDIA GeForce RTX 4090)");
+    }
+
+    /// The per-job sentence of section 4.2 stays as it was: one job that fell back to the processor
+    /// does not mean the run is using the processor, so both statements are true at once.
+    #[test]
+    fn a_fallen_back_job_says_the_processor_while_the_run_still_names_the_card() {
+        let mut facts = both_installed();
+        facts.gpu = Some(state::GpuFacts {
+            name: "NVIDIA GeForce RTX 4090".to_string(),
+            free_mib: 22_118,
+            total_mib: 24_576,
+            ready: true,
+            libraries_bytes: 1_915_544_656,
+        });
+        facts.jobs.push(state::JobFacts {
+            task: "fill_masked_area".to_string(),
+            device: "cpu".to_string(),
+            fallback: Some("insufficient_memory".to_string()),
+            elapsed_ms: 12_400,
+            ago_secs: 11_000,
+        });
+        let view = view(&facts);
+        assert_eq!(view.meta, "Last: Generative Fill, 3 h ago \u{b7} 12 s on the processor, because the graphics card didn't have enough free memory");
+        assert_eq!(view.device_line, "AI device: Graphics card (NVIDIA GeForce RTX 4090)");
+    }
+
+    /// Erik's acceptance review (Oct 20, 2026): an installed row ended at `Ready` and nothing
+    /// else, so its two operations read as absent. They are on the row now, in the words Details uses.
+    #[test]
+    fn an_installed_row_offers_to_check_again_and_remove_without_opening_details() {
+        let view = view(&both_installed());
+        for row in &view.rows {
+            assert_eq!(row.manage, vec![format::CHECK_AGAIN_WORDS.to_string(), format::REMOVE_WORDS.to_string()]);
+        }
+    }
+
+    /// A model that is not installed has nothing to check or remove, and a download in flight is not
+    /// a model yet, so those rows offer nothing of their own.
+    #[test]
+    fn a_row_that_is_not_installed_offers_no_management_of_its_own() {
+        let fresh = Facts { version: "0.1.0".to_string(), models: vec![lama(), birefnet()], ..Facts::default() };
+        assert!(view(&fresh).rows.iter().all(|row| row.manage.is_empty()));
+        let mut facts = both_installed();
+        facts.models[0].downloading = Some((93 * 1024 * 1024, 198 * 1024 * 1024));
+        assert_eq!(view(&facts).rows[0].state.words(), "47%");
+        assert!(view(&facts).rows[0].manage.is_empty());
+        facts.models[0].downloading = None;
+        facts.models[0].paused = Some((120 * 1024 * 1024, 198 * 1024 * 1024));
+        assert_eq!(state::view(&facts).rows[0].state.words(), "\u{25cf} Paused \u{b7} 61%");
+        assert!(state::view(&facts).rows[0].manage.is_empty());
+    }
+
+    /// The states that need the user most are the ones that keep their management: a damaged or
+    /// unacknowledged model is exactly when `Check again` is the way out.
+    #[test]
+    fn a_working_or_needs_you_row_keeps_its_management() {
+        let mut facts = both_installed();
+        facts.running = Some(state::RunningFacts { task: "subject_mask".to_string(), started_secs: 2, progress_percent: 40 });
+        let view = view(&facts);
+        assert_eq!(view.rows[1].state, RowState::Working { percent: 40 });
+        assert_eq!(view.rows[1].manage, vec![format::CHECK_AGAIN_WORDS.to_string(), format::REMOVE_WORDS.to_string()]);
+        let mut facts = both_installed();
+        facts.models[1].damaged = true;
+        assert_eq!(state::view(&facts).rows[1].state, RowState::NeedsRepair);
+        assert!(!state::view(&facts).rows[1].manage.is_empty());
+        let mut facts = both_installed();
+        facts.models[0].acknowledged = false;
+        assert_eq!(state::view(&facts).rows[0].state, RowState::NeedsYourOk);
+        assert!(!state::view(&facts).rows[0].manage.is_empty());
     }
 
     fn details_value(facts: &Facts, label: &str) -> String {

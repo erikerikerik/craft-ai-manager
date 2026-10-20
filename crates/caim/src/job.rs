@@ -109,6 +109,22 @@ impl Backend {
             Backend::Real { .. } => "none: no model is installed yet".to_string(),
         }
     }
+
+    /// The device setting every job on this start resolves against, or `None` when the backend has
+    /// no device of its own.
+    ///
+    /// MG-13 review round 6: the window has to say which hardware an AI feature would run on, and
+    /// the only honest source for that is the backend the queue is pointing at. `--device cpu` is a
+    /// fact about this run that no amount of probing changes, so it travels with the backend rather
+    /// than being re-read from the command line. The fake backend and a start with nothing installed
+    /// name no hardware at all, which the window reads as "this run has not chosen a device".
+    #[must_use]
+    pub fn device_setting(&self) -> Option<device::Setting> {
+        match self {
+            Backend::Real { device, .. } => Some(*device),
+            Backend::NoModel | Backend::Fake { .. } => None,
+        }
+    }
 }
 
 /// The device chain for one job (MG-11), decided from the model that is about to run.
@@ -387,6 +403,14 @@ impl Runner {
     #[must_use]
     pub fn offered(&self) -> routing::Offered {
         self.routing.lock().unwrap_or_else(PoisonError::into_inner).offered.clone()
+    }
+
+    /// The device setting the next job will resolve against, read from the same cell as
+    /// [Runner::offered], so the window's device statement and the queue can never disagree
+    /// (MG-13 review round 6). A refresh that points the queue at a new backend changes this too.
+    #[must_use]
+    pub fn device_setting(&self) -> Option<device::Setting> {
+        self.routing.lock().unwrap_or_else(PoisonError::into_inner).backend.device_setting()
     }
 
     /// Whether a job for this task still holds the model, which is not the question
