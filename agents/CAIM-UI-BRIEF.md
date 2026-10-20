@@ -31,10 +31,11 @@ Rejected directions (Oct 15): 1a sidebar + cards (a 2010s control panel, no hier
 ## 3. Layout (top to bottom)
 
 1. **Status sentence** (28 px): bold part + grey part. Below it, one 12 px line: activity, or what's happening.
+   - And one more 12 px line, in ink: the device statement - `AI device: Graphics card (NVIDIA GeForce RTX 4090)` or `AI device: Processor (CPU)`. Erik's acceptance review (Oct 20, 2026) found the CPU/GPU question unclear, and a bare hardware name in the footer was not enough. It names the device this run would use: the card only when it is here *and* its NVIDIA libraries are installed, and the processor whenever the run was started with `--device cpu`. A job that fell back to the processor keeps its own sentence (4.2); that is a different statement.
 2. **Action block** (only in "needs you" states): optional licence note, one primary button, one 12 px explanation.
 3. **Feature list**: one row per *catalog model*, listing the features it enables, separated by hairlines.
 4. **Graphics card offer** (only when an NVIDIA card is present and the CUDA libraries are not installed).
-5. **Footer** (12 px grey): `This computer only · <device> · Closing this window turns AI features off · Details`. Details expands a definition list above the footer line.
+5. **Footer** (12 px grey): `This computer only · Closing this window turns AI features off · Details`. Details expands a definition list above the footer line. (The device used to sit in this sentence; it is the labeled line of item 1 now - saying it twice in a footer is how it got missed.)
 
 ### Feature rows (from `catalog/models.toml`)
 
@@ -48,6 +49,7 @@ Rejected directions (Oct 15): 1a sidebar + cards (a 2010s control panel, no hier
 - **Sizes use Windows units** (1024-based, labelled MB/GB) so they match Explorer: 208,044,816 B = 198 MB; 224,005,088 B = 214 MB; CUDA total 1,915,544,656 B = 1.8 GB. One decimal under 10 GB, none above 10 MB.
 - Feature count in the status sentence counts features, not models: LaMa = 1, BiRefNet = 2.
 - Right side of the row, by state: `Add · <size>` button (not installed) · `47%` (downloading) · `Ready` (installed, verified, acknowledged) · `Working` + progress line (job running) · `● Needs repair` / `● Paused · 61%` / `● Needs your OK` in ink with an accent dot (needs you).
+- Under an installed model's state, two tertiary words: `Check again` and `Remove` - the same two Details already offers (4.5), said again where the row can be seen. Erik's acceptance review (Oct 20, 2026) found that a row ending at `Ready` read as a model with nothing to do with it. A row with nothing installed has nothing to check or remove, and a download in flight is not a model yet, so those show neither. There is no reload or rebuild to offer: the library has no such operation.
 - There is **no "Add features…" link**: every catalog entry is always listed, so uninstalled ones carry their own Add button. Hide nothing.
 
 ## 4. States and exact copy
@@ -95,7 +97,7 @@ Shown only when `cuda::status` finds an NVIDIA card and the libraries are not in
 - Title "Use your graphics card"; text "<device name> found. AI features run many times faster on it." (measured on the 4090, MG-11b: Select Subject 4.5 s → 0.27 s warm, Generative Fill 1.36 s → 0.12 s); meta "NVIDIA CUDA and cuDNN libraries · 1.8 GB · NVIDIA's licences"; button `Add · 1.8 GB`.
 - `Add` opens the terms inline (accent bar): "NVIDIA allows these libraries to be passed on, but they aren't open source. Without them every feature still works, on the processor." + link "Read NVIDIA's terms" (shows the two notes from `cuda.rs`: CUDA Toolkit, cuDNN SLA) + checkbox "I accept NVIDIA's licence terms." + `Download · 1.8 GB` + "Not now".
 - Downloading: progress line + "Downloading 0.7 of 1.8 GB · features keep running on the processor meanwhile" + "Cancel". Calls `cuda::install(root, accept_note = true, …)`.
-- Done: the section disappears; the footer device becomes the card name.
+- Done: the section disappears; the device line of item 1 becomes `AI device: Graphics card (<name>)`.
 
 ### 4.4 Needs you (artboard 3)
 
@@ -139,11 +141,11 @@ Example values on the canvas (412 MB, 21.6 GB free, port 41234, uptimes, "4 min 
 7. **Accessibility:** every control reachable by keyboard (Tab order follows the column), visible focus ring (2 px ink), accesskit labels for icon-free buttons, text contrast ≥ 4.5:1 (the tokens above pass).
 8. **Tests:** a state-model unit test per row in sections 4.1 to 4.4 (inputs: catalog + store + activity + cuda status → expected strings), plus a test that sizes format as in section 3. No pixel snapshots needed for M2.
 
-## 6. Open for Erik
+## 6. Open for Erik - all three decided (Oct 20, 2026)
 
-1. **Closing = stop** (rule 4)? The alternative is to keep serving with no window, which needs the tray (CAIM-09) to be findable again.
-2. **LaMa's catalog note** still says "Use it for personal work only." Proposed text (shown in 4.1 and 4.4): "LaMa's code and weights are Apache-2.0, but it was trained on Places2, whose images are licensed for non-commercial research and education. Not for paid or client jobs." Changing it makes existing installs ask for one fresh OK (4.4, row 3). Also: the `reason` field and the D2 line in SPEC amendment 13 still say "personal use".
-3. **Font:** Segoe UI from the system (default above), or bundle Inter (OFL-1.1, needs your OK)?
+1. **Closing = stop** (rule 4): **approved**. Closing the window stops CAIM for M2; the tray stays CAIM-09. It was already built that way (`crates/caim/src/main.rs:120`, and `window/app.rs:237` with its `on_exit` at `window/app.rs:264`).
+2. **LaMa's catalog note**: **approved**, with the precise disclosure - the code and weights are Apache-2.0, the training data is licensed for non-commercial research and education, and the model is not for paid or client jobs. Rule 5 means the change asks every existing install for one fresh OK; Erik approved that as intended. The `reason` field and the D2 wording changed in the same commit. One correction for the record: the approved sentence names **Places2**, but the bytes this catalog pins were trained on **Places365** (`crates/caim/catalog/models.toml:33`, `docs/models/lama.md:42`, and the PhotoCraft fork's `agents/research/RS-02-clean-fill.md:21`), so the note names Places365 and the rest of the sentence is as approved. Erik to confirm.
+3. **Font**: **approved** - Segoe UI from the system, no Inter, no extra font licence. `system_fonts()` in `window/app.rs:161` stays as it is.
 
 ## 7. Future: permission for third-party models (Oct 15; not M2)
 
