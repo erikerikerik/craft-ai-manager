@@ -159,7 +159,7 @@ pub fn open(server: &mut Server, stop: &StopHandle) -> Result<()> {
 /// Nothing is bundled - the brief leaves that to Erik - so a machine whose own font files cannot be
 /// read gets a sentence, and the caller serves in the terminal instead.
 fn system_fonts() -> Result<FontDefinitions> {
-    let folder = std::env::var_os("WINDIR").map_or_else(|| PathBuf::from(r"C:\Windows\Fonts"), PathBuf::from);
+    let folder = fonts_folder();
     let Some(regular) = font_file(&folder, "segoeui.ttf") else {
         return Err(Fail::internal("This computer's own fonts could not be read, so the window cannot open."));
     };
@@ -181,6 +181,18 @@ fn system_fonts() -> Result<FontDefinitions> {
     monospace.push("segoeui".to_string());
     fonts.families.insert(FontFamily::Monospace, monospace);
     Ok(fonts)
+}
+
+/// The folder this machine keeps its fonts in.
+fn fonts_folder() -> PathBuf {
+    fonts_folder_from(std::env::var_os("WINDIR"))
+}
+
+/// `WINDIR` names the Windows folder, not the Fonts folder inside it, so the fonts are one level
+/// below whatever it points at (MG-13 review round 5). A machine with no `WINDIR` at all gets the
+/// folder every Windows install puts its fonts in.
+fn fonts_folder_from(windir: Option<std::ffi::OsString>) -> PathBuf {
+    windir.map_or_else(|| PathBuf::from(r"C:\Windows\Fonts"), |folder| PathBuf::from(folder).join("Fonts"))
 }
 
 /// One font file from the system folder, if this machine has it and it can be read.
@@ -439,9 +451,7 @@ impl Window {
             ui.add_space(12.0);
             ui.horizontal(|ui| {
                 if window.primary(ui, &format::download_button(bytes), ticked).clicked() {
-                    window.press(task::Task::Install { id: id.clone(), accept_note: true });
-                    window.open_note = None;
-                    window.note_ticked = false;
+                    window.download_pressed(&id);
                 }
                 ui.add_space(10.0);
                 if window.tertiary(ui, format::NOT_NOW).clicked() {
@@ -450,6 +460,16 @@ impl Window {
                 }
             });
         });
+    }
+
+    /// The note's Download. The note and its box stay exactly as the person left them unless a
+    /// worker actually started, so a refused press cannot take back the tick they just made
+    /// (MG-13 review round 5).
+    fn download_pressed(&mut self, id: &str) {
+        if self.press(task::Task::Install { id: id.to_string(), accept_note: true }) {
+            self.open_note = None;
+            self.note_ticked = false;
+        }
     }
 
     /// A download in flight: the percentage, the bar, the brief's sentence, and Cancel.
@@ -538,8 +558,9 @@ impl Window {
         } else {
             task::Task::Acknowledge { id: id.to_string() }
         };
-        self.action_ticked = false;
-        self.press(task);
+        if self.press(task) {
+            self.action_ticked = false;
+        }
     }
 
     /// The graphics-card offer (brief 4.3), which only the state model knows to show.
@@ -590,9 +611,7 @@ impl Window {
             ui.add_space(12.0);
             ui.horizontal(|ui| {
                 if window.primary(ui, &format::download_button(bytes), ticked).clicked() {
-                    window.press(task::Task::Cuda { accept_note: true });
-                    window.cuda_open = false;
-                    window.cuda_ticked = false;
+                    window.cuda_download_pressed();
                 }
                 ui.add_space(10.0);
                 if window.tertiary(ui, format::NOT_NOW).clicked() {
@@ -601,6 +620,15 @@ impl Window {
                 }
             });
         });
+    }
+
+    /// The offer's Download, under the same rule as the licence note: the terms and their box stay
+    /// open and ticked unless a worker actually started.
+    fn cuda_download_pressed(&mut self) {
+        if self.press(task::Task::Cuda { accept_note: true }) {
+            self.cuda_open = false;
+            self.cuda_ticked = false;
+        }
     }
 
     /// The footer: the brief's sentence, with the Details toggle beside it.
@@ -685,15 +713,36 @@ impl Window {
         });
     }
 
-    /// Start a task. One that cannot start is a sentence, not a crash (brief rule 6).
-    fn press(&mut self, what: task::Task) {
+    /// Start a task, and say whether it started. One that cannot start is a sentence, not a crash
+    /// (brief rule 6), and the caller keeps whatever the person had on the screen.
+    fn press(&mut self, what: task::Task) -> bool {
         match task::start(&self.source, what) {
             Ok(running) => {
                 self.running = Some(running);
                 self.message = None;
+                true
             }
-            Err(fail) => self.message = Some(fail.sentence),
+            Err(fail) => {
+                self.message = Some(self.refusal(&fail.sentence));
+                false
+            }
         }
+    }
+
+    /// A refused press in the brief's plain words: the library's sentence, then what this window is
+    /// really doing, so nobody has to guess why the button did nothing. A press refused for a reason
+    /// the window cannot see - a thread the machine would not start - keeps the library's sentence on
+    /// its own rather than inventing work that is not happening.
+    fn refusal(&self, why: &str) -> String {
+        let doing = match self.source.busy() {
+            Some(Busy::Model { id, done, total }) => format!("Downloading {} - {}.", format::display_name(&id), format::of_words(done, total)),
+            Some(Busy::Cuda { done, total }) => format!("Downloading the CUDA libraries - {}.", format::of_words(done, total)),
+            Some(Busy::Checking { id }) => format!("Checking {}.", format::display_name(&id)),
+            Some(Busy::Removing { id }) => format!("Removing {}.", format::display_name(&id)),
+            None if self.source.is_claimed() => "This window is already working on something else.".to_string(),
+            None => return why.to_string(),
+        };
+        format!("{why} {doing} Nothing was changed; try again when it finishes.")
     }
 
     /// The one filled button on the screen. Grey and unclickable until `enabled`, which is how the
@@ -750,5 +799,118 @@ fn reveal(path: Option<&Path>) -> Option<String> {
     match std::process::Command::new("explorer.exe").arg(path).spawn() {
         Ok(_) => None,
         Err(_) => Some(format!("Windows would not open {}.", path.display())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::{ServeOptions, Server};
+    use crate::testkit::Scratch;
+    use std::ffi::OsString;
+
+    /// The window over a scratch store, with the server that shares the process with it. Every press
+    /// under test is refused before it could reach the network, so no test downloads anything.
+    fn window_at(root: PathBuf) -> (Server, Window) {
+        let server = Server::start(ServeOptions {
+            fake_backend: true,
+            models_root: Some(root.clone()),
+            endpoint_file: Some(root.join("endpoint.json")),
+            ..ServeOptions::default()
+        })
+        .expect("the server starts");
+        let source = Arc::new(Source::at_root(server.runner(), server.port(), None, server.routing(), root).expect("the window has a store"));
+        (server, Window::new(source, Arc::new(AtomicBool::new(false))))
+    }
+
+    /// Say that this window is busy, the way a worker does once it has bytes to report.
+    fn make_busy(window: &Window, busy: Busy) {
+        let work = window.source.work();
+        let mut work = work.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        work.set_busy(Some(busy));
+    }
+
+    /// MG-13 review round 5: `WINDIR` names the Windows folder, so the fonts are one level below it.
+    /// Before this, a normal Windows machine looked for `segoeui.ttf` in `C:\Windows` and the window
+    /// refused to open at all.
+    #[test]
+    fn windir_names_the_windows_folder_so_the_fonts_are_one_level_below_it() {
+        assert_eq!(fonts_folder_from(Some(OsString::from("C:/Windows"))), PathBuf::from("C:/Windows/Fonts"));
+        assert_eq!(fonts_folder_from(None), PathBuf::from(r"C:\Windows\Fonts"));
+    }
+
+    /// The same machine seen the way Windows writes its own variable, and the face it draws with.
+    #[cfg(windows)]
+    #[test]
+    fn a_normal_windows_machine_has_the_fonts_the_window_draws_with() {
+        assert_eq!(fonts_folder_from(Some(OsString::from(r"C:\Windows"))), PathBuf::from(r"C:\Windows\Fonts"));
+        let fonts = system_fonts().expect("this machine has the fonts Windows itself uses");
+        assert!(fonts.font_data.contains_key("segoeui"), "the window's own face comes from the system folder");
+    }
+
+    /// MG-13 review round 5: a refused Download used to close the licence note and clear the box the
+    /// person had just ticked, so the only way to retry was to read the licence all over again.
+    #[test]
+    fn a_refused_download_keeps_the_licence_note_open_and_ticked() {
+        let scratch = Scratch::new("window-refused-download");
+        let (_server, mut window) = window_at(scratch.path.clone());
+        window.open_note = Some("birefnet-lite".to_string());
+        window.note_ticked = true;
+        make_busy(&window, Busy::Model { id: "birefnet-lite".to_string(), done: 80 * 1024 * 1024, total: 198 * 1024 * 1024 });
+        window.download_pressed("birefnet-lite");
+        assert_eq!(window.open_note.as_deref(), Some("birefnet-lite"), "the note is still open under its row");
+        assert!(window.note_ticked, "and the box is still ticked, so the retry is one press away");
+        assert!(window.running.is_none(), "nothing started");
+        let message = window.message.clone().expect("the window says why the press was refused");
+        assert!(message.contains("Something else is happening in this window right now."), "the library's own sentence: {message}");
+        assert!(message.contains("Downloading BiRefNet lite - 80 of 198 MB."), "and what is really happening: {message}");
+        assert!(message.contains("Nothing was changed; try again when it finishes."), "and that nothing was lost: {message}");
+    }
+
+    /// The offer's terms are the same shape, so they carry the same rule.
+    #[test]
+    fn a_refused_cuda_download_keeps_the_terms_open_and_ticked() {
+        let scratch = Scratch::new("window-refused-cuda");
+        let (_server, mut window) = window_at(scratch.path.clone());
+        window.cuda_open = true;
+        window.cuda_ticked = true;
+        make_busy(&window, Busy::Cuda { done: 512 * 1024 * 1024, total: 1024 * 1024 * 1024 });
+        window.cuda_download_pressed();
+        assert!(window.cuda_open, "the terms are still on the screen");
+        assert!(window.cuda_ticked, "and the acceptance the person gave is still given");
+        assert!(window.running.is_none(), "nothing started");
+        let message = window.message.clone().expect("the window says why the press was refused");
+        assert!(message.contains("Downloading the CUDA libraries - 0.5 of 1.0 GB."), "the progress the worker reported: {message}");
+    }
+
+    /// A worker that has taken the window but has no bytes yet has nothing to report, so the window
+    /// says that rather than a percentage it does not have.
+    #[test]
+    fn a_refused_press_says_the_window_is_busy_before_any_worker_has_reported() {
+        let scratch = Scratch::new("window-refused-claim");
+        let (_server, mut window) = window_at(scratch.path.clone());
+        window.open_note = Some("lama".to_string());
+        window.note_ticked = true;
+        let work = window.source.work();
+        assert!(work.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).claim(), "the window takes its own worker slot");
+        window.download_pressed("lama");
+        assert_eq!(window.open_note.as_deref(), Some("lama"), "the note stays open");
+        assert!(window.note_ticked, "and its box stays ticked");
+        let message = window.message.clone().expect("the window says why the press was refused");
+        assert!(message.contains("This window is already working on something else."), "no invented progress: {message}");
+    }
+
+    /// The other half: a press that is accepted still clears its box and starts its worker. This one
+    /// uses `Acknowledge`, which touches the store and never the network.
+    #[test]
+    fn an_accepted_press_starts_its_worker_and_clears_its_box() {
+        let scratch = Scratch::new("window-accepted-press");
+        let (_server, mut window) = window_at(scratch.path.clone());
+        window.action_ticked = true;
+        window.action_pressed(Some("lama"));
+        assert!(!window.action_ticked, "the box clears once the work has started");
+        assert!(window.message.is_none(), "an accepted press says nothing");
+        let mut running = window.running.take().expect("the worker started");
+        running.join();
     }
 }

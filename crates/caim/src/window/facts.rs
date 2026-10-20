@@ -85,6 +85,12 @@ impl Work {
         self.claimed = false;
     }
 
+    /// Whether a worker has this window, which is true a moment before it has anything to report.
+    #[must_use]
+    pub fn claimed(&self) -> bool {
+        self.claimed
+    }
+
     /// A model download's progress callback.
     pub fn model_progress(&mut self, id: &str, done: u64, total: u64) {
         self.busy = Some(Busy::Model { id: id.to_string(), done, total });
@@ -285,6 +291,14 @@ impl Source {
     #[must_use]
     pub fn busy(&self) -> Option<Busy> {
         lock(&self.work).busy().cloned()
+    }
+
+    /// Whether a worker has this window. This is true before [Source::busy] can say what the worker is
+    /// doing, which is what lets a refused press say something honest about the gap in between
+    /// (MG-13 review round 5).
+    #[must_use]
+    pub fn is_claimed(&self) -> bool {
+        lock(&self.work).claimed()
     }
 
     /// The whole state model, as this machine is right now.

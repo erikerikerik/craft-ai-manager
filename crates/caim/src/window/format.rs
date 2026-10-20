@@ -278,14 +278,21 @@ pub fn download_button(bytes: u64) -> String {
     format!("Download \u{b7} {}", size(bytes))
 }
 
+/// How far a download has got, in the total's unit: "93 of 198 MB".
+///
+/// Both numbers are measured in the total's unit, which is what the brief's "0.7 of 1.8 GB" needs.
+#[must_use]
+pub fn of_words(done: u64, total: u64) -> String {
+    let (divisor, unit) = scale(total);
+    format!("{} of {} {unit}", in_unit(done, divisor), in_unit(total, divisor))
+}
+
 /// The line under a download in flight: "Downloading 93 of 198 MB \u{b7} checked as it arrives".
 ///
-/// Both numbers are measured in the total's unit, which is what the brief's "Downloading 0.7 of
-/// 1.8 GB" needs. The suffix is the only difference between a model's line and the CUDA one.
+/// The suffix is the only difference between a model's line and the CUDA one.
 #[must_use]
 pub fn downloading_line(done: u64, total: u64, suffix: &str) -> String {
-    let (divisor, unit) = scale(total);
-    format!("Downloading {} of {} {unit} \u{b7} {suffix}", in_unit(done, divisor), in_unit(total, divisor))
+    format!("Downloading {} \u{b7} {suffix}", of_words(done, total))
 }
 
 /// The footer without its own toggle, so the toggle can be drawn as a control beside it.
@@ -299,7 +306,8 @@ mod tests {
         ACKNOWLEDGE_WORDS, CANCEL, CHECK_AGAIN_WORDS, CLOSE_QUESTION, CLOSE_WORDS, COPY_DETAILS_WORDS, CUDA_ACCEPT_WORDS, CUDA_DOWNLOADING_SUFFIX,
         CUDA_LINK_WORDS, CUDA_TERMS, DETAILS_WORDS, HIDE_DETAILS_WORDS, KEEP_OPEN_WORDS, MODEL_DOWNLOADING_SUFFIX, NOT_NOW, NOTE_HEADING, OPEN_ACTIVITY_WORDS,
         OPEN_FOLDER_WORDS, REMOVE_WORDS, WINDOW_TITLE, about_words, ago_words, date_words, device_words, display_name, download_button, downloading_line,
-        elapsed_words, fallback_words, feature, footer_without_details, gib_words, group, percent, running_words, size, size_parts, task_words, uptime_words,
+        elapsed_words, fallback_words, feature, footer_without_details, gib_words, group, of_words, percent, running_words, size, size_parts, task_words,
+        uptime_words,
     };
 
     /// Section 3 of the brief, exactly: the three sizes it names and the rule behind them.
@@ -315,6 +323,14 @@ mod tests {
         assert_eq!(size(1024), "1 KB");
         assert_eq!(size(0), "0 bytes");
         assert_eq!(size_parts(120 * 1024 * 1024), ("120".to_string(), "MB"));
+    }
+
+    /// The two numbers of a download share the total's unit, wherever a sentence quotes them.
+    #[test]
+    fn the_two_numbers_of_a_download_share_the_totals_unit() {
+        assert_eq!(of_words(97_517_568, 208_044_816), "93 of 198 MB");
+        assert_eq!(of_words(751_619_276, 1_915_544_656), "0.7 of 1.8 GB");
+        assert_eq!(of_words(0, 208_044_816), "0 of 198 MB");
     }
 
     #[test]

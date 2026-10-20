@@ -315,7 +315,7 @@ fn open_starts_a_manager_at_once_when_a_dead_run_left_the_launch_lock_behind() {
 #[test]
 fn open_keeps_serving_when_this_computer_has_no_window_to_open() {
     // MG-13, brief rules 1 and 6: the window is the manager's front end, not the service. A computer
-    // whose own fonts cannot be read - here, a `WINDIR` with no font files in it, which is every
+    // whose own fonts cannot be read - here, a `WINDIR` with no Fonts folder under it, which is every
     // computer that has no Segoe UI at all - gets one plain sentence and a manager that serves
     // anyway, because PhotoCraft talks to the port and never to the window.
     let folder = std::env::temp_dir().join(format!("caim-it-{}-open-no-window", std::process::id()));
