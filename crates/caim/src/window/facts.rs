@@ -17,6 +17,7 @@ use crate::cuda;
 use crate::error::Result;
 use crate::job::Runner;
 use crate::models;
+use crate::server;
 use crate::store;
 use crate::window::{format, state};
 
@@ -148,6 +149,9 @@ struct Log {
 /// can be read while something else is writing them.
 pub struct Source {
     runner: Arc<Runner>,
+    /// The server's live routing, which this window changes whenever it installs or removes a model
+    /// (MG-13 review round 2).
+    routing: server::Routing,
     port: u16,
     endpoint: Option<PathBuf>,
     activity: Option<PathBuf>,
@@ -166,7 +170,7 @@ pub struct Source {
 impl Source {
     /// Open the window's view of this machine. A machine with no models folder, or a catalog that
     /// will not parse, has no window: the caller serves in the terminal instead.
-    pub fn new(runner: Arc<Runner>, port: u16, endpoint: Option<PathBuf>) -> Result<Source> {
+    pub fn new(runner: Arc<Runner>, port: u16, endpoint: Option<PathBuf>, routing: server::Routing) -> Result<Source> {
         let root = models::models_root()?;
         let models = catalog::load()?;
         let cuda_components = cuda::components();
@@ -174,6 +178,7 @@ impl Source {
         Ok(Source {
             cuda: cuda_components,
             runner,
+            routing,
             port,
             activity: activity::activity_path_for(endpoint.as_deref()),
             endpoint,
@@ -222,6 +227,15 @@ impl Source {
     #[must_use]
     pub fn runner(&self) -> Arc<Runner> {
         Arc::clone(&self.runner)
+    }
+
+    /// Tell the server that what this machine has installed may have changed (MG-13 review round 2).
+    ///
+    /// The worker does this after every install, acknowledgement and removal, so a model installed
+    /// from the window is routable without restarting Craft AI Manager, and one the window removed
+    /// stops being offered.
+    pub fn refresh_routing(&self) {
+        self.routing.refresh();
     }
 
     /// The catalog entry with this id, which the worker looks up rather than trusts the UI with.

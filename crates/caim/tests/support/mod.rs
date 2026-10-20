@@ -145,6 +145,11 @@ impl TestServer {
         self.server.token()
     }
 
+    /// What the window does after it installs, acknowledges or removes a model (MG-13 round 2).
+    pub fn refresh_routing(&self) {
+        self.server.refresh_routing();
+    }
+
     /// One well-formed request, framed exactly as PhotoCraft's client frames it.
     pub fn request(&self, method: &str, path: &str, content_type: Option<&str>, body: &[u8]) -> Reply {
         let mut out = Vec::new();

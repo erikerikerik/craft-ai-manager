@@ -265,6 +265,12 @@ fn lock(shared: &Arc<Mutex<Shared>>) -> std::sync::MutexGuard<'_, Shared> {
     shared.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// The backend the worker runs the next job on. The cell is only ever held for the clone, never
+/// across a job, so a refresh while a job is running cannot block the worker or interrupt it.
+fn backend_of(cell: &Mutex<Arc<Backend>>) -> Arc<Backend> {
+    cell.lock().unwrap_or_else(PoisonError::into_inner).clone()
+}
+
 /// The job with this id, if this manager still knows about it.
 fn find_mut<'a>(jobs: &'a mut [Entry], id: &str) -> Option<&'a mut Entry> {
     jobs.iter_mut().find(|entry| entry.id == id)
@@ -295,6 +301,10 @@ pub struct Runner {
     stop: Arc<std::sync::atomic::AtomicBool>,
     max_queue: usize,
     budget: Budget,
+    /// What the worker runs jobs on, which the window can change while the manager is serving
+    /// (MG-13 review round 2). The worker takes its own copy per job, so a job already running keeps
+    /// the backend it started with and a model installed afterwards is used by the next job.
+    backend: Arc<Mutex<Arc<Backend>>>,
 }
 
 impl Runner {
@@ -310,18 +320,37 @@ impl Runner {
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let worker_shared = Arc::clone(&shared);
         let worker_stop = Arc::clone(&stop);
-        let backend = Arc::new(backend);
+        let backend_cell = Arc::new(Mutex::new(Arc::new(backend)));
+        let worker_backend = Arc::clone(&backend_cell);
         let handle = std::thread::Builder::new()
             .name("caim-jobs".to_string())
-            .spawn(move || worker(worker_shared, queue_rx, worker_stop, backend))
+            .spawn(move || worker(worker_shared, queue_rx, worker_stop, worker_backend))
             .map_err(|error| Fail::internal(format!("Craft AI Manager could not start its job worker: {error}")))?;
-        Ok(Runner { shared, queue_tx, worker: Mutex::new(Some(handle)), stop, max_queue, budget: Budget::new(memory_limit) })
+        Ok(Runner {
+            shared,
+            queue_tx,
+            worker: Mutex::new(Some(handle)),
+            stop,
+            max_queue,
+            budget: Budget::new(memory_limit),
+            backend: Arc::clone(&backend_cell),
+        })
     }
 
     /// Point the queue at an activity log. Amendment 18 puts it next to `endpoint.json`, and a
     /// run with no endpoint file has no log: nothing about a job changes either way.
     pub(crate) fn set_activity_log(&self, path: Option<PathBuf>) {
         lock(&self.shared).activity = path;
+    }
+
+    /// Point the queue at a different backend (MG-13 review round 2).
+    ///
+    /// The window installs, acknowledges and removes models while this manager is already serving, so
+    /// the models on disk are not the models this start found. A job already inside a backend keeps
+    /// the one it took - a session is never pulled out from under a running job - and the next job
+    /// gets the new one.
+    pub fn set_backend(&self, backend: Backend) {
+        *self.backend.lock().unwrap_or_else(PoisonError::into_inner) = Arc::new(backend);
     }
 
     /// The job the worker is inside right now, if any. The window asks once per repaint, which is
@@ -346,6 +375,15 @@ impl Runner {
         if !shared.retired.iter().any(|retired| retired == task) {
             shared.retired.push(task.to_string());
         }
+    }
+
+    /// Route to a task again after a removal that did not happen (MG-13 review round 2).
+    ///
+    /// Retirement means "this run deleted the file", so it may only stand while the file is gone. If
+    /// the job inside the model would not stop, or the delete failed, the model is still installed and
+    /// every job for its task has to be accepted again rather than refused until the next restart.
+    pub fn restore_task(&self, task: &str) {
+        lock(&self.shared).retired.retain(|retired| retired != task);
     }
 
     pub(crate) fn admit(&self, body_bytes: usize) -> Result<Admission> {
@@ -546,11 +584,16 @@ impl Drop for Runner {
 }
 
 /// The worker loop: take the next job, run it, then sweep finished results.
-fn worker(shared: Arc<Mutex<Shared>>, queue_rx: Receiver<String>, stop: Arc<std::sync::atomic::AtomicBool>, backend: Arc<Backend>) {
+fn worker(shared: Arc<Mutex<Shared>>, queue_rx: Receiver<String>, stop: Arc<std::sync::atomic::AtomicBool>, backend: Arc<Mutex<Arc<Backend>>>) {
     use std::sync::atomic::Ordering;
     while !stop.load(Ordering::Relaxed) {
         match queue_rx.recv_timeout(WORKER_POLL) {
-            Ok(id) => run_one(&shared, &id, &backend),
+            // The backend is taken per job, so the window can change what runs next without waiting
+            // for, or interrupting, the job this worker is inside.
+            Ok(id) => {
+                let running = backend_of(&backend);
+                run_one(&shared, &id, &running);
+            }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
@@ -1412,6 +1455,47 @@ mod tests {
         };
         assert_eq!(state, State::Failed, "it never reaches a backend that is still holding the file");
         assert_eq!(message, "The Select Subject model isn't installed.");
+        runner.stop();
+    }
+
+    /// MG-13 review round 2: the window installs a model while this manager is already serving.
+    #[test]
+    fn a_backend_pointed_at_an_installed_model_serves_the_next_job() {
+        let runner = Runner::new(Backend::NoModel, MAX_QUEUE).expect("the worker starts");
+        let before = runner.submit(TASK_FILL, frame(), mask()).expect("the queue takes the job");
+        assert_eq!(finish(&runner, &before), State::Failed, "nothing is installed yet");
+        assert_eq!(runner.state(&before).expect("the job exists").2, crate::routing::not_ready_sentence(TASK_FILL), "the same sentence an uninstalled model gets");
+        runner.set_backend(Backend::Fake { step_delay: Duration::ZERO });
+        let id = runner.submit(TASK_FILL, frame(), mask()).expect("the model the window just installed");
+        assert_eq!(finish(&runner, &id), State::Done, "the next job runs on the backend the refresh pointed at");
+        runner.stop();
+    }
+
+    /// A refresh must not reach into a job that is already inside a backend.
+    #[test]
+    fn a_job_already_running_keeps_the_backend_it_took_when_the_backend_is_swapped() {
+        let runner = Runner::new(Backend::Fake { step_delay: Duration::from_millis(40) }, MAX_QUEUE).expect("the worker starts");
+        let first = runner.submit(TASK_FILL, frame(), mask()).expect("the first job holds the worker");
+        assert_eq!(settle(&runner, &first), State::Running, "the worker is inside the fake backend");
+        runner.set_backend(Backend::NoModel);
+        assert_eq!(finish(&runner, &first), State::Done, "the job that was already running finishes on the backend it took");
+        let second = runner.submit(TASK_FILL, frame(), mask()).expect("the next job is still accepted");
+        assert_eq!(finish(&runner, &second), State::Failed, "the next job gets the new backend");
+        assert_eq!(runner.state(&second).expect("the job exists").2, crate::routing::not_ready_sentence(TASK_FILL));
+        runner.stop();
+    }
+
+    /// MG-13 review round 2: a Remove that did not delete must not leave the task retired.
+    #[test]
+    fn restoring_a_retired_task_routes_it_again() {
+        let runner = Runner::new(Backend::Fake { step_delay: Duration::ZERO }, MAX_QUEUE).expect("the worker starts");
+        runner.retire_task(TASK_MASK);
+        let fail = runner.submit(TASK_MASK, frame(), mask()).expect_err("the task was retired");
+        assert_eq!(fail.status.code(), 400, "{fail}");
+        runner.restore_task(TASK_MASK);
+        runner.restore_task(TASK_MASK);
+        let id = runner.submit(TASK_MASK, frame(), mask()).expect("the model is still installed, so the task routes again");
+        assert_eq!(finish(&runner, &id), State::Done, "and the job runs");
         runner.stop();
     }
 }

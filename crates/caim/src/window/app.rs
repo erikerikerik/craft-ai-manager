@@ -135,7 +135,7 @@ impl Window {
 /// parse, no readable system font or no usable graphics device gets a sentence instead, and the
 /// caller keeps serving in the terminal.
 pub fn open(server: &mut Server, stop: &StopHandle) -> Result<()> {
-    let source = Arc::new(Source::new(server.runner(), server.port(), server.endpoint_path().map(Path::to_path_buf))?);
+    let source = Arc::new(Source::new(server.runner(), server.port(), server.endpoint_path().map(Path::to_path_buf), server.routing())?);
     let fonts = system_fonts()?;
     let stop_flag = stop.stop_signal();
     let options = eframe::NativeOptions {
