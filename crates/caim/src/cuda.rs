@@ -273,25 +273,41 @@ pub fn install(root: &Path, accept_note: bool, fetcher: &dyn fetch::Fetch, progr
     if !supported_here() {
         return Err(Fail::internal(format!("{} There is nothing to install.", unpinned_sentence())));
     }
+    let parts = components();
+    let dir = library_dir(root);
+    let (downloaded, libraries) = install_components(root, &parts, accept_note, fetcher, progress)?;
+    let bytes: u64 = parts.iter().map(|model| model.size).sum();
+    Ok(format!("CUDA libraries are ready in {}: {libraries} files from {} archives ({bytes} bytes), {downloaded} downloaded now.", dir.display(), parts.len()))
+}
+
+/// Fetch the archives in `components` and unpack the libraries they carry, into [library_dir].
+///
+/// MG-13 review round 3: an archive that is already verified is not fetched again, but its bytes
+/// still have to be reported - the window adds the reports up into the one total the offer showed,
+/// and on a machine that already had one of the archives the bar used to stop short of it and the
+/// row never read finished. Returns how many archives were fetched and how many libraries landed.
+fn install_components(
+    root: &Path,
+    components: &[Model],
+    accept_note: bool,
+    fetcher: &dyn fetch::Fetch,
+    progress: &mut dyn FnMut(u64, u64),
+) -> Result<(usize, usize)> {
     let dir = library_dir(root);
     std::fs::create_dir_all(&dir).map_err(|error| Fail::internal(format!("Craft AI Manager could not create {}: {error}", dir.display())))?;
     let mut downloaded = 0usize;
     let mut libraries = 0usize;
-    for model in components() {
+    for model in components {
         if accept_note && model.note.is_some() {
-            store::write_acknowledgement(root, &model)?;
+            store::write_acknowledgement(root, model)?;
         }
-        if let fetch::Outcome::Downloaded { .. } = fetch::install(&model, root, fetcher, progress)? {
-            downloaded += 1;
+        match fetch::install(model, root, fetcher, progress)? {
+            fetch::Outcome::Downloaded { .. } => downloaded += 1,
+            fetch::Outcome::AlreadyInstalled => progress(model.size, model.size),
         }
-        libraries += extract(&store::model_file(root, &model), &dir, &wanted(&model))?.len();
+        libraries += extract(&store::model_file(root, model), &dir, &wanted(model))?.len();
     }
-    let bytes: u64 = components().iter().map(|model| model.size).sum();
-    Ok(format!(
-        "CUDA libraries are ready in {}: {libraries} files from {} archives ({bytes} bytes), {downloaded} downloaded now.",
-        dir.display(),
-        components().len()
-    ))
+    Ok((downloaded, libraries))
 }
 
 /// `caim cuda install [--accept-note]` with the real folder and the real HTTPS fetcher, which is
@@ -970,7 +986,7 @@ fn u32_at(bytes: &[u8], at: usize) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testkit::Scratch;
+    use crate::testkit::{FakeFetch, Scratch, test_model};
 
     /// A zip archive built the way an archiver builds one: local headers, then the central
     /// directory, then the record that points at it. `method` is [STORED] or [DEFLATED].
@@ -1024,6 +1040,28 @@ mod tests {
         out.extend_from_slice(&directory_at.to_le_bytes());
         out.extend_from_slice(&0u16.to_le_bytes());
         out
+    }
+
+    /// MG-13 review round 3: an archive that is already verified is not fetched again, but its bytes
+    /// still have to be reported. The window adds the reports up into the one total the offer showed,
+    /// so on a machine that already had one of the four archives the bar used to stop short of it.
+    #[test]
+    fn an_archive_that_is_already_installed_still_reports_its_bytes() {
+        let scratch = Scratch::new("cuda-already-installed");
+        let root = scratch.path.join("cuda");
+        let zip = archive(&[("cuda_cudart/bin/x64/cudart64_13.dll", STORED, b"the bytes a library would be made of".as_slice())]);
+        let mut model = test_model(&zip, None);
+        model.id = "cuda_cudart".to_string();
+        model.file = "cuda_cudart.zip".to_string();
+        let parts = [model.clone()];
+        let mut reports: Vec<(u64, u64)> = Vec::new();
+        let first = install_components(&root, &parts, true, &FakeFetch::new(&zip), &mut |done, seen| reports.push((done, seen))).expect("the archive arrives");
+        assert_eq!(first, (1, 1), "one archive fetched, one library unpacked");
+        let before = reports.len();
+        let second = install_components(&root, &parts, true, &FakeFetch::new(&[]), &mut |done, seen| reports.push((done, seen)))
+            .expect("the second run makes no request at all");
+        assert_eq!(second, (0, 1), "the archive is already verified, so nothing is fetched");
+        assert_eq!(&reports[before..], &[(model.size, model.size)], "the archive already on disk still counts towards the total");
     }
 
     /// An archive in a scratch folder, plus the folder its members are unpacked into.

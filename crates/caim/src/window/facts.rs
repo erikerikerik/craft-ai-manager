@@ -47,6 +47,9 @@ pub enum Busy {
 /// while the UI thread reads it.
 #[derive(Clone, Debug, Default)]
 pub struct Work {
+    /// Whether a worker has taken this window. `busy` stays empty until a download's first byte, so
+    /// it cannot be the thing that says a second press is too early (MG-13 review round 3).
+    claimed: bool,
     busy: Option<Busy>,
     damaged: Vec<String>,
     out_of_space: Vec<String>,
@@ -63,6 +66,23 @@ impl Work {
     /// Say what the window is doing, or that it is doing nothing.
     pub fn set_busy(&mut self, busy: Option<Busy>) {
         self.busy = busy;
+    }
+
+    /// Take this window for one task, or say that somebody already has it.
+    ///
+    /// The claim happens before the worker starts, which is the only way to refuse a second press
+    /// that arrives in the moment before the first worker has anything to report.
+    pub fn claim(&mut self) -> bool {
+        if self.claimed || self.busy.is_some() {
+            return false;
+        }
+        self.claimed = true;
+        true
+    }
+
+    /// Give the window back, so the next press can have it.
+    pub fn release(&mut self) {
+        self.claimed = false;
     }
 
     /// A model download's progress callback.
@@ -171,7 +191,18 @@ impl Source {
     /// Open the window's view of this machine. A machine with no models folder, or a catalog that
     /// will not parse, has no window: the caller serves in the terminal instead.
     pub fn new(runner: Arc<Runner>, port: u16, endpoint: Option<PathBuf>, routing: server::Routing) -> Result<Source> {
-        let root = models::models_root()?;
+        Self::build(runner, port, endpoint, routing, models::models_root()?)
+    }
+
+    /// The same view pointed at a models folder of the caller's choosing. MG-13 review round 3: the
+    /// tests for installing, checking and removing a model need a store they can put a whole model
+    /// into, rather than whatever this machine happens to have.
+    #[cfg(test)]
+    pub(crate) fn at_root(runner: Arc<Runner>, port: u16, endpoint: Option<PathBuf>, routing: server::Routing, root: PathBuf) -> Result<Source> {
+        Self::build(runner, port, endpoint, routing, root)
+    }
+
+    fn build(runner: Arc<Runner>, port: u16, endpoint: Option<PathBuf>, routing: server::Routing, root: PathBuf) -> Result<Source> {
         let models = catalog::load()?;
         let cuda_components = cuda::components();
         let cuda_bytes = cuda_components.iter().map(|component| component.size).sum();
@@ -439,4 +470,23 @@ fn paused_pair(root: &Path, model: &Model) -> Option<(u64, u64)> {
 /// is unwrapped rather than turned into a panic the window would never see.
 fn lock<T>(cell: &Mutex<T>) -> MutexGuard<'_, T> {
     cell.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Busy, Work};
+
+    /// MG-13 review round 3: the claim, not the progress report, is what says a second press is too
+    /// early - a download has nothing to show until its first byte has arrived.
+    #[test]
+    fn a_claimed_window_stays_claimed_until_the_worker_gives_it_back() {
+        let mut work = Work::default();
+        assert!(work.claim(), "an idle window can be taken");
+        assert!(!work.claim(), "a second press is refused while the first worker has it");
+        work.release();
+        assert!(work.claim(), "and the next press gets it");
+        work.set_busy(Some(Busy::Checking { id: "lama".to_string() }));
+        work.release();
+        assert!(!work.claim(), "a worker that is already reporting is a window that is busy");
+    }
 }

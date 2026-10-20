@@ -97,12 +97,16 @@ impl Running {
 /// stays open.
 pub fn start(source: &Arc<Source>, task: Task) -> Result<Running> {
     let work = source.work();
-    if lock(&work).busy().is_some() {
+    // MG-13 review round 3: the slot is taken here, before the thread exists. `busy` only says
+    // something once a worker has bytes to report, so two presses in the same repaint used to start
+    // two workers over the same `.part` file.
+    if !lock(&work).claim() {
         return Err(Fail::conflict("Something else is happening in this window right now."));
     }
     if let Some(id) = task_id(&task)
         && source.model(id).is_none()
     {
+        lock(&work).release();
         return Err(Fail::not_found(format!("There is no model called {id} in this version of Craft AI Manager.")));
     }
     let cancel = Arc::new(AtomicBool::new(false));
@@ -114,7 +118,22 @@ pub fn start(source: &Arc<Source>, task: Task) -> Result<Running> {
     });
     match spawned {
         Ok(handle) => Ok(Running { handle: Some(handle), cancel }),
-        Err(_) => Err(Fail::internal("This computer would not start the work, so nothing was changed.")),
+        Err(_) => {
+            lock(&work).release();
+            Err(Fail::internal("This computer would not start the work, so nothing was changed."))
+        }
+    }
+}
+
+/// Give the window back when its worker is done, whatever the task ended as - including a panic,
+/// which would otherwise leave every button refusing to start anything (MG-13 review round 3).
+struct Finished(Arc<Mutex<Work>>);
+
+impl Drop for Finished {
+    fn drop(&mut self) {
+        let mut work = lock(&self.0);
+        work.set_busy(None);
+        work.release();
     }
 }
 
@@ -128,7 +147,7 @@ fn task_id(task: &Task) -> Option<&str> {
 
 /// The worker's whole life: say what is happening, do it, say what happened, and stop saying anything.
 fn fill(source: &Source, task: &Task, fetcher: &dyn Fetch, cancel: &AtomicBool) {
-    let work = source.work();
+    let _done = Finished(source.work());
     match task {
         Task::Install { id, accept_note } => download(source, id, *accept_note, fetcher, cancel),
         Task::Repair { id } => repair(source, id, fetcher, cancel),
@@ -138,7 +157,6 @@ fn fill(source: &Source, task: &Task, fetcher: &dyn Fetch, cancel: &AtomicBool) 
         Task::Remove { id } => remove(source, id),
         Task::Cuda { accept_note } => cuda_libraries(source, *accept_note, fetcher, cancel),
     }
-    lock(&work).set_busy(None);
 }
 
 /// A model download, whether it starts from nothing or carries on from a part.
@@ -163,8 +181,16 @@ fn download(source: &Source, id: &str, accept_note: bool, fetcher: &dyn Fetch, c
     if installed {
         // MG-13 review round 2: the point of installing from the window is that the feature works
         // afterwards, so the server has to be told that this model is now on disk.
-        source.refresh_routing();
+        route_installed(source, &model.task);
     }
+}
+
+/// Point the server at a model that is on disk: undo any retirement this run still remembers, then
+/// re-read the store (MG-13 review round 3). A `Remove` that gave up halfway retired the task, and
+/// without that step a model installed afterwards stayed unroutable until Craft AI Manager restarted.
+fn route_installed(source: &Source, task: &str) {
+    source.runner().restore_task(task);
+    source.refresh_routing();
 }
 
 /// Section 4.4's first row: delete the damaged file and its verification, then the normal install.
@@ -209,6 +235,10 @@ fn check(source: &Source, id: &str) {
             work.set_error(Some(fail.sentence));
         }
     }
+    // MG-13 review round 3: a failed check deletes `verified.json`, which is the proof the queue
+    // routes this task on, and a successful one writes it back. Either way the task list has to
+    // follow, or the window reads Needs repair while PhotoCraft is still being offered the model.
+    source.refresh_routing();
 }
 
 /// Brief rule 2: the window is the process that is serving, so it retires the task, waits out or
@@ -230,8 +260,7 @@ fn remove(source: &Source, id: &str) {
         // A job that will not stop is a reason not to delete, not a reason to delete under it.
         // MG-13 review round 2: it is also a reason to keep routing to the model, which is still
         // installed and still ready.
-        runner.restore_task(&model.task);
-        source.refresh_routing();
+        route_installed(source, &model.task);
         let mut work = lock(&work);
         work.set_error(Some("A job is still using that model, so nothing was deleted.".to_string()));
         return;
@@ -248,8 +277,7 @@ fn remove(source: &Source, id: &str) {
         Err(fail) => {
             // The delete failed - a locked folder, a missing permission - so the model is still
             // there and has to keep working (MG-13 review round 2).
-            runner.restore_task(&model.task);
-            source.refresh_routing();
+            route_installed(source, &model.task);
             lock(&work).set_error(Some(fail.sentence));
         }
     }
@@ -413,6 +441,11 @@ impl Read for Guarded {
 /// size, so the window cannot tell which archive it is inside. What it can tell is that the size
 /// changed, or that the counter started again from the front: either one means the previous archive
 /// is finished and its bytes belong to the running total.
+///
+/// MG-13 review round 3: an archive already on disk reports its size in one go, so a report that has
+/// reached its own size is banked immediately rather than remembered until the next archive starts.
+/// Without that, installing the libraries on a machine that already had one of them stopped short of
+/// the total the offer promised, and the row never read finished.
 struct Cumulative {
     total: u64,
     base: u64,
@@ -426,6 +459,12 @@ impl Cumulative {
             && (seen != last_seen || done < last_done)
         {
             self.base = self.base.saturating_add(last_seen);
+            self.last = None;
+        }
+        if done >= seen {
+            self.base = self.base.saturating_add(seen);
+            self.last = None;
+            return (self.base, self.total);
         }
         self.last = Some((done, seen));
         (self.base.saturating_add(done), self.total)
@@ -441,6 +480,11 @@ fn lock<T>(cell: &Arc<Mutex<T>>) -> MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::image::Frame;
+    use crate::protocol::TASK_FILL;
+    use crate::server::{ServeOptions, Server};
+    use crate::testkit::Scratch;
+    use std::path::PathBuf;
 
     /// A download's reader, with the channel the reader thread would fill held open by the test.
     fn waiting_reader(poll: Duration, stall: Duration) -> (Guarded, SyncSender<io::Result<Vec<u8>>>, Arc<AtomicBool>) {
@@ -513,5 +557,114 @@ mod tests {
         assert_eq!(overall.report(50, 50), (50, 100));
         assert_eq!(overall.report(0, 50), (50, 100), "the counter starting again from the front is a new archive");
         assert_eq!(overall.report(50, 50), (100, 100));
+    }
+
+    /// A server answering from a scratch store, and the window that shares the process with it.
+    /// MG-13 review round 3: the task list a press changes lives in the server, so a test that wants
+    /// to see what a press does to it needs both halves.
+    fn window(root: PathBuf, fake_backend: bool) -> (Server, Arc<Source>) {
+        let server = Server::start(ServeOptions {
+            fake_backend,
+            models_root: Some(root.clone()),
+            endpoint_file: Some(root.join("endpoint.json")),
+            step_delay: Duration::ZERO,
+            ..ServeOptions::default()
+        })
+        .expect("the server starts");
+        let source = Arc::new(Source::at_root(server.runner(), server.port(), None, server.routing(), root).expect("the window has a store"));
+        (server, source)
+    }
+
+    /// The smallest job the queue will take.
+    fn frame() -> Frame {
+        Frame { width: 2, height: 2, channels: 3, bit_depth: 8, samples: vec![10, 20, 30, 200, 100, 50, 40, 60, 80, 90, 20, 10] }
+    }
+
+    fn mask() -> Vec<u8> {
+        vec![255, 0, 0, 0]
+    }
+
+    /// MG-13 review round 3: two presses in one repaint used to start two workers over the same part
+    /// file, because the first worker has nothing to report until its first byte arrives.
+    #[test]
+    fn a_second_press_is_refused_before_the_first_worker_has_reported_anything() {
+        let scratch = Scratch::new("task-claim");
+        let (_server, source) = window(scratch.path.clone(), true);
+        let work = source.work();
+        assert!(lock(&work).claim(), "an idle window can be taken");
+        let fail = match start(&source, Task::Check { id: "lama".to_string() }) {
+            Ok(_) => panic!("the slot was already taken, so no second worker should have started"),
+            Err(fail) => fail,
+        };
+        assert_eq!(fail.status.code(), 409, "{fail}");
+        assert_eq!(fail.sentence, "Something else is happening in this window right now.");
+        lock(&work).release();
+        let fail = match start(&source, Task::Check { id: "no-such-model".to_string() }) {
+            Ok(_) => panic!("the catalog has no such model"),
+            Err(fail) => fail,
+        };
+        assert_eq!(fail.status.code(), 404, "{fail}");
+        assert!(lock(&work).claim(), "a press refused before its worker started gives the window back");
+        lock(&work).release();
+    }
+
+    /// MG-13 review round 3: a failed Check deletes the verification the queue routes on, so the task
+    /// list has to be worked out again - otherwise the row reads Needs repair while PhotoCraft is
+    /// still being offered the model.
+    #[test]
+    fn a_failed_check_takes_the_model_off_the_task_list_the_server_answers_with() {
+        let scratch = Scratch::new("task-check-routing");
+        let root = scratch.path.clone();
+        let (_server, source) = window(root.clone(), false);
+        let runner = source.runner();
+        let model = source.model("lama").expect("the catalog has a model for the fill task");
+        std::fs::create_dir_all(store::model_folder(&root, &model)).expect("the model folder");
+        let file = std::fs::File::create(store::model_file(&root, &model)).expect("the model file");
+        file.set_len(model.size).expect("a file the size the catalog promises");
+        store::write_verified(&root, &model, &model.sha256, model.size).expect("the verification record");
+        store::write_acknowledgement(&root, &model).expect("the note has been read");
+        source.refresh_routing();
+        assert!(runner.offered().is_ready(TASK_FILL), "a whole model the person has acknowledged is offered");
+        check(&source, "lama");
+        assert!(lock(&source.work()).is_damaged("lama"), "the row reads Needs repair");
+        assert!(!runner.offered().is_ready(TASK_FILL), "and the server says the same thing without a restart");
+    }
+
+    /// MG-13 review round 3: a Remove that gave up halfway retired the task, and a model installed
+    /// afterwards stayed unroutable until Craft AI Manager restarted.
+    #[test]
+    fn installing_a_model_clears_the_retirement_an_abandoned_remove_left_behind() {
+        let scratch = Scratch::new("task-restore-routing");
+        let (_server, source) = window(scratch.path.clone(), true);
+        let runner = source.runner();
+        runner.retire_task(TASK_FILL);
+        let fail = runner.submit(TASK_FILL, frame(), mask()).expect_err("the task is still retired");
+        assert_eq!(fail.status.code(), 400, "{fail}");
+        route_installed(&source, TASK_FILL);
+        let id = runner.submit(TASK_FILL, frame(), mask()).expect("the model the window installed routes again");
+        assert!(runner.state(&id).is_ok(), "and the job is in the queue: {id}");
+        runner.stop();
+    }
+
+    /// MG-13 review round 3: an archive that is already on disk reports its size in one go, and those
+    /// bytes belong to the total the offer showed. The four sizes are the archives NVIDIA pins today.
+    #[test]
+    fn an_archive_that_is_already_on_disk_still_counts_towards_the_total() {
+        let sizes = [2_737_397_u64, 422_415_931, 159_602_693, 1_330_803_635];
+        let total: u64 = sizes.iter().sum();
+        let mut overall = Cumulative { total, base: 0, last: None };
+        let mut done = 0u64;
+        for (index, size) in sizes.iter().enumerate() {
+            if index == 0 {
+                let report = overall.report(*size, *size);
+                assert_eq!(report, (*size, total), "an archive that did not have to be fetched still reports its bytes");
+                done = *size;
+                continue;
+            }
+            assert_eq!(overall.report(0, *size), (done, total), "the next archive starts again without losing what came before");
+            done += size;
+            assert_eq!(overall.report(*size, *size), (done, total), "and it counts when it finishes");
+        }
+        assert_eq!(done, total, "the four archives are the whole download the offer promised, so the row can read finished");
     }
 }

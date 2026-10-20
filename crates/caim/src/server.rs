@@ -120,11 +120,6 @@ impl Default for ServeOptions {
 struct Context {
     port: u16,
     token: String,
-    /// What this start can run: every task the catalog knows, each marked ready or not. Amendment
-    /// 18 lists the tasks even when nothing is installed, so this is a table rather than a flag.
-    /// MG-13 review round 2: the window installs and removes models while this server is answering,
-    /// so the table is read per request and replaced when that happens.
-    offered: Mutex<routing::Offered>,
     read_timeout: Duration,
     head_timeout: Duration,
     body_timeout: Duration,
@@ -143,9 +138,12 @@ struct Context {
 
 impl Context {
     /// The tasks this start offers, as of right now.
+    ///
+    /// MG-13 review round 3: this comes from the job manager rather than a table of its own, so the
+    /// list a request is checked against and the backend that job will run on are the same pair.
     #[must_use]
     fn offered(&self) -> routing::Offered {
-        self.offered.lock().unwrap_or_else(PoisonError::into_inner).clone()
+        self.runner.offered()
     }
 
     /// Work out again what this machine has installed, and point the queue at it.
@@ -159,8 +157,9 @@ impl Context {
         let offered = if self.fake_backend { routing::Offered::fake() } else { routing::Offered::from_store(self.models_root.as_deref()) };
         let backend =
             if self.fake_backend { Backend::Fake { step_delay: self.step_delay } } else { real_backend(&offered, self.models_root.as_deref(), self.device) };
-        *self.offered.lock().unwrap_or_else(PoisonError::into_inner) = offered;
-        self.runner.set_backend(backend);
+        // MG-13 review round 3: one step, so a request can never be accepted against a task list the
+        // queue has not caught up with.
+        self.runner.set_routing(offered, backend);
     }
 }
 
@@ -208,7 +207,9 @@ impl Server {
             real_backend(&offered, options.models_root.as_deref(), options.device)
         };
         let backend_note = backend.note();
-        let runner = Arc::new(Runner::with_memory_limit(backend, options.max_queue, options.memory_limit)?);
+        // MG-13 review round 3: the task list this start answers with and the backend its first job
+        // runs on are handed to the queue together, so the two can never disagree.
+        let runner = Arc::new(Runner::with_routing(job::Snapshot::new(offered, backend), options.max_queue, options.memory_limit)?);
         // MG-08 review round 2: the handle gets the runner before the endpoint file exists, so a
         // press that arrived while this start was still setting up cancels its jobs too.
         handle.attach(&runner);
@@ -247,7 +248,6 @@ impl Server {
             active: Mutex::new(Vec::new()),
             stop: Arc::clone(&stop_state.stop),
             runner: Arc::clone(&runner),
-            offered: Mutex::new(offered),
             fake_backend: options.fake_backend,
             step_delay: options.step_delay,
             models_root: options.models_root.clone(),
@@ -800,7 +800,7 @@ pub const ENDPOINT_VARIABLE: &str = ENDPOINT_ENV;
 #[cfg(test)]
 mod tests {
     use super::{Accept, Context, MAX_CONNECTIONS, READ_TIMEOUT, ServeOptions, Server, StopHandle, accept_loop, state_name};
-    use crate::job::{Backend, MAX_QUEUE, Runner, State};
+    use crate::job::{self, Backend, MAX_QUEUE, Runner, State};
     use crate::protocol::TASK_FILL;
     use crate::routing;
     use std::io::{ErrorKind, Read, Write};
@@ -838,12 +838,18 @@ mod tests {
             std::io::Error::other("Too many open files"),
         ];
         let flaky = Flaky { listener, failures: Mutex::new(failures) };
-        let runner = Arc::new(Runner::new(Backend::Fake { step_delay: Duration::ZERO }, MAX_QUEUE).expect("the worker starts"));
+        let runner = Arc::new(
+            Runner::with_routing(
+                job::Snapshot::new(routing::Offered::fake(), Backend::Fake { step_delay: Duration::ZERO }),
+                MAX_QUEUE,
+                job::DEFAULT_MEMORY_BYTES,
+            )
+            .expect("the worker starts"),
+        );
         let options = ServeOptions::default();
         let context = Arc::new(Context {
             port,
             token: "t".repeat(64),
-            offered: Mutex::new(routing::Offered::fake()),
             fake_backend: true,
             step_delay: options.step_delay,
             models_root: options.models_root.clone(),
