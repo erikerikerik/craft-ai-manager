@@ -247,6 +247,16 @@ impl Server {
         self.endpoint_path.as_deref()
     }
 
+    /// The queue this server answers with.
+    ///
+    /// The window is the only other thing in the process, and it needs the queue for two things the
+    /// HTTP layer cannot do for it: say what the worker is inside right now, and stop routing jobs
+    /// to a model it is about to delete (brief §5.2).
+    #[must_use]
+    pub fn runner(&self) -> Arc<Runner> {
+        Arc::clone(&self.runner)
+    }
+
     /// The flag that asks this server to stop, so the binary can watch stdin without owning the
     /// server itself.
     #[must_use]

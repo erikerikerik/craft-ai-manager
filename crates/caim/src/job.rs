@@ -183,6 +183,8 @@ struct Entry {
     provenance: Option<Provenance>,
     /// When the job finished, which starts the ten-minute clock.
     finished_at: Option<Instant>,
+    /// When the worker took the job, which is what lets the window say "Started 2 s ago".
+    started_at: Option<Instant>,
 }
 
 /// The jobs this manager knows about, in the order they arrived.
@@ -192,6 +194,22 @@ struct Shared {
     pending: usize,
     /// Where finished jobs are logged, or `None` when this run has nowhere to log.
     activity: Option<PathBuf>,
+    /// Tasks whose model this run has removed. The window is the process that removes a model it is
+    /// serving (brief §5.2), so the queue has to stop routing to it rather than trust the store.
+    retired: Vec<String>,
+}
+
+/// The job the worker is inside right now, in the shape the window draws it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Active {
+    /// The job id, so the window can name the job it is asking about.
+    pub id: String,
+    /// The task the job asked for, which picks the window's sentence.
+    pub task: String,
+    /// How long the worker has had the job.
+    pub started_secs: u64,
+    /// The backend's progress, as a whole percentage.
+    pub progress_percent: u64,
 }
 
 /// A queue slot is reserved before HTTP buffers a body; all failure paths release it.
@@ -256,6 +274,17 @@ fn find<'a>(jobs: &'a [Entry], id: &str) -> Option<&'a Entry> {
     jobs.iter().find(|entry| entry.id == id)
 }
 
+/// Whether this run has stopped routing jobs to this task's model, because the window removed it.
+fn is_retired(shared: &Arc<Mutex<Shared>>, task: &str) -> bool {
+    lock(shared).retired.iter().any(|retired| retired == task)
+}
+
+/// A job's progress, as the whole percentage the window shows at the end of a feature row.
+#[must_use]
+fn percent(progress: f64) -> u64 {
+    (progress.clamp(0.0, 1.0) * 100.0).round_ties_even() as u64
+}
+
 /// The queue, the worker, and everything the HTTP layer needs to answer the jobs endpoints.
 ///
 /// The MG-01 backend is the fake one; MG-04 swaps a real runner in behind the same interface.
@@ -277,7 +306,7 @@ impl Runner {
 
     pub(crate) fn with_memory_limit(backend: Backend, max_queue: usize, memory_limit: usize) -> Result<Runner> {
         let (queue_tx, queue_rx) = std::sync::mpsc::sync_channel::<String>(MAX_RECORDS);
-        let shared = Arc::new(Mutex::new(Shared { jobs: Vec::new(), next_id: 0, pending: 0, activity: None }));
+        let shared = Arc::new(Mutex::new(Shared { jobs: Vec::new(), next_id: 0, pending: 0, activity: None, retired: Vec::new() }));
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let worker_shared = Arc::clone(&shared);
         let worker_stop = Arc::clone(&stop);
@@ -293,6 +322,30 @@ impl Runner {
     /// run with no endpoint file has no log: nothing about a job changes either way.
     pub(crate) fn set_activity_log(&self, path: Option<PathBuf>) {
         lock(&self.shared).activity = path;
+    }
+
+    /// The job the worker is inside right now, if any. The window asks once per repaint, which is
+    /// how it can say "Working." and "Started 2 s ago" without keeping a copy of its own.
+    #[must_use]
+    pub fn active(&self) -> Option<Active> {
+        let shared = lock(&self.shared);
+        let entry = shared.jobs.iter().find(|entry| entry.state == State::Running)?;
+        let started = entry.started_at.unwrap_or_else(Instant::now);
+        Some(Active { id: entry.id.clone(), task: entry.task.clone(), started_secs: started.elapsed().as_secs(), progress_percent: percent(entry.progress) })
+    }
+
+    /// Stop routing jobs to a task whose model this run has just deleted (brief §5.2).
+    ///
+    /// The window is the process that is serving, so it cannot use the "a manager is listening, so
+    /// nothing was deleted" guard the CLI relies on. It retires the task first, waits out or cancels
+    /// the job that was inside it, and only then deletes the file. A job that arrives afterwards is
+    /// refused with the same sentence an uninstalled model gets; a job already queued for it fails
+    /// the same way rather than running from a session still held in memory.
+    pub fn retire_task(&self, task: &str) {
+        let mut shared = lock(&self.shared);
+        if !shared.retired.iter().any(|retired| retired == task) {
+            shared.retired.push(task.to_string());
+        }
     }
 
     pub(crate) fn admit(&self, body_bytes: usize) -> Result<Admission> {
@@ -329,6 +382,12 @@ impl Runner {
                 drop(shared);
                 return Err(Fail::internal(NO_WORKER));
             }
+            if shared.retired.iter().any(|retired| retired == task) {
+                // Brief §5.2: the window removed the model this run is serving, so a job arriving
+                // now gets the same 400 sentence an uninstalled model gets.
+                drop(shared);
+                return Err(Fail::bad_request(routing::not_ready_sentence(task)));
+            }
             shared.pending = shared.pending.saturating_sub(1);
             admission.pending = false;
             shared.next_id = shared.next_id.wrapping_add(1);
@@ -346,6 +405,7 @@ impl Runner {
                 memory: admission.work.take(),
                 provenance: None,
                 finished_at: None,
+                started_at: None,
             });
             id
         };
@@ -506,6 +566,7 @@ fn run_one(shared: &Arc<Mutex<Shared>>, id: &str, backend: &Backend) {
             Some(entry) if entry.state == State::Queued => {
                 entry.state = State::Running;
                 entry.message = routing::running_message(&entry.task).to_string();
+                entry.started_at = Some(Instant::now());
                 Some((entry.task.clone(), entry.input.take()))
             }
             _ => None,
@@ -533,20 +594,25 @@ fn run_one(shared: &Arc<Mutex<Shared>>, id: &str, backend: &Backend) {
     // The task picks the runner, and nothing else. A runner never decides which model to use, and
     // a task with no runner in this backend gets the same sentence the queue would have given it
     // before the job arrived.
-    let outcome = match (backend, task.as_str()) {
-        (Backend::NoModel, _) => Err(Fail::bad_request(routing::not_ready_sentence(&task))),
-        (Backend::Fake { step_delay }, TASK_MASK) => backend::run_mask(&image, &mask, &cancel, *step_delay, &mut progress),
-        (Backend::Fake { step_delay }, _) => backend::run_fill(&image, &mask, &cancel, *step_delay, &mut progress),
-        (Backend::Real { birefnet: Some(pipeline), device: setting, .. }, TASK_MASK) => {
-            let decision = decision_for(*setting, pipeline.manifest(), TASK_MASK, crate::birefnet::BIREFNET_ID, pipeline.session_card());
-            pipeline.run_mask_on(&image, &mask, &decision, &cancel, &mut progress)
+    let outcome = if is_retired(shared, &task) {
+        // Accepted before the window removed the model, so it never reaches a backend.
+        Err(Fail::bad_request(routing::not_ready_sentence(&task)))
+    } else {
+        match (backend, task.as_str()) {
+            (Backend::NoModel, _) => Err(Fail::bad_request(routing::not_ready_sentence(&task))),
+            (Backend::Fake { step_delay }, TASK_MASK) => backend::run_mask(&image, &mask, &cancel, *step_delay, &mut progress),
+            (Backend::Fake { step_delay }, _) => backend::run_fill(&image, &mask, &cancel, *step_delay, &mut progress),
+            (Backend::Real { birefnet: Some(pipeline), device: setting, .. }, TASK_MASK) => {
+                let decision = decision_for(*setting, pipeline.manifest(), TASK_MASK, crate::birefnet::BIREFNET_ID, pipeline.session_card());
+                pipeline.run_mask_on(&image, &mask, &decision, &cancel, &mut progress)
+            }
+            (Backend::Real { birefnet: None, .. }, TASK_MASK) => Err(Fail::bad_request(routing::not_ready_sentence(TASK_MASK))),
+            (Backend::Real { lama: Some(pipeline), device: setting, .. }, _) => {
+                let decision = decision_for(*setting, pipeline.manifest(), &task, lama::LAMA_ID, pipeline.session_card());
+                pipeline.run_fill_on(&image, &mask, &decision, &cancel, &mut progress)
+            }
+            (Backend::Real { lama: None, .. }, _) => Err(Fail::bad_request(routing::not_ready_sentence(&task))),
         }
-        (Backend::Real { birefnet: None, .. }, TASK_MASK) => Err(Fail::bad_request(routing::not_ready_sentence(TASK_MASK))),
-        (Backend::Real { lama: Some(pipeline), device: setting, .. }, _) => {
-            let decision = decision_for(*setting, pipeline.manifest(), &task, lama::LAMA_ID, pipeline.session_card());
-            pipeline.run_fill_on(&image, &mask, &decision, &cancel, &mut progress)
-        }
-        (Backend::Real { lama: None, .. }, _) => Err(Fail::bad_request(routing::not_ready_sentence(&task))),
     };
     drop(image);
     drop(mask);
@@ -717,6 +783,7 @@ mod tests {
                 memory: None,
                 provenance: None,
                 finished_at: Some(std::time::Instant::now()),
+                started_at: None,
             });
         }
         assert_eq!(runner.admit(0).err().expect("record cap").status.code(), 503);
@@ -1023,6 +1090,7 @@ mod tests {
                 diagnostics: Some("the card would not start".to_string()),
             }),
             finished_at: Some(std::time::Instant::now()),
+            started_at: None,
         };
         let record = super::activity_record(&entry);
         assert_eq!(record.task.as_deref(), Some(TASK_FILL));
@@ -1287,5 +1355,63 @@ mod tests {
         for _ in 0..MAX_QUEUE + 1 {
             assert_eq!(runner.submit(TASK_FILL, frame(), mask()).expect_err("still no worker").status.code(), 500, "never a 503 from leftovers");
         }
+    }
+
+    /// The window asks what the worker is inside, so it never keeps a copy of a job of its own.
+    #[test]
+    fn the_running_job_is_visible_with_its_task_and_how_long_it_has_been_running() {
+        let runner = Runner::new(Backend::Fake { step_delay: Duration::from_millis(40) }, MAX_QUEUE).expect("the worker starts");
+        assert!(runner.active().is_none(), "an idle manager has no running job");
+        let id = runner.submit(TASK_MASK, frame(), mask()).expect("the job is accepted");
+        assert_eq!(settle(&runner, &id), State::Running, "the job is inside the backend");
+        let active = runner.active().expect("the worker is inside a job");
+        assert_eq!(active.id, id);
+        assert_eq!(active.task, TASK_MASK, "the window picks its sentence from the task");
+        assert!(active.started_secs < 60, "the clock starts when the worker takes the job");
+        assert!(active.progress_percent <= 100, "a percentage is a percentage");
+        let deadline = std::time::Instant::now() + PATIENCE;
+        while runner.active().is_some() {
+            assert!(std::time::Instant::now() < deadline, "the job never finished");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(runner.active().is_none(), "a finished job is not a running job");
+        runner.stop();
+    }
+
+    /// Brief §5.2: the window removes a model this very process is serving.
+    #[test]
+    fn a_retired_task_is_refused_with_the_uninstalled_model_sentence() {
+        let runner = Runner::new(Backend::Fake { step_delay: Duration::ZERO }, MAX_QUEUE).expect("the worker starts");
+        runner.retire_task(TASK_MASK);
+        runner.retire_task(TASK_MASK);
+        let fail = runner.submit(TASK_MASK, frame(), mask()).expect_err("the model has been removed");
+        assert_eq!(fail.status.code(), 400, "{fail}");
+        assert_eq!(fail.sentence, "The Select Subject model isn't installed.", "the same sentence an uninstalled model gets");
+        assert!(lock(&runner.shared).jobs.is_empty(), "the refused job is never queued");
+        let other = runner.submit(TASK_FILL, frame(), mask()).expect("the other feature still works");
+        assert_eq!(settle(&runner, &other), State::Done, "retiring one feature leaves the other alone");
+        runner.stop();
+    }
+
+    #[test]
+    fn a_job_queued_before_the_removal_fails_with_that_sentence_instead_of_running() {
+        let runner = Runner::new(Backend::Fake { step_delay: Duration::from_millis(30) }, MAX_QUEUE).expect("the worker starts");
+        let first = runner.submit(TASK_FILL, frame(), mask()).expect("the first job holds the worker");
+        assert_eq!(settle(&runner, &first), State::Running, "the worker is busy with the first job");
+        let second = runner.submit(TASK_MASK, frame(), mask()).expect("the second job is queued");
+        runner.retire_task(TASK_MASK);
+        assert_eq!(finish(&runner, &first), State::Done, "the job already inside the backend finishes normally");
+        let deadline = std::time::Instant::now() + PATIENCE;
+        let (state, message) = loop {
+            let (state, _, message) = runner.state(&second).expect("the job exists");
+            if state.is_finished() {
+                break (state, message);
+            }
+            assert!(std::time::Instant::now() < deadline, "the queued job never reached a final state");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(state, State::Failed, "it never reaches a backend that is still holding the file");
+        assert_eq!(message, "The Select Subject model isn't installed.");
+        runner.stop();
     }
 }

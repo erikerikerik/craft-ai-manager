@@ -312,6 +312,55 @@ fn open_starts_a_manager_at_once_when_a_dead_run_left_the_launch_lock_behind() {
     let _ = std::fs::remove_dir_all(&folder);
 }
 
+#[test]
+fn open_keeps_serving_when_this_computer_has_no_window_to_open() {
+    // MG-13, brief rules 1 and 6: the window is the manager's front end, not the service. A computer
+    // whose own fonts cannot be read - here, a `WINDIR` with no font files in it, which is every
+    // computer that has no Segoe UI at all - gets one plain sentence and a manager that serves
+    // anyway, because PhotoCraft talks to the port and never to the window.
+    let folder = std::env::temp_dir().join(format!("caim-it-{}-open-no-window", std::process::id()));
+    let _ = std::fs::remove_dir_all(&folder);
+    std::fs::create_dir_all(&folder).expect("a folder for the endpoint file");
+    let endpoint = folder.join("endpoint.json");
+    let store = support::empty_store("open-no-window");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_caim"))
+        .arg("open")
+        .env(craft_ai_manager::endpoint::ENDPOINT_ENV, &endpoint)
+        .env(craft_ai_manager::store::MODELS_ENV, &store)
+        .env("WINDIR", folder.join("no-fonts-here"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("the binary runs");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let (port, token) = loop {
+        let text = std::fs::read_to_string(&endpoint).unwrap_or_default();
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+            let published = value.get("port").and_then(serde_json::Value::as_u64).and_then(|number| u16::try_from(number).ok());
+            let found = value.get("token").and_then(serde_json::Value::as_str).map(str::to_string);
+            if let (Some(published), Some(found)) = (published, found) {
+                break (published, found);
+            }
+        }
+        if child.try_wait().expect("the child is ours to watch").is_some() {
+            let (out, err) = read_output(&mut child);
+            panic!("a missing window stopped the manager instead of just the window. stdout: {out} stderr: {err}");
+        }
+        assert!(Instant::now() < deadline, "no manager started without a window: {}", std::fs::read_to_string(&endpoint).unwrap_or_default());
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let request = format!("GET /v1/health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n");
+    let health = support::talk(port, request.as_bytes());
+    // Stop the manager before asserting, so a failing assert cannot leave one running.
+    let _ = child.kill();
+    child.wait().expect("the manager stopped");
+    let (out, err) = read_output(&mut child);
+    assert_eq!(health.status, 200, "the manager is serving even though the window never opened");
+    assert!(err.contains("window"), "and it says in one sentence that the window is the thing that is missing: {err}");
+    assert!(out.contains("keeps serving"), "and says what happens instead: {out}");
+    let _ = std::fs::remove_dir_all(&folder);
+}
 /// One `caim open` pointed at one endpoint file, with its output kept rather than printed. Stdin is
 /// closed so the run never waits on the terminal of whoever is running the tests.
 fn open_run(endpoint: &std::path::Path, store: &std::path::Path) -> Child {
