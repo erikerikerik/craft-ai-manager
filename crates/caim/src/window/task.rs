@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 use crate::cuda;
 use crate::error::{Fail, Result};
 use crate::fetch::{self, Fetch, Stream};
+use crate::job::Runner;
 use crate::models;
 use crate::store;
 use crate::window::facts::{Busy, Source, Work};
@@ -252,11 +253,7 @@ fn remove(source: &Source, id: &str) {
     if let Some(active) = runner.active().filter(|active| active.task == model.task) {
         let _ = runner.cancel(&active.id);
     }
-    let deadline = Instant::now() + REMOVE_WAIT;
-    while runner.active().is_some_and(|active| active.task == model.task) && Instant::now() < deadline {
-        std::thread::sleep(REMOVE_POLL);
-    }
-    if runner.active().is_some_and(|active| active.task == model.task) {
+    if !wait_for_worker(&runner, &model.task, REMOVE_WAIT, REMOVE_POLL) {
         // A job that will not stop is a reason not to delete, not a reason to delete under it.
         // MG-13 review round 2: it is also a reason to keep routing to the model, which is still
         // installed and still ready.
@@ -281,6 +278,25 @@ fn remove(source: &Source, id: &str) {
             lock(&work).set_error(Some(fail.sentence));
         }
     }
+}
+
+/// Wait for the worker to report on any job for this task: `true` when it got there, `false` when
+/// the wait ran out.
+///
+/// MG-13 review round 3, finding 4321829672: this cannot be asked of [Runner::active]. A cancel
+/// marks the record Cancelled the moment it is asked for, so the task stops looking active while
+/// the backend may still be inside the model, and deleting then takes the file out from under a job
+/// that is still running. The queue's own record of whether the worker has reported is the only
+/// answer, so it is what the wait watches.
+fn wait_for_worker(runner: &Runner, task: &str, wait: Duration, poll: Duration) -> bool {
+    let deadline = Instant::now() + wait;
+    while runner.task_in_flight(task) {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(poll);
+    }
+    true
 }
 
 /// Section 4.3: the CUDA and cuDNN libraries, which are a download like any other except that they
@@ -563,11 +579,17 @@ mod tests {
     /// MG-13 review round 3: the task list a press changes lives in the server, so a test that wants
     /// to see what a press does to it needs both halves.
     fn window(root: PathBuf, fake_backend: bool) -> (Server, Arc<Source>) {
+        window_at(root, fake_backend, Duration::ZERO)
+    }
+
+    /// The same, with the fake backend's steps spaced by `step_delay`, so a test can hold a job
+    /// inside a model for as long as it needs to watch something wait for it.
+    fn window_at(root: PathBuf, fake_backend: bool, step_delay: Duration) -> (Server, Arc<Source>) {
         let server = Server::start(ServeOptions {
             fake_backend,
             models_root: Some(root.clone()),
             endpoint_file: Some(root.join("endpoint.json")),
-            step_delay: Duration::ZERO,
+            step_delay,
             ..ServeOptions::default()
         })
         .expect("the server starts");
@@ -666,5 +688,28 @@ mod tests {
             assert_eq!(overall.report(*size, *size), (done, total), "and it counts when it finishes");
         }
         assert_eq!(done, total, "the four archives are the whole download the offer promised, so the row can read finished");
+    }
+
+    /// MG-13 review round 3, finding 4321829672: asking a job to stop answers the person straight
+    /// away, so the model stops looking busy while the worker is still inside it. Remove has to wait
+    /// for the worker's own report before it deletes anything.
+    #[test]
+    fn a_remove_does_not_delete_a_model_whose_job_has_only_been_asked_to_stop() {
+        let scratch = Scratch::new("task-remove-wait");
+        let (_server, source) = window_at(scratch.path.clone(), true, Duration::from_secs(2));
+        let runner = source.runner();
+        let id = runner.submit(TASK_FILL, frame(), mask()).expect("a job is inside the model");
+        let until_running = Instant::now() + Duration::from_secs(5);
+        while runner.active().is_none() && Instant::now() < until_running {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(runner.active().is_some(), "the worker is inside the model by now");
+        runner.cancel(&id).expect("the person asks the job to stop");
+        assert!(runner.active().is_none(), "the client sees it stop straight away");
+        assert!(
+            !wait_for_worker(&runner, TASK_FILL, Duration::from_millis(300), REMOVE_POLL),
+            "the worker is still inside the model, so nothing may be deleted yet"
+        );
+        assert!(wait_for_worker(&runner, TASK_FILL, Duration::from_secs(5), REMOVE_POLL), "and once the worker has reported, Remove can go ahead");
     }
 }

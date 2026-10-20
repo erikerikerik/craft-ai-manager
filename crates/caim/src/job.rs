@@ -389,6 +389,20 @@ impl Runner {
         self.routing.lock().unwrap_or_else(PoisonError::into_inner).offered.clone()
     }
 
+    /// Whether a job for this task still holds the model, which is not the question
+    /// [Runner::active] answers.
+    ///
+    /// A cancel marks the record `Cancelled` the moment it is asked for, so the client sees a
+    /// stopped job - and the task stops looking active - while the worker may still be inside the
+    /// backend. The record is free only once that worker has reported, which is what `finished_at`
+    /// records. Anything about to delete the model has to ask this instead (MG-13 review round 3,
+    /// finding 4321829672).
+    #[must_use]
+    pub fn task_in_flight(&self, task: &str) -> bool {
+        let shared = lock(&self.shared);
+        shared.jobs.iter().any(|entry| entry.task == task && entry.finished_at.is_none())
+    }
+
     /// The job the worker is inside right now, if any. The window asks once per repaint, which is
     /// how it can say "Working." and "Started 2 s ago" without keeping a copy of its own.
     #[must_use]
@@ -1331,6 +1345,30 @@ mod tests {
         assert_eq!(finish(&runner, &id), State::Cancelled, "the run notices and stops");
         assert_eq!(runs.load(Ordering::SeqCst), 0, "the run never completed");
         assert_eq!(runner.provenance(&id).expect_err("a cancelled job has no result").status.code(), 409);
+        runner.stop();
+    }
+
+    /// MG-13 review round 3, finding 4321829672: the cancel answers the client at once, so the job
+    /// is no longer the active one while the worker is still inside the model. What has to be
+    /// waited for is the worker's own report.
+    #[test]
+    fn a_cancelled_job_holds_its_model_until_the_worker_reports() {
+        let (loads, runs) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let runner = lama_runner(Duration::from_millis(20), &loads, &runs);
+        let id = runner.submit(TASK_FILL, frame(), mask()).expect("the job is accepted");
+        assert_eq!(settle(&runner, &id), State::Running, "the worker is inside the model");
+        assert!(runner.task_in_flight(TASK_FILL), "and the model is in use");
+        runner.cancel(&id).expect("a running job can be cancelled");
+        assert_eq!(runner.state(&id).expect("the record").0, State::Cancelled, "the client sees it stop straight away");
+        assert!(runner.active().is_none(), "and it is no longer the active job");
+        assert!(runner.task_in_flight(TASK_FILL), "yet the worker has not reported, so the model is still in use");
+        let reported = std::time::Instant::now() + PATIENCE;
+        while runner.task_in_flight(TASK_FILL) && std::time::Instant::now() < reported {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!runner.task_in_flight(TASK_FILL), "once the worker reports, the model is free");
+        assert_eq!(runner.state(&id).expect("the record").0, State::Cancelled, "and the client's answer never changed");
+        assert_eq!(runs.load(Ordering::SeqCst), 0, "the run never completed");
         runner.stop();
     }
 
