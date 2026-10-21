@@ -38,4 +38,13 @@ sha2 = "0.11.1"
 thiserror = "2.0"
 toml = "1.1.8"
 ureq = "3.4.2"
+# MG-13: the Craft AI Manager window (agents/CAIM-UI-BRIEF.md), in the same process as
+# `caim open` - the library draws it, no CLI subprocess and no second server. `accesskit` is
+# the brief's screen-reader rule; `wgpu` matches PhotoCraft's renderer. `default_fonts` stays off
+# on purpose: it commits egui's own copy of DejaVu Sans and the Ubuntu Font licence into the
+# binary, which the deny gate does not allow, and the brief's font question is Erik's (section 6).
+# The window loads Segoe UI from the system at run time instead, so no font is bundled. `links`,
+# `wayland` and `x11` stay off: the window opens no links, and CAIM is Windows-first.
+eframe = { version = "0.36.2", default-features = false, features = ["accesskit", "wgpu"] }
+egui = "0.36.2"
 

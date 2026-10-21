@@ -269,29 +269,55 @@ pub fn is_ready(root: &Path) -> bool {
 /// each library is unpacked only after its own CRC and size check. Re-running it costs nothing - an
 /// archive that is already verified is not fetched again, and a library that is already on disk with
 /// the right size is not written again.
-pub fn install(root: &Path, accept_note: bool, fetcher: &dyn fetch::Fetch, progress: &mut dyn FnMut(u64, u64)) -> Result<String> {
+///
+/// `stop` is asked before every archive and again inside [extract], so the window's Cancel button
+/// reaches the unpacking of a cuDNN-sized archive and not only its download (MG-13 review round 7,
+/// finding 4331629578).
+pub fn install(root: &Path, accept_note: bool, fetcher: &dyn fetch::Fetch, progress: &mut dyn FnMut(u64, u64), stop: &dyn Fn() -> bool) -> Result<String> {
     if !supported_here() {
         return Err(Fail::internal(format!("{} There is nothing to install.", unpinned_sentence())));
     }
+    let parts = components();
+    let dir = library_dir(root);
+    let (downloaded, libraries) = install_components(root, &parts, accept_note, fetcher, progress, stop)?;
+    let bytes: u64 = parts.iter().map(|model| model.size).sum();
+    Ok(format!("CUDA libraries are ready in {}: {libraries} files from {} archives ({bytes} bytes), {downloaded} downloaded now.", dir.display(), parts.len()))
+}
+
+/// Fetch the archives in `components` and unpack the libraries they carry, into [library_dir].
+///
+/// MG-13 review round 3: an archive that is already verified is not fetched again, but its bytes
+/// still have to be reported - the window adds the reports up into the one total the offer showed,
+/// and on a machine that already had one of the archives the bar used to stop short of it and the
+/// row never read finished. Returns how many archives were fetched and how many libraries landed.
+fn install_components(
+    root: &Path,
+    components: &[Model],
+    accept_note: bool,
+    fetcher: &dyn fetch::Fetch,
+    progress: &mut dyn FnMut(u64, u64),
+    stop: &dyn Fn() -> bool,
+) -> Result<(usize, usize)> {
     let dir = library_dir(root);
     std::fs::create_dir_all(&dir).map_err(|error| Fail::internal(format!("Craft AI Manager could not create {}: {error}", dir.display())))?;
     let mut downloaded = 0usize;
     let mut libraries = 0usize;
-    for model in components() {
+    for model in components {
+        // Asked before the acknowledgement is written and before the next archive is fetched, so a
+        // stopped install leaves nothing new behind.
+        if stop() {
+            return Err(stopped(&model.label()));
+        }
         if accept_note && model.note.is_some() {
-            store::write_acknowledgement(root, &model)?;
+            store::write_acknowledgement(root, model)?;
         }
-        if let fetch::Outcome::Downloaded { .. } = fetch::install(&model, root, fetcher, progress)? {
-            downloaded += 1;
+        match fetch::install(model, root, fetcher, progress)? {
+            fetch::Outcome::Downloaded { .. } => downloaded += 1,
+            fetch::Outcome::AlreadyInstalled => progress(model.size, model.size),
         }
-        libraries += extract(&store::model_file(root, &model), &dir, &wanted(&model))?.len();
+        libraries += extract(&store::model_file(root, model), &dir, &wanted(model), stop)?.len();
     }
-    let bytes: u64 = components().iter().map(|model| model.size).sum();
-    Ok(format!(
-        "CUDA libraries are ready in {}: {libraries} files from {} archives ({bytes} bytes), {downloaded} downloaded now.",
-        dir.display(),
-        components().len()
-    ))
+    Ok((downloaded, libraries))
 }
 
 /// `caim cuda install [--accept-note]` with the real folder and the real HTTPS fetcher, which is
@@ -300,7 +326,8 @@ pub fn install_all(accept_note: bool, progress: &mut dyn FnMut(u64, u64)) -> Res
     let Some(root) = store_root() else {
         return Err(Fail::internal("Craft AI Manager cannot find a folder for the CUDA libraries on this machine."));
     };
-    install(&root, accept_note, &fetch::HttpFetch::new(), progress)
+    // The command line has no Cancel button: it runs to the end or is closed with the terminal.
+    install(&root, accept_note, &fetch::HttpFetch::new(), progress, &|| false)
 }
 
 /// `caim cuda status`: one line per archive, one per card the probe found, and whether a CUDA job
@@ -793,6 +820,13 @@ const CENTRAL_HEADER: usize = 46;
 const LOCAL_HEADER: usize = 30;
 /// What every 32-bit zip field holds when the real number lives in a Zip64 record.
 const ZIP64_MARKER: u32 = 0xFFFF_FFFF;
+/// How much of a member is copied at a time. [std::io::copy] would run a 700 MB member to the end
+/// without looking up, which is where a Cancel used to go unnoticed (MG-13 review round 7, finding
+/// 4331629578).
+const COPY_CHUNK: usize = 64 * 1024;
+/// The words the window reads as "the person stopped this" rather than as a broken download. It is
+/// the sentence the network reader already gives, so a Cancel means the same thing wherever it lands.
+const CANCELLED: &str = "the download was cancelled";
 
 /// One member of an archive, as its central directory entry describes it.
 #[derive(Clone, Debug)]
@@ -811,16 +845,23 @@ struct Member {
 /// CRC is, which is exactly the check amendment 15 wants before a library is loaded. Nothing is
 /// written to its final name until the CRC and the length agree, and a member that is already on
 /// disk with the right length is left alone, so re-running an install costs a read and no writes.
-pub fn extract(archive: &Path, into: &Path, wanted: &[(String, String)]) -> Result<Vec<PathBuf>> {
+///
+/// `stop` is asked before every member and, through [unpack], before every chunk of one, so Cancel
+/// stops a big archive part way through rather than only while its bytes are arriving (MG-13 review
+/// round 7, finding 4331629578).
+pub fn extract(archive: &Path, into: &Path, wanted: &[(String, String)], stop: &dyn Fn() -> bool) -> Result<Vec<PathBuf>> {
     if wanted.is_empty() {
         return Ok(Vec::new());
     }
     let mut file = File::open(archive).map_err(|error| Fail::internal(format!("Craft AI Manager could not open {}: {error}", archive.display())))?;
     let total =
         file.metadata().map(|meta| meta.len()).map_err(|error| Fail::internal(format!("Craft AI Manager could not measure {}: {error}", archive.display())))?;
-    let table = central_directory(archive, &mut file, total)?;
+    let table = central_directory(archive, &mut file, total, stop)?;
     let mut done = Vec::with_capacity(wanted.len());
     for (inside, name) in wanted {
+        if stop() {
+            return Err(stopped(&archive.display().to_string()));
+        }
         let member = table
             .get(inside.as_str())
             .ok_or_else(|| Fail::internal(format!("{} does not contain {inside}, which Craft AI Manager needs for {name}.", archive.display())))?;
@@ -829,14 +870,21 @@ pub fn extract(archive: &Path, into: &Path, wanted: &[(String, String)]) -> Resu
             done.push(target);
             continue;
         }
-        unpack(archive, &mut file, member, &target)?;
+        unpack(archive, &mut file, member, &target, stop)?;
         done.push(target);
     }
     Ok(done)
 }
 
+/// The answer a stopped install gives. [crate::window::task] reads this sentence as a pause, so a
+/// Cancel during unpacking leaves the row Paused with its part files, exactly as a Cancel during the
+/// download does (MG-13 review round 7, finding 4331629578).
+fn stopped(what: &str) -> Fail {
+    Fail::internal(format!("{what}: {CANCELLED}"))
+}
+
 /// Every member the central directory lists, by the name it uses inside the archive.
-fn central_directory(archive: &Path, file: &mut File, total: u64) -> Result<BTreeMap<String, Member>> {
+fn central_directory(archive: &Path, file: &mut File, total: u64, stop: &dyn Fn() -> bool) -> Result<BTreeMap<String, Member>> {
     let window = (EOCD_SIZE + EOCD_COMMENT_MAX).min(total);
     file.seek(SeekFrom::Start(total - window)).map_err(|error| Fail::internal(format!("Craft AI Manager could not read {}: {error}", archive.display())))?;
     let mut tail = vec![0u8; window as usize];
@@ -855,6 +903,9 @@ fn central_directory(archive: &Path, file: &mut File, total: u64) -> Result<BTre
     let mut table = BTreeMap::new();
     let mut header = [0u8; CENTRAL_HEADER];
     for _ in 0..u64::from(entries) {
+        if stop() {
+            return Err(stopped(&archive.display().to_string()));
+        }
         file.read_exact(&mut header)
             .map_err(|error| Fail::internal(format!("{} lists {} members but could not be read that far: {error}", archive.display(), entries)))?;
         if header.get(..4) != Some(&CENTRAL_SIGNATURE) {
@@ -904,7 +955,11 @@ fn local_data_at(archive: &Path, file: &mut File, header_at: u64) -> Result<u64>
 }
 
 /// Copy one member out, checking its CRC and its length before it gets its real name.
-fn unpack(archive: &Path, file: &mut File, member: &Member, target: &Path) -> Result<()> {
+///
+/// The copy goes a chunk at a time and asks [stop] before every chunk, which is what lets Cancel
+/// land inside a cuDNN-sized member rather than only inside the network read (MG-13 review round 7,
+/// finding 4331629578). A member that was stopped never gets its real name, and its `.part` goes.
+fn unpack(archive: &Path, file: &mut File, member: &Member, target: &Path, stop: &dyn Fn() -> bool) -> Result<()> {
     if member.method != STORED && member.method != DEFLATED {
         return Err(Fail::internal(format!(
             "{} holds {} compressed with method {}, which Craft AI Manager cannot read.",
@@ -921,10 +976,17 @@ fn unpack(archive: &Path, file: &mut File, member: &Member, target: &Path) -> Re
     let mut writer = flate2::CrcWriter::new(std::io::BufWriter::new(handle));
     let copied = if member.method == DEFLATED {
         let mut decoder = flate2::read::DeflateDecoder::new(source);
-        std::io::copy(&mut decoder, &mut writer)
+        copy_in_chunks(&mut decoder, &mut writer, stop)
     } else {
-        std::io::copy(&mut source, &mut writer)
+        copy_in_chunks(&mut source, &mut writer, stop)
     };
+    if stop() {
+        // The person stopped this, so it is not a damaged archive: the half-written library is thrown
+        // away and the answer is the sentence the window reads as a pause.
+        drop(writer);
+        let _ = std::fs::remove_file(&part);
+        return Err(stopped(&archive.display().to_string()));
+    }
     let crc = writer.crc().sum();
     if let Err(error) = writer.flush() {
         let _ = std::fs::remove_file(&part);
@@ -946,6 +1008,28 @@ fn unpack(archive: &Path, file: &mut File, member: &Member, target: &Path) -> Re
             Fail::internal(format!("Craft AI Manager could not move {} into place: {error}", target.display()))
         }),
     }
+}
+
+/// Copy a reader into a writer [COPY_CHUNK] bytes at a time, asking `stop` before every chunk.
+///
+/// [std::io::copy] would take a member to its end without looking up, so the window's Cancel flag was
+/// only ever read by the network reader and an archive still being unpacked ran on regardless
+/// (MG-13 review round 7, finding 4331629578).
+fn copy_in_chunks<R: Read, W: Write>(source: &mut R, sink: &mut W, stop: &dyn Fn() -> bool) -> std::io::Result<u64> {
+    let mut buffer = vec![0u8; COPY_CHUNK];
+    let mut copied = 0u64;
+    loop {
+        if stop() {
+            return Err(std::io::Error::other(CANCELLED));
+        }
+        let read = source.read(buffer.as_mut_slice())?;
+        if read == 0 {
+            break;
+        }
+        sink.write_all(&buffer[..read])?;
+        copied += u64::try_from(read).unwrap_or(u64::MAX);
+    }
+    Ok(copied)
 }
 
 /// A name for the half-written file, so an interrupted install never leaves a library that looks
@@ -970,7 +1054,7 @@ fn u32_at(bytes: &[u8], at: usize) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testkit::Scratch;
+    use crate::testkit::{FakeFetch, Scratch, test_model};
 
     /// A zip archive built the way an archiver builds one: local headers, then the central
     /// directory, then the record that points at it. `method` is [STORED] or [DEFLATED].
@@ -1024,6 +1108,29 @@ mod tests {
         out.extend_from_slice(&directory_at.to_le_bytes());
         out.extend_from_slice(&0u16.to_le_bytes());
         out
+    }
+
+    /// MG-13 review round 3: an archive that is already verified is not fetched again, but its bytes
+    /// still have to be reported. The window adds the reports up into the one total the offer showed,
+    /// so on a machine that already had one of the four archives the bar used to stop short of it.
+    #[test]
+    fn an_archive_that_is_already_installed_still_reports_its_bytes() {
+        let scratch = Scratch::new("cuda-already-installed");
+        let root = scratch.path.join("cuda");
+        let zip = archive(&[("cuda_cudart/bin/x64/cudart64_13.dll", STORED, b"the bytes a library would be made of".as_slice())]);
+        let mut model = test_model(&zip, None);
+        model.id = "cuda_cudart".to_string();
+        model.file = "cuda_cudart.zip".to_string();
+        let parts = [model.clone()];
+        let mut reports: Vec<(u64, u64)> = Vec::new();
+        let first = install_components(&root, &parts, true, &FakeFetch::new(&zip), &mut |done, seen| reports.push((done, seen)), &|| false)
+            .expect("the archive arrives");
+        assert_eq!(first, (1, 1), "one archive fetched, one library unpacked");
+        let before = reports.len();
+        let second = install_components(&root, &parts, true, &FakeFetch::new(&[]), &mut |done, seen| reports.push((done, seen)), &|| false)
+            .expect("the second run makes no request at all");
+        assert_eq!(second, (0, 1), "the archive is already verified, so nothing is fetched");
+        assert_eq!(&reports[before..], &[(model.size, model.size)], "the archive already on disk still counts towards the total");
     }
 
     /// An archive in a scratch folder, plus the folder its members are unpacked into.
@@ -1117,7 +1224,7 @@ mod tests {
                 ("cuda_cudart/bin/x64/three.dll", STORED, b"never asked for"),
             ]),
         );
-        let got = extract(&path, &into, &asked_for(&[("cuda_cudart/bin/x64/one.dll", "one.dll"), ("cuda_cudart/bin/x64/two.dll", "two.dll")]))
+        let got = extract(&path, &into, &asked_for(&[("cuda_cudart/bin/x64/one.dll", "one.dll"), ("cuda_cudart/bin/x64/two.dll", "two.dll")]), &|| false)
             .expect("a well-formed archive unpacks");
         assert_eq!(got.len(), 2);
         assert_eq!(std::fs::read(into.join("one.dll")).expect("the first library is on disk"), b"first library");
@@ -1131,7 +1238,7 @@ mod tests {
     fn extract_undoes_deflate_which_is_what_nvidia_uses() {
         let payload = vec![b'z'; 90_000];
         let (scratch, path, into) = fixture("zip-deflate", &archive(&[("libcublas/bin/x64/big.dll", DEFLATED, &payload)]));
-        extract(&path, &into, &asked_for(&[("libcublas/bin/x64/big.dll", "big.dll")])).expect("a deflated member unpacks");
+        extract(&path, &into, &asked_for(&[("libcublas/bin/x64/big.dll", "big.dll")]), &|| false).expect("a deflated member unpacks");
         assert_eq!(std::fs::read(into.join("big.dll")).expect("the library is on disk"), payload);
         drop(scratch);
     }
@@ -1142,7 +1249,8 @@ mod tests {
         let at = bytes.windows(10).position(|window| window == b"0123456789").expect("the fixture holds its payload once");
         bytes[at] ^= 0b_0000_0001;
         let (scratch, path, into) = fixture("zip-crc", &bytes);
-        let fail = extract(&path, &into, &asked_for(&[("libcufft/bin/x64/bad.dll", "bad.dll")])).expect_err("a member that does not match its CRC is refused");
+        let fail = extract(&path, &into, &asked_for(&[("libcufft/bin/x64/bad.dll", "bad.dll")]), &|| false)
+            .expect_err("a member that does not match its CRC is refused");
         assert!(fail.sentence.contains("bad.dll"), "the sentence names the file: {}", fail.sentence);
         assert!(fail.sentence.contains("CRC"), "and says why: {}", fail.sentence);
         assert!(!into.join("bad.dll").exists(), "nothing reaches its final name");
@@ -1158,7 +1266,8 @@ mod tests {
         let at = u32_at(&bytes, record + 16).expect("the fixture names its directory");
         bytes[at as usize + 24..at as usize + 28].copy_from_slice(&13u32.to_le_bytes());
         std::fs::write(&path, bytes).expect("the fixture can be rewritten");
-        let fail = extract(&path, &into, &asked_for(&[("libcudnn/bin/x64/short.dll", "short.dll")])).expect_err("a member of the wrong length is refused");
+        let fail =
+            extract(&path, &into, &asked_for(&[("libcudnn/bin/x64/short.dll", "short.dll")]), &|| false).expect_err("a member of the wrong length is refused");
         assert!(fail.sentence.contains("bytes"), "the sentence says what was short: {}", fail.sentence);
         assert!(!into.join("short.dll").exists());
         drop(scratch);
@@ -1167,9 +1276,9 @@ mod tests {
     #[test]
     fn extract_leaves_a_library_that_is_already_right_alone() {
         let (scratch, path, into) = fixture("zip-again", &archive(&[("cuda_cudart/bin/x64/same.dll", STORED, b"0123456789")]));
-        extract(&path, &into, &asked_for(&[("cuda_cudart/bin/x64/same.dll", "same.dll")])).expect("the first pass writes it");
+        extract(&path, &into, &asked_for(&[("cuda_cudart/bin/x64/same.dll", "same.dll")]), &|| false).expect("the first pass writes it");
         std::fs::write(into.join("same.dll"), b"abcdefghij").expect("the test replaces the bytes, same length");
-        extract(&path, &into, &asked_for(&[("cuda_cudart/bin/x64/same.dll", "same.dll")])).expect("the second pass is allowed");
+        extract(&path, &into, &asked_for(&[("cuda_cudart/bin/x64/same.dll", "same.dll")]), &|| false).expect("the second pass is allowed");
         assert_eq!(std::fs::read(into.join("same.dll")).expect("the library is on disk"), b"abcdefghij", "a library of the right length is not rewritten");
         drop(scratch);
     }
@@ -1177,7 +1286,7 @@ mod tests {
     #[test]
     fn extract_names_a_member_the_archive_does_not_hold() {
         let (scratch, path, into) = fixture("zip-missing", &archive(&[("cuda_cudart/bin/x64/here.dll", STORED, b"here")]));
-        let fail = extract(&path, &into, &asked_for(&[("cuda_cudart/bin/x64/gone.dll", "gone.dll")])).expect_err("a missing member is an error");
+        let fail = extract(&path, &into, &asked_for(&[("cuda_cudart/bin/x64/gone.dll", "gone.dll")]), &|| false).expect_err("a missing member is an error");
         assert!(fail.sentence.contains("gone.dll"), "the sentence names what is missing: {}", fail.sentence);
         drop(scratch);
     }
@@ -1185,7 +1294,7 @@ mod tests {
     #[test]
     fn extract_refuses_a_file_that_is_not_an_archive() {
         let (scratch, path, into) = fixture("zip-junk", b"this is a text file, not a zip archive, and it has no records at all");
-        let fail = extract(&path, &into, &asked_for(&[("anything/bin/x64/x.dll", "x.dll")])).expect_err("junk is refused");
+        let fail = extract(&path, &into, &asked_for(&[("anything/bin/x64/x.dll", "x.dll")]), &|| false).expect_err("junk is refused");
         assert!(fail.sentence.contains("end-of-central-directory"), "and says so: {}", fail.sentence);
         drop(scratch);
     }
@@ -1193,7 +1302,33 @@ mod tests {
     #[test]
     fn extract_of_nothing_asks_for_nothing() {
         let (scratch, path, into) = fixture("zip-empty", &archive(&[("cuda_cudart/bin/x64/one.dll", STORED, b"one")]));
-        assert!(extract(&path, &into, &[]).expect("an empty list is fine").is_empty());
+        assert!(extract(&path, &into, &[], &|| false).expect("an empty list is fine").is_empty());
+        drop(scratch);
+    }
+
+    /// MG-13 review round 7, finding 4331629578: Cancel used to be invisible once the bytes had
+    /// arrived, because only the download's reader looked at the flag. The flag has to be asked while
+    /// a member is being unpacked too, and a member that was stopped must not reach its real name.
+    #[test]
+    fn a_cancel_part_way_through_an_archive_stops_before_the_library_is_put_in_place() {
+        let payload = vec![b'q'; COPY_CHUNK * 3];
+        let (scratch, path, into) = fixture("zip-cancel", &archive(&[("libcudnn/bin/x64/cudnn.dll", DEFLATED, &payload)]));
+        let part = part_path(&into.join("cudnn.dll"));
+        // The half-written file is the flag: once the first chunk has landed the person has pressed
+        // Cancel, so the next chunk is where the unpacking has to stop.
+        let written = std::cell::Cell::new(0u64);
+        let stop = || {
+            let seen = part.metadata().map(|meta| meta.len()).unwrap_or(0);
+            written.set(seen);
+            seen >= COPY_CHUNK as u64
+        };
+        let fail = extract(&path, &into, &asked_for(&[("libcudnn/bin/x64/cudnn.dll", "cudnn.dll")]), &stop)
+            .expect_err("a cancel part way through a member ends the install");
+        assert!(fail.sentence.contains(CANCELLED), "the window reads a pause, not a failure: {}", fail.sentence);
+        assert!(written.get() >= COPY_CHUNK as u64, "it did get into the member, not just up to it: {} bytes", written.get());
+        assert!(written.get() < payload.len() as u64, "and it stopped inside the member: {} of {} bytes", written.get(), payload.len());
+        assert!(!into.join("cudnn.dll").exists(), "nothing is renamed into place");
+        assert!(!part.exists(), "and the half-written file does not stay behind");
         drop(scratch);
     }
 

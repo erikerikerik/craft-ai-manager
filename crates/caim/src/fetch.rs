@@ -50,19 +50,19 @@ pub struct Stream {
     /// The whole file, or the part that was asked for.
     pub answer: Answer,
     /// The body.
-    pub reader: Box<dyn Read>,
+    pub reader: Box<dyn Read + Send>,
 }
 
 impl Stream {
     /// A stream holding the whole file.
     #[must_use]
-    pub fn full(claimed_len: Option<u64>, reader: Box<dyn Read>) -> Self {
+    pub fn full(claimed_len: Option<u64>, reader: Box<dyn Read + Send>) -> Self {
         Self { claimed_len, answer: Answer::Full, reader }
     }
 
     /// A stream holding the bytes from an offset on.
     #[must_use]
-    pub fn partial(claimed_len: Option<u64>, reader: Box<dyn Read>) -> Self {
+    pub fn partial(claimed_len: Option<u64>, reader: Box<dyn Read + Send>) -> Self {
         Self { claimed_len, answer: Answer::Partial, reader }
     }
 }

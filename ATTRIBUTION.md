@@ -32,7 +32,7 @@ each carries a signed `[model.override]` from Erik and needs one `--accept-note`
 
 | Model | Code | Weights | Training data | Override |
 |---|---|---|---|---|
-| `lama` - `lama_fp32.onnx`, 208,044,816 bytes | Apache-2.0 | Apache-2.0 | Places365: non-commercial research | D2 (Oct 13, 2026), personal use only |
+| `lama` - `lama_fp32.onnx`, 208,044,816 bytes | Apache-2.0 | Apache-2.0 | Places365: non-commercial research and education | D2 (Oct 13, 2026; wording approved Oct 20, 2026), not for paid or client jobs |
 | `birefnet-lite` - `birefnet_lite.onnx`, 224,005,088 bytes | MIT | MIT | DIS5K: research-only, commercial use prohibited; DUTS, HRSOD, UHRSD, HRS10K: no published licence | D11/D12 (Oct 17, 2026), non-commercial use only |
 
 - **LaMa**: [advimman/lama](https://github.com/advimman/lama) (Apache-2.0), run from the ONNX port

@@ -58,6 +58,8 @@ pub mod store;
 pub(crate) mod testkit;
 /// The per-start token, and the constant-time check every request goes through.
 pub mod token;
+/// The Craft AI Manager window (MG-13): the state model, the facts behind it, and the eframe drawing.
+pub mod window;
 
 /// The package version, which `caim --version` prints and `/v1/health` reports as `caim/<version>`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

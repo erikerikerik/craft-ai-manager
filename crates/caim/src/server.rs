@@ -120,9 +120,6 @@ impl Default for ServeOptions {
 struct Context {
     port: u16,
     token: String,
-    /// What this start can run: every task the catalog knows, each marked ready or not. Amendment
-    /// 18 lists the tasks even when nothing is installed, so this is a table rather than a flag.
-    offered: routing::Offered,
     read_timeout: Duration,
     head_timeout: Duration,
     body_timeout: Duration,
@@ -131,6 +128,39 @@ struct Context {
     active: Mutex<Vec<Weak<TcpStream>>>,
     stop: Arc<AtomicBool>,
     runner: Arc<Runner>,
+    /// What this start was asked for, kept so the routing can be worked out again later rather than
+    /// only at the moment the socket was bound (MG-13 review round 2).
+    fake_backend: bool,
+    step_delay: Duration,
+    models_root: Option<PathBuf>,
+    device: device::Setting,
+}
+
+impl Context {
+    /// The tasks this start offers, as of right now.
+    ///
+    /// MG-13 review round 3: this comes from the job manager rather than a table of its own, so the
+    /// list a request is checked against and the backend that job will run on are the same pair.
+    #[must_use]
+    fn offered(&self) -> routing::Offered {
+        self.runner.offered()
+    }
+
+    /// Work out again what this machine has installed, and point the queue at it.
+    ///
+    /// MG-13 review round 2: the window is the thing that installs, acknowledges and removes models,
+    /// and it does that while this server is already answering. Without this, a model installed from
+    /// the window would read Ready in the window and stay `ready: false` for PhotoCraft until Craft
+    /// AI Manager restarted. A job already running keeps the backend it took, because the worker
+    /// holds its own copy of it.
+    fn refresh_routing(&self) {
+        let offered = if self.fake_backend { routing::Offered::fake() } else { routing::Offered::from_store(self.models_root.as_deref()) };
+        let backend =
+            if self.fake_backend { Backend::Fake { step_delay: self.step_delay } } else { real_backend(&offered, self.models_root.as_deref(), self.device) };
+        // MG-13 review round 3: one step, so a request can never be accepted against a task list the
+        // queue has not caught up with.
+        self.runner.set_routing(offered, backend);
+    }
 }
 
 /// A running server. Dropping it, or calling `Server::shutdown`, stops the threads and removes the
@@ -148,6 +178,9 @@ pub struct Server {
     /// asked it to stop, and whether a second ask cut a shutdown short. Shared with every
     /// `StopHandle` for this start, including one the binary made before the server existed.
     stop_state: Arc<StopState>,
+    /// The same view the connections answer from, so the window sharing this process can say that
+    /// what is installed has changed (MG-13 review round 2).
+    context: Arc<Context>,
 }
 
 impl Server {
@@ -174,7 +207,9 @@ impl Server {
             real_backend(&offered, options.models_root.as_deref(), options.device)
         };
         let backend_note = backend.note();
-        let runner = Arc::new(Runner::with_memory_limit(backend, options.max_queue, options.memory_limit)?);
+        // MG-13 review round 3: the task list this start answers with and the backend its first job
+        // runs on are handed to the queue together, so the two can never disagree.
+        let runner = Arc::new(Runner::with_routing(job::Snapshot::new(offered, backend), options.max_queue, options.memory_limit)?);
         // MG-08 review round 2: the handle gets the runner before the endpoint file exists, so a
         // press that arrived while this start was still setting up cancels its jobs too.
         handle.attach(&runner);
@@ -205,7 +240,6 @@ impl Server {
         let context = Arc::new(Context {
             port,
             token: token.clone(),
-            offered,
             read_timeout: options.read_timeout,
             head_timeout: options.head_timeout,
             body_timeout: options.body_timeout,
@@ -214,13 +248,18 @@ impl Server {
             active: Mutex::new(Vec::new()),
             stop: Arc::clone(&stop_state.stop),
             runner: Arc::clone(&runner),
+            fake_backend: options.fake_backend,
+            step_delay: options.step_delay,
+            models_root: options.models_root.clone(),
+            device: options.device,
         });
         let accept_stop = Arc::clone(&stop_state.stop);
+        let accept_context = Arc::clone(&context);
         let accept = std::thread::Builder::new()
             .name("caim-accept".to_string())
-            .spawn(move || accept_loop(listener, context, accept_stop, options.max_connections))
+            .spawn(move || accept_loop(listener, accept_context, accept_stop, options.max_connections))
             .map_err(|error| Fail::internal(format!("Craft AI Manager could not start its listener thread: {error}")))?;
-        Ok(Server { port, token, endpoint_path, backend_note, accept: Some(accept), runner, stop_state })
+        Ok(Server { port, token, endpoint_path, backend_note, accept: Some(accept), runner, stop_state, context })
     }
 
     /// The port the operating system gave us.
@@ -245,6 +284,31 @@ impl Server {
     #[must_use]
     pub fn endpoint_path(&self) -> Option<&std::path::Path> {
         self.endpoint_path.as_deref()
+    }
+
+    /// The queue this server answers with.
+    ///
+    /// The window is the only other thing in the process, and it needs the queue for two things the
+    /// HTTP layer cannot do for it: say what the worker is inside right now, and stop routing jobs
+    /// to a model it is about to delete (brief §5.2).
+    #[must_use]
+    pub fn runner(&self) -> Arc<Runner> {
+        Arc::clone(&self.runner)
+    }
+
+    /// The window's way back into this server's routing (MG-13 review round 2).
+    ///
+    /// The window installs, acknowledges and removes models on its own worker thread while the
+    /// connections are answering, and every one of those changes what this start can run.
+    #[must_use]
+    pub fn routing(&self) -> Routing {
+        Routing { context: Arc::clone(&self.context) }
+    }
+
+    /// Work out again what this machine has installed, and point the queue at it. The window does the
+    /// same through `Source::refresh_routing`; this is for a caller that owns the server.
+    pub fn refresh_routing(&self) {
+        self.context.refresh_routing();
     }
 
     /// The flag that asks this server to stop, so the binary can watch stdin without owning the
@@ -283,6 +347,22 @@ impl Server {
             endpoint::remove(path, &self.token)?;
         }
         Ok(())
+    }
+}
+
+/// The live routing of a running server, for the window that shares the process with it.
+///
+/// Cheap to clone and safe to hold: it names the same table the connections answer from, so the
+/// window's worker and PhotoCraft cannot end up with different answers about what is ready.
+#[derive(Clone)]
+pub struct Routing {
+    context: Arc<Context>,
+}
+
+impl Routing {
+    /// Work out again what this machine has installed, and point the queue at it.
+    pub fn refresh(&self) {
+        self.context.refresh_routing();
     }
 }
 
@@ -638,7 +718,7 @@ fn route(stream: &mut Connection, context: &Context, head: &Head, unread: &mut U
     }
     if path == PATH_TASKS {
         return if method == "GET" {
-            send(stream, context, Status::Ok, Some(JSON), &protocol::tasks(&context.offered))
+            send(stream, context, Status::Ok, Some(JSON), &protocol::tasks(&context.offered()))
         } else {
             unknown_path(stream, context, path)
         };
@@ -698,7 +778,11 @@ fn submit(stream: &mut Connection, context: &Context, head: &Head, unread: &mut 
     *unread = Unread::Nothing;
     let parts = multipart::parse(head.header("content-type"), &body)?;
     let request = JobRequest::parse(parts.job)?;
-    request.validate(&context.offered)?;
+    // MG-13 review round 7, finding 4331629574: the request is checked against the task list of the
+    // snapshot this queue slot was taken from, and that snapshot's backend is the one its job runs on.
+    // Checking a fresh copy here and letting the worker take a third would let a "Check again" land
+    // between the two and run an accepted job against a backend that was never offered to it.
+    request.validate(admission.offered())?;
     let [width, height] = request.image_size;
     admission.reserve_work(width, height)?;
     let frame = image::decode_image(parts.image, width, height, usize::from(request.channels), request.bit_depth)?;
@@ -720,7 +804,7 @@ pub const ENDPOINT_VARIABLE: &str = ENDPOINT_ENV;
 #[cfg(test)]
 mod tests {
     use super::{Accept, Context, MAX_CONNECTIONS, READ_TIMEOUT, ServeOptions, Server, StopHandle, accept_loop, state_name};
-    use crate::job::{Backend, MAX_QUEUE, Runner, State};
+    use crate::job::{self, Backend, MAX_QUEUE, Runner, State};
     use crate::protocol::TASK_FILL;
     use crate::routing;
     use std::io::{ErrorKind, Read, Write};
@@ -758,12 +842,22 @@ mod tests {
             std::io::Error::other("Too many open files"),
         ];
         let flaky = Flaky { listener, failures: Mutex::new(failures) };
-        let runner = Arc::new(Runner::new(Backend::Fake { step_delay: Duration::ZERO }, MAX_QUEUE).expect("the worker starts"));
+        let runner = Arc::new(
+            Runner::with_routing(
+                job::Snapshot::new(routing::Offered::fake(), Backend::Fake { step_delay: Duration::ZERO }),
+                MAX_QUEUE,
+                job::DEFAULT_MEMORY_BYTES,
+            )
+            .expect("the worker starts"),
+        );
         let options = ServeOptions::default();
         let context = Arc::new(Context {
             port,
             token: "t".repeat(64),
-            offered: routing::Offered::fake(),
+            fake_backend: true,
+            step_delay: options.step_delay,
+            models_root: options.models_root.clone(),
+            device: options.device,
             read_timeout: options.read_timeout,
             head_timeout: options.head_timeout,
             body_timeout: options.body_timeout,

@@ -32,14 +32,19 @@ memory_mib = 1500
 backends = { cpu = "supported", cuda = "supported", coreml = "untested" }
 provenance = "An ONNX port (Hugging Face Carve/LaMa-ONNX) of advimman's big-lama, trained on Places365; downloaded and checked on the CraftML PC on Oct 13, 2026 (docs/models/lama.md)."
 
-# Erik's override (decision D2, Oct 13, 2026): the weights are Apache-2.0 but Places365 is licensed
-# for non-commercial research, so this model is M1 and personal use only until it is replaced (D7).
-# The note is what caim models install shows, and what has to be acknowledged once.
+# Erik's override (decision D2, Oct 13, 2026; wording approved Oct 20, 2026): the code and the weights
+# are Apache-2.0, but the training set is licensed for non-commercial research and education, so this
+# model is M1 and not for paid or client jobs until it is replaced (D7). The note is what caim models
+# install shows, and what has to be acknowledged once - and because the acknowledgement is bound to
+# the note's hash (store.rs), changing this text asks every existing install once more. Erik approved
+# that as intended (agents/CAIM-UI-BRIEF.md section 6, item 2). Erik's approved sentence named
+# Places2; the bytes pinned above were trained on Places365 (docs/models/lama.md), so the note below
+# says Places365 and the rest of the sentence is as approved.
 [model.override]
 by = "Erik"
 date = "2026-10-13"
-reason = "D2: M1 and personal use only; replace before any public release (D7)"
-note = "LaMa was trained on Places365, whose images are licensed for non-commercial research. Use it for personal work only."
+reason = "D2: M1, non-commercial research and education only; not for paid or client jobs; replace before any public release (D7)"
+note = "LaMa's code and weights are Apache-2.0, but it was trained on Places365, whose images are licensed for non-commercial research and education. Not for paid or client jobs."
 
 # MG-10, decision D12 (Erik, Oct 17, 2026): the lite checkpoint - BiRefNet_lite, the swin_v1_tiny
 # backbone of the general model - is the CPU default. These are the bytes of the GitHub release

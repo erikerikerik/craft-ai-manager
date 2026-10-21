@@ -146,6 +146,52 @@ fn trim(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The newest `limit` finished jobs, newest first.
+///
+/// The window reads the log instead of remembering it, so a restart still shows what ran. A file
+/// far larger than the log can legitimately hold is read from the end, exactly as [trim] reads it,
+/// and a line that is not one CAIM wrote is skipped rather than guessed at. A log that is not there
+/// is an empty answer: nothing has run yet.
+#[must_use]
+pub fn read_recent(path: &Path, limit: usize) -> Vec<Record> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let Ok(file) = File::open(path) else {
+        return Vec::new();
+    };
+    let skip = file.metadata().ok().map(|metadata| metadata.len().saturating_sub(MAX_READ_BYTES)).unwrap_or(0);
+    let mut reader = BufReader::new(file);
+    if skip > 0 {
+        if reader.seek(SeekFrom::Start(skip)).is_err() {
+            return Vec::new();
+        }
+        // The first thing read is the tail of a line that started before the seek.
+        let mut partial = String::new();
+        let _ = reader.read_line(&mut partial);
+    }
+    let mut kept: VecDeque<Record> = VecDeque::new();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        let text = line.trim_end_matches(['\n', '\r']);
+        if text.is_empty() || text.len() > MAX_LINE_BYTES {
+            continue;
+        }
+        if let Ok(record) = serde_json::from_str::<Record>(text) {
+            kept.push_back(record);
+            if kept.len() > limit {
+                kept.pop_front();
+            }
+        }
+    }
+    kept.into_iter().rev().collect()
+}
+
 /// A temp name in the same folder as the target, so the rename stays inside one folder.
 fn temp_path(path: &Path) -> PathBuf {
     let counter = WRITE_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -168,9 +214,66 @@ pub fn utc_stamp(unix: u64) -> String {
     format!("{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z", seconds / 3_600, seconds % 3_600 / 60, seconds % 60)
 }
 
+/// The window's inverse of [utc_stamp]: a log timestamp back into seconds since the epoch.
+///
+/// The window says how long ago a job ran, so it has to read the log's stamps as numbers. The
+/// parser is as strict as [utc_stamp] is tidy: exactly twenty characters, digits exactly where the
+/// shape promises digits, a capital `T`, a trailing `Z`, and a date that exists. Anything else
+/// answers `None`, which the window reads as "we do not know when", never as a guess.
+#[must_use]
+pub fn unix_from_stamp(stamp: &str) -> Option<u64> {
+    let bytes = stamp.as_bytes();
+    let shape = bytes.len() == 20 && bytes[4] == b'-' && bytes[7] == b'-' && bytes[10] == b'T' && bytes[13] == b':' && bytes[16] == b':' && bytes[19] == b'Z';
+    if !shape {
+        return None;
+    }
+    let number = |start: usize, end: usize| -> Option<u64> {
+        let mut value = 0_u64;
+        for byte in bytes.get(start..end)? {
+            value = value.checked_mul(10)?.checked_add(u64::from(byte.checked_sub(b'0')?))?;
+        }
+        Some(value)
+    };
+    let year = i64::try_from(number(0, 4)?).ok()?;
+    let (month, day) = (number(5, 7)?, number(8, 10)?);
+    let (hour, minute, second) = (number(11, 13)?, number(14, 16)?, number(17, 19)?);
+    if !(1..=12).contains(&month) || !(1..=days_in_month(year, month)).contains(&day) || hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
+    let days = u64::try_from(days_from_civil(year, i64::try_from(month).ok()?, i64::try_from(day).ok()?)).ok()?;
+    days.checked_mul(86_400)?.checked_add(hour * 3_600 + minute * 60 + second)
+}
+
+/// How many days `year-month-day` is after 1970-01-01: Hinnant's `days_from_civil`, the inverse of
+/// [civil_from_days], so the two agree about leap years and centuries without a lookup table.
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let shifted = if month <= 2 { year - 1 } else { year };
+    let era = if shifted < 0 { shifted - 399 } else { shifted } / 400;
+    let year_of_era = shifted - era * 400;
+    let month_of_era = if month > 2 { month - 3 } else { month + 9 };
+    let day_of_year = (153 * month_of_era + 2) / 5 + day - 1;
+    era * 146_097 + (year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year) - 719_468
+}
+
+/// How many days a month has in a given year, or 0 for a number that is not a month.
+fn days_in_month(year: i64, month: u64) -> u64 {
+    const LENGTHS: [u64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let Some(index) = month.checked_sub(1).and_then(|month| usize::try_from(month).ok()) else {
+        return 0;
+    };
+    let Some(&days) = LENGTHS.get(index) else {
+        return 0;
+    };
+    if month == 2 && is_leap(year) { 29 } else { days }
+}
+
+/// The Gregorian leap-year rule, the one part of the calendar the log cannot leave out.
+fn is_leap(year: i64) -> bool {
+    year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
+}
 /// Howard Hinnant's `civil_from_days`: the calendar date `days` after 1970-01-01, which is what
 /// keeps this right across leap years and centuries without a table.
-fn civil_from_days(days: i64) -> (i64, u64, u64) {
+pub(crate) fn civil_from_days(days: i64) -> (i64, u64, u64) {
     let z = days + 719_468;
     let era = if z < 0 { z - 146_096 } else { z } / 146_097;
     let doe = (z - era * 146_097) as u64;
@@ -185,7 +288,7 @@ fn civil_from_days(days: i64) -> (i64, u64, u64) {
 
 #[cfg(test)]
 mod tests {
-    use super::{ACTIVITY_NAME, MAX_LINES, TRIM_AT, activity_path_for, append, utc_stamp};
+    use super::{ACTIVITY_NAME, MAX_LINES, TRIM_AT, activity_path_for, append, read_recent, unix_from_stamp, utc_stamp};
     use crate::activity::Record;
     use std::path::PathBuf;
 
@@ -246,6 +349,65 @@ mod tests {
         assert!(written.first().expect("a line").contains(&(q("fallback_reason") + ":null")));
     }
 
+    /// The window reads the log back; it does not have to remember what it wrote.
+    #[test]
+    fn the_newest_lines_come_back_newest_first_and_the_rest_are_left_out() {
+        let path = folder("read").join(ACTIVITY_NAME);
+        for state in ["done", "failed", "cancelled"] {
+            append(&path, &record(state)).expect("a line goes in");
+        }
+        let read = read_recent(&path, 2);
+        assert_eq!(read.len(), 2, "the limit is honoured");
+        assert_eq!(read.first().expect("a record").state, "cancelled", "newest first");
+        assert_eq!(read.last().expect("a record").state, "failed");
+        assert_eq!(read.first().expect("a record").elapsed_ms, Some(1_234));
+        assert_eq!(read_recent(&path, 99).len(), 3, "a limit past the end asks for everything");
+        assert!(read_recent(&path, 0).is_empty(), "asking for nothing reads nothing");
+    }
+
+    #[test]
+    fn a_log_that_is_not_there_is_nothing_and_a_line_that_is_not_ours_is_skipped() {
+        let path = folder("read-missing").join(ACTIVITY_NAME);
+        assert!(read_recent(&path, 10).is_empty(), "no log yet is not an error");
+        std::fs::write(&path, "not json at all\n{\"time\":\"2026-10-19T00:00:00Z\",\"state\":\"done\"}\n\n").expect("the file is written");
+        let read = read_recent(&path, 10);
+        assert_eq!(read.len(), 1, "the line CAIM did not write is skipped, not guessed at");
+        assert_eq!(read.first().expect("a record").state, "done");
+    }
+
+    /// The window reads the log's stamps as numbers, so the two directions have to agree.
+    #[test]
+    fn a_stamp_reads_back_as_the_seconds_it_was_written_from() {
+        for unix in [0, 1, 1_760_320_800, 1_709_209_200, 951_782_400, 1_735_689_600, 4_102_444_800] {
+            assert_eq!(unix_from_stamp(&utc_stamp(unix)), Some(unix), "round trip for {unix}");
+        }
+        assert_eq!(utc_stamp(1_709_209_200), "2024-02-29T12:20:00Z", "the sample really does cross the leap day");
+        assert_eq!(utc_stamp(4_102_444_800), "2100-01-01T00:00:00Z", "and it crosses a century year that is not a leap year");
+    }
+
+    #[test]
+    fn a_stamp_that_is_not_one_we_wrote_is_not_a_time() {
+        for stamp in [
+            "",
+            "2026-10-19T01:02:03",
+            "2026-10-19t01:02:03Z",
+            "2026-10-19T01:02:03z",
+            "2026-10-19T01:02:03ZZ",
+            " 2026-10-19T01:02:03Z",
+            "2026-1O-19T01:02:03Z",
+            "2026-13-19T01:02:03Z",
+            "2026-10-00T01:02:03Z",
+            "2026-02-30T01:02:03Z",
+            "2025-02-29T01:02:03Z",
+            "2100-02-29T01:02:03Z",
+            "2026-10-19T24:02:03Z",
+            "2026-10-19T01:60:03Z",
+            "2026-10-19T01:02:60Z",
+        ] {
+            assert_eq!(unix_from_stamp(stamp), None, "{stamp:?} is not a stamp CAIM wrote");
+        }
+        assert_eq!(unix_from_stamp("2024-02-29T00:00:00Z"), Some(1_709_164_800), "a leap day that exists is read normally");
+    }
     #[test]
     fn a_log_over_1100_lines_is_trimmed_to_the_newest_1000() {
         let path = folder("trim").join(ACTIVITY_NAME);

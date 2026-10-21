@@ -1,6 +1,6 @@
 //! The `caim` binary: `caim serve` (also the default) runs the loopback server, `--fake-backend`
-//! runs jobs on the built-in fake fill, `--device` asks for a backend, `caim open` starts the manager
-//! unless one is already answering, `caim models ...` looks after the model store, `caim cuda ...`
+//! runs jobs on the built-in fake fill, `--device` asks for a backend, `caim open` opens the manager's
+//! window unless one is already answering, `caim models ...` looks after the model store, `caim cuda ...`
 //! looks after the CUDA libraries, and `--version` / `--help` answer without starting anything.
 
 #![forbid(unsafe_code)]
@@ -15,6 +15,7 @@ use craft_ai_manager::endpoint::{self, Launch};
 use craft_ai_manager::error::{Fail, Status};
 use craft_ai_manager::models;
 use craft_ai_manager::server::StopHandle;
+use craft_ai_manager::window;
 use craft_ai_manager::{Action, EXIT_FAILED, EXIT_MODEL, EXIT_USAGE, ServeOptions, Server, USAGE, VERSION, classify};
 
 fn main() -> std::process::ExitCode {
@@ -49,7 +50,7 @@ fn main() -> std::process::ExitCode {
 fn help() {
     println!("{USAGE}");
     println!("  serve             run the loopback server (this is also the default)");
-    println!("  open              start the manager, or say that one is already running");
+    println!("  open              open the manager's window, or say that one is already running");
     println!("  --fake-backend    run jobs on the built-in mean-colour fill, to try the protocol out");
     println!("  --device          ask for a backend for every job: auto, cuda or cpu (default auto)");
     println!("  models list       one line per catalog entry: task, size, licences, and whether it is installed");
@@ -88,13 +89,7 @@ fn serve_and_release(fake_backend: bool, device: device::Setting, launch_lock: O
         Err(fail) => return report(fail),
     };
     drop(launch_lock);
-    let endpoint_variable = endpoint::ENDPOINT_ENV;
-    println!("Craft AI Manager {VERSION} listening on 127.0.0.1:{}", server.port());
-    match server.endpoint_path() {
-        Some(path) => println!("endpoint file: {}", path.display()),
-        None => println!("endpoint file: none, so a client needs {endpoint_variable} to find this port"),
-    }
-    println!("backend: {}", server.backend_note());
+    print_started(&server);
     if std::io::stdin().is_terminal() {
         println!("press Enter or Ctrl+C to stop cleanly. A second Ctrl+C leaves at once.");
         watch_stdin(server.stop_signal());
@@ -106,8 +101,58 @@ fn serve_and_release(fake_backend: bool, device: device::Setting, launch_lock: O
     }
 }
 
+/// What the terminal says once a manager is listening: the port, where the endpoint file is, and
+/// which backend this start runs. `caim serve` and `caim open` say the same thing to whoever is
+/// reading the terminal.
+fn print_started(server: &Server) {
+    let endpoint_variable = endpoint::ENDPOINT_ENV;
+    println!("Craft AI Manager {VERSION} listening on 127.0.0.1:{}", server.port());
+    match server.endpoint_path() {
+        Some(path) => println!("endpoint file: {}", path.display()),
+        None => println!("endpoint file: none, so a client needs {endpoint_variable} to find this port"),
+    }
+    println!("backend: {}", server.backend_note());
+}
+
+/// `caim open` when nothing was answering: serve in this process and open the window (MG-13).
+///
+/// Brief rule 1: the window is the server, so it gets the queue this server answers with and calls
+/// the library itself rather than the CLI. Brief rule 4: closing the window is what turns the AI
+/// features off, so the stop handle exists before the window does and the server shuts down as soon
+/// as the window is gone.
+///
+/// A machine that cannot draw a window - no readable system font, no usable graphics device - loses
+/// the window, not the manager: the sentence goes to the terminal and the terminal becomes the front
+/// end, the way [serve_and_release] has it.
+fn open_manager(device: device::Setting, launch_lock: Option<endpoint::LaunchLock>) -> std::process::ExitCode {
+    // As in [serve_and_release]: the handler goes in before the endpoint file exists, so a
+    // supervisor that stops the process as soon as it can find the port still gets a clean stop.
+    let stop = StopHandle::new();
+    if let Err(fail) = watch_signals(&stop) {
+        eprintln!("{}", fail.sentence);
+    }
+    let mut server = match Server::start_with_stop(ServeOptions { fake_backend: false, device, ..ServeOptions::default() }, &stop) {
+        Ok(server) => server,
+        Err(fail) => return report(fail),
+    };
+    drop(launch_lock);
+    print_started(&server);
+    if let Err(fail) = window::open(&mut server, &stop) {
+        eprintln!("{}", fail.sentence);
+        println!("Craft AI Manager keeps serving without its window.");
+        if std::io::stdin().is_terminal() {
+            println!("press Enter or Ctrl+C to stop cleanly. A second Ctrl+C leaves at once.");
+            watch_stdin(server.stop_signal());
+        }
+        server.wait();
+    }
+    match server.shutdown() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(fail) => report(fail),
+    }
+}
 /// `caim open`: start the manager unless one is already answering on loopback (amendment 18).
-/// When nothing is answering, this is `caim serve` for now - MG-13 gives the manager its window.
+/// When nothing is answering, this starts serving and opens the manager's window (MG-13).
 ///
 /// The decision and the start are one step rather than two: a second `caim open` launched at the
 /// same moment waits on a lock file beside the endpoint file instead of starting a manager that
@@ -135,7 +180,7 @@ fn open() -> std::process::ExitCode {
             println!("Craft AI Manager is already running on 127.0.0.1:{port}. Nothing was started.");
             std::process::ExitCode::SUCCESS
         }
-        Launch::Start => serve_and_release(false, device::Setting::Auto, launch_lock),
+        Launch::Start => open_manager(device::Setting::Auto, launch_lock),
     }
 }
 

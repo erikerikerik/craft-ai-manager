@@ -109,6 +109,22 @@ impl Backend {
             Backend::Real { .. } => "none: no model is installed yet".to_string(),
         }
     }
+
+    /// The device setting every job on this start resolves against, or `None` when the backend has
+    /// no device of its own.
+    ///
+    /// MG-13 review round 6: the window has to say which hardware an AI feature would run on, and
+    /// the only honest source for that is the backend the queue is pointing at. `--device cpu` is a
+    /// fact about this run that no amount of probing changes, so it travels with the backend rather
+    /// than being re-read from the command line. The fake backend and a start with nothing installed
+    /// name no hardware at all, which the window reads as "this run has not chosen a device".
+    #[must_use]
+    pub fn device_setting(&self) -> Option<device::Setting> {
+        match self {
+            Backend::Real { device, .. } => Some(*device),
+            Backend::NoModel | Backend::Fake { .. } => None,
+        }
+    }
 }
 
 /// The device chain for one job (MG-11), decided from the model that is about to run.
@@ -183,6 +199,15 @@ struct Entry {
     provenance: Option<Provenance>,
     /// When the job finished, which starts the ten-minute clock.
     finished_at: Option<Instant>,
+    /// When the worker took the job, which is what lets the window say "Started 2 s ago".
+    started_at: Option<Instant>,
+    /// The backend this job was accepted against (MG-13 review round 7, finding 4331629574).
+    ///
+    /// A request is checked against the task list of one routing snapshot, and this is the backend
+    /// from that same snapshot, so the job runs on what the answer of "accepted" was based on even if
+    /// a "Check again" has pointed the queue somewhere else by the time the job reaches the front.
+    /// A model this run removed is still refused, because [Runner::retire_task] is checked first.
+    backend: Arc<Backend>,
 }
 
 /// The jobs this manager knows about, in the order they arrived.
@@ -192,17 +217,44 @@ struct Shared {
     pending: usize,
     /// Where finished jobs are logged, or `None` when this run has nowhere to log.
     activity: Option<PathBuf>,
+    /// Tasks whose model this run has removed. The window is the process that removes a model it is
+    /// serving (brief §5.2), so the queue has to stop routing to it rather than trust the store.
+    retired: Vec<String>,
+}
+
+/// The job the worker is inside right now, in the shape the window draws it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Active {
+    /// The job id, so the window can name the job it is asking about.
+    pub id: String,
+    /// The task the job asked for, which picks the window's sentence.
+    pub task: String,
+    /// How long the worker has had the job.
+    pub started_secs: u64,
+    /// The backend's progress, as a whole percentage.
+    pub progress_percent: u64,
 }
 
 /// A queue slot is reserved before HTTP buffers a body; all failure paths release it.
+///
+/// It also carries the routing snapshot the slot was taken from, so the task list a request is
+/// checked against and the backend its job runs on are the same pair to the end (MG-13 review
+/// round 7, finding 4331629574).
 pub(crate) struct Admission {
     shared: Arc<Mutex<Shared>>,
     body: Option<Reservation>,
     work: Option<Reservation>,
     pending: bool,
+    routing: Snapshot,
 }
 
 impl Admission {
+    /// The tasks this slot was admitted against, from the snapshot whose backend will run the job.
+    #[must_use]
+    pub(crate) fn offered(&self) -> &routing::Offered {
+        &self.routing.offered
+    }
+
     pub(crate) fn reserve_work(&mut self, width: u32, height: u32) -> Result<()> {
         let body = self.body.as_mut().ok_or_else(|| Fail::internal("This upload has already reserved its working space."))?;
         let bytes = memory::upload_work_bytes(width, height, body.bytes())?;
@@ -247,6 +299,31 @@ fn lock(shared: &Arc<Mutex<Shared>>) -> std::sync::MutexGuard<'_, Shared> {
     shared.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// What this manager can run right now: the tasks it advertises and the backend that runs them.
+///
+/// MG-13 review round 3: these two are one value because a job is accepted by the first and run by
+/// the second. Kept apart, a refresh could advertise a model the queue was not yet pointed at, and a
+/// job accepted in that moment ran on the old backend and failed as not ready.
+#[derive(Clone, Debug)]
+pub struct Snapshot {
+    offered: routing::Offered,
+    backend: Arc<Backend>,
+}
+
+impl Snapshot {
+    /// The pair as one start, or one refresh, worked it out.
+    #[must_use]
+    pub fn new(offered: routing::Offered, backend: Backend) -> Self {
+        Self { offered, backend: Arc::new(backend) }
+    }
+}
+
+/// The routing the worker runs the next job on. The cell is only ever held for the clone, never
+/// across a job, so a refresh while a job is running cannot block the worker or interrupt it.
+fn snapshot_of(cell: &Mutex<Snapshot>) -> Snapshot {
+    cell.lock().unwrap_or_else(PoisonError::into_inner).clone()
+}
+
 /// The job with this id, if this manager still knows about it.
 fn find_mut<'a>(jobs: &'a mut [Entry], id: &str) -> Option<&'a mut Entry> {
     jobs.iter_mut().find(|entry| entry.id == id)
@@ -254,6 +331,17 @@ fn find_mut<'a>(jobs: &'a mut [Entry], id: &str) -> Option<&'a mut Entry> {
 
 fn find<'a>(jobs: &'a [Entry], id: &str) -> Option<&'a Entry> {
     jobs.iter().find(|entry| entry.id == id)
+}
+
+/// Whether this run has stopped routing jobs to this task's model, because the window removed it.
+fn is_retired(shared: &Arc<Mutex<Shared>>, task: &str) -> bool {
+    lock(shared).retired.iter().any(|retired| retired == task)
+}
+
+/// A job's progress, as the whole percentage the window shows at the end of a feature row.
+#[must_use]
+fn percent(progress: f64) -> u64 {
+    (progress.clamp(0.0, 1.0) * 100.0).round_ties_even() as u64
 }
 
 /// The queue, the worker, and everything the HTTP layer needs to answer the jobs endpoints.
@@ -266,27 +354,47 @@ pub struct Runner {
     stop: Arc<std::sync::atomic::AtomicBool>,
     max_queue: usize,
     budget: Budget,
+    /// What the worker runs jobs on, and what this manager advertises, in one cell the window can
+    /// change while the manager is serving (MG-13 review round 2, round 3). Each job takes the pair it
+    /// was accepted against, so a job keeps the backend it was promised and a model installed
+    /// afterwards is used by the next job.
+    routing: Arc<Mutex<Snapshot>>,
 }
 
 impl Runner {
     /// Start the worker. The fake backend's `step_delay` spaces its ten progress steps, which is
     /// what lets the tests have eight jobs in flight at once.
     pub fn new(backend: Backend, max_queue: usize) -> Result<Runner> {
-        Self::with_memory_limit(backend, max_queue, DEFAULT_MEMORY_BYTES)
+        Self::with_routing(Snapshot::new(routing::Offered::default(), backend), max_queue, DEFAULT_MEMORY_BYTES)
     }
 
+    #[cfg(test)]
     pub(crate) fn with_memory_limit(backend: Backend, max_queue: usize, memory_limit: usize) -> Result<Runner> {
+        Self::with_routing(Snapshot::new(routing::Offered::default(), backend), max_queue, memory_limit)
+    }
+
+    /// Start the worker with the routing this start worked out, which is how a server's first answer
+    /// and its first job come from the same pair (MG-13 review round 3).
+    pub(crate) fn with_routing(routing: Snapshot, max_queue: usize, memory_limit: usize) -> Result<Runner> {
         let (queue_tx, queue_rx) = std::sync::mpsc::sync_channel::<String>(MAX_RECORDS);
-        let shared = Arc::new(Mutex::new(Shared { jobs: Vec::new(), next_id: 0, pending: 0, activity: None }));
+        let shared = Arc::new(Mutex::new(Shared { jobs: Vec::new(), next_id: 0, pending: 0, activity: None, retired: Vec::new() }));
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let worker_shared = Arc::clone(&shared);
         let worker_stop = Arc::clone(&stop);
-        let backend = Arc::new(backend);
+        let routing_cell = Arc::new(Mutex::new(routing));
         let handle = std::thread::Builder::new()
             .name("caim-jobs".to_string())
-            .spawn(move || worker(worker_shared, queue_rx, worker_stop, backend))
+            .spawn(move || worker(worker_shared, queue_rx, worker_stop))
             .map_err(|error| Fail::internal(format!("Craft AI Manager could not start its job worker: {error}")))?;
-        Ok(Runner { shared, queue_tx, worker: Mutex::new(Some(handle)), stop, max_queue, budget: Budget::new(memory_limit) })
+        Ok(Runner {
+            shared,
+            queue_tx,
+            worker: Mutex::new(Some(handle)),
+            stop,
+            max_queue,
+            budget: Budget::new(memory_limit),
+            routing: Arc::clone(&routing_cell),
+        })
     }
 
     /// Point the queue at an activity log. Amendment 18 puts it next to `endpoint.json`, and a
@@ -295,7 +403,86 @@ impl Runner {
         lock(&self.shared).activity = path;
     }
 
+    /// Point the queue and the task list at a new routing (MG-13 review round 2, round 3).
+    ///
+    /// The window installs, acknowledges and removes models while this manager is already serving, so
+    /// the models on disk are not the models this start found. A job keeps the backend it was accepted
+    /// against - a session is never pulled out from under a running job, and a job still waiting in the
+    /// queue was promised the backend its request was checked against (MG-13 review round 7, finding
+    /// 4331629574) - and the next job gets the new one. The task list and the backend change inside one
+    /// lock, so a request is never accepted against a task list the queue has not caught up with.
+    pub fn set_routing(&self, offered: routing::Offered, backend: Backend) {
+        let mut cell = self.routing.lock().unwrap_or_else(PoisonError::into_inner);
+        cell.offered = offered;
+        cell.backend = Arc::new(backend);
+    }
+
+    /// The tasks this manager advertises, read from the same cell the worker takes its backend from.
+    #[must_use]
+    pub fn offered(&self) -> routing::Offered {
+        self.routing.lock().unwrap_or_else(PoisonError::into_inner).offered.clone()
+    }
+
+    /// The device setting the next job will resolve against, read from the same cell as
+    /// [Runner::offered], so the window's device statement and the queue can never disagree
+    /// (MG-13 review round 6). A refresh that points the queue at a new backend changes this too.
+    #[must_use]
+    pub fn device_setting(&self) -> Option<device::Setting> {
+        self.routing.lock().unwrap_or_else(PoisonError::into_inner).backend.device_setting()
+    }
+
+    /// Whether a job for this task still holds the model, which is not the question
+    /// [Runner::active] answers.
+    ///
+    /// A cancel marks the record `Cancelled` the moment it is asked for, so the client sees a
+    /// stopped job - and the task stops looking active - while the worker may still be inside the
+    /// backend. The record is free only once that worker has reported, which is what `finished_at`
+    /// records. Anything about to delete the model has to ask this instead (MG-13 review round 3,
+    /// finding 4321829672).
+    #[must_use]
+    pub fn task_in_flight(&self, task: &str) -> bool {
+        let shared = lock(&self.shared);
+        shared.jobs.iter().any(|entry| entry.task == task && entry.finished_at.is_none())
+    }
+
+    /// The job the worker is inside right now, if any. The window asks once per repaint, which is
+    /// how it can say "Working." and "Started 2 s ago" without keeping a copy of its own.
+    #[must_use]
+    pub fn active(&self) -> Option<Active> {
+        let shared = lock(&self.shared);
+        let entry = shared.jobs.iter().find(|entry| entry.state == State::Running)?;
+        let started = entry.started_at.unwrap_or_else(Instant::now);
+        Some(Active { id: entry.id.clone(), task: entry.task.clone(), started_secs: started.elapsed().as_secs(), progress_percent: percent(entry.progress) })
+    }
+
+    /// Stop routing jobs to a task whose model this run has just deleted (brief §5.2).
+    ///
+    /// The window is the process that is serving, so it cannot use the "a manager is listening, so
+    /// nothing was deleted" guard the CLI relies on. It retires the task first, waits out or cancels
+    /// the job that was inside it, and only then deletes the file. A job that arrives afterwards is
+    /// refused with the same sentence an uninstalled model gets; a job already queued for it fails
+    /// the same way rather than running from a session still held in memory.
+    pub fn retire_task(&self, task: &str) {
+        let mut shared = lock(&self.shared);
+        if !shared.retired.iter().any(|retired| retired == task) {
+            shared.retired.push(task.to_string());
+        }
+    }
+
+    /// Route to a task again after a removal that did not happen (MG-13 review round 2).
+    ///
+    /// Retirement means "this run deleted the file", so it may only stand while the file is gone. If
+    /// the job inside the model would not stop, or the delete failed, the model is still installed and
+    /// every job for its task has to be accepted again rather than refused until the next restart.
+    pub fn restore_task(&self, task: &str) {
+        lock(&self.shared).retired.retain(|retired| retired != task);
+    }
+
     pub(crate) fn admit(&self, body_bytes: usize) -> Result<Admission> {
+        // MG-13 review round 7, finding 4331629574: the pair is read here, before the queue lock, so
+        // the request can be checked against the same snapshot whose backend runs its job. The two
+        // locks are never held at once.
+        let routing = snapshot_of(&self.routing);
         let mut shared = lock(&self.shared);
         if self.stop.load(std::sync::atomic::Ordering::Relaxed) {
             return Err(Fail::internal(NO_WORKER));
@@ -310,7 +497,7 @@ impl Runner {
         }
         let body = self.budget.reserve(body_bytes)?;
         shared.pending += 1;
-        Ok(Admission { shared: Arc::clone(&self.shared), body: Some(body), work: None, pending: true })
+        Ok(Admission { shared: Arc::clone(&self.shared), body: Some(body), work: None, pending: true, routing })
     }
 
     /// Accept a job and put it at the back of the queue. The id is opaque to the client, and safe
@@ -323,11 +510,18 @@ impl Runner {
 
     pub(crate) fn submit_admitted(&self, task: &str, frame: Frame, mask: Vec<u8>, mut admission: Admission) -> Result<String> {
         admission.body = None;
+        let backend = Arc::clone(&admission.routing.backend);
         let id = {
             let mut shared = lock(&self.shared);
             if self.stop.load(std::sync::atomic::Ordering::Relaxed) {
                 drop(shared);
                 return Err(Fail::internal(NO_WORKER));
+            }
+            if shared.retired.iter().any(|retired| retired == task) {
+                // Brief §5.2: the window removed the model this run is serving, so a job arriving
+                // now gets the same 400 sentence an uninstalled model gets.
+                drop(shared);
+                return Err(Fail::bad_request(routing::not_ready_sentence(task)));
             }
             shared.pending = shared.pending.saturating_sub(1);
             admission.pending = false;
@@ -346,6 +540,8 @@ impl Runner {
                 memory: admission.work.take(),
                 provenance: None,
                 finished_at: None,
+                started_at: None,
+                backend,
             });
             id
         };
@@ -486,11 +682,14 @@ impl Drop for Runner {
 }
 
 /// The worker loop: take the next job, run it, then sweep finished results.
-fn worker(shared: Arc<Mutex<Shared>>, queue_rx: Receiver<String>, stop: Arc<std::sync::atomic::AtomicBool>, backend: Arc<Backend>) {
+fn worker(shared: Arc<Mutex<Shared>>, queue_rx: Receiver<String>, stop: Arc<std::sync::atomic::AtomicBool>) {
     use std::sync::atomic::Ordering;
     while !stop.load(Ordering::Relaxed) {
         match queue_rx.recv_timeout(WORKER_POLL) {
-            Ok(id) => run_one(&shared, &id, &backend),
+            // Each job carries the backend it was accepted against, so the window can change what runs
+            // next without waiting for, or interrupting, the job this worker is inside (MG-13 review
+            // round 7, finding 4331629574).
+            Ok(id) => run_one(&shared, &id),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
@@ -498,20 +697,22 @@ fn worker(shared: Arc<Mutex<Shared>>, queue_rx: Receiver<String>, stop: Arc<std:
     }
 }
 
-/// Run one job from the queue. A job cancelled while it waited never starts.
-fn run_one(shared: &Arc<Mutex<Shared>>, id: &str, backend: &Backend) {
+/// Run one job from the queue on the backend it was accepted against. A job cancelled while it
+/// waited never starts.
+fn run_one(shared: &Arc<Mutex<Shared>>, id: &str) {
     let taken = {
         let mut shared = lock(shared);
         match find_mut(&mut shared.jobs, id) {
             Some(entry) if entry.state == State::Queued => {
                 entry.state = State::Running;
                 entry.message = routing::running_message(&entry.task).to_string();
-                Some((entry.task.clone(), entry.input.take()))
+                entry.started_at = Some(Instant::now());
+                Some((entry.task.clone(), entry.input.take(), Arc::clone(&entry.backend)))
             }
             _ => None,
         }
     };
-    let Some((task, Some((image, mask)))) = taken else { return };
+    let Some((task, Some((image, mask)), backend)) = taken else { return };
     let cancel = match find(&lock(shared).jobs, id) {
         Some(entry) => Arc::clone(&entry.cancel),
         None => return,
@@ -533,20 +734,25 @@ fn run_one(shared: &Arc<Mutex<Shared>>, id: &str, backend: &Backend) {
     // The task picks the runner, and nothing else. A runner never decides which model to use, and
     // a task with no runner in this backend gets the same sentence the queue would have given it
     // before the job arrived.
-    let outcome = match (backend, task.as_str()) {
-        (Backend::NoModel, _) => Err(Fail::bad_request(routing::not_ready_sentence(&task))),
-        (Backend::Fake { step_delay }, TASK_MASK) => backend::run_mask(&image, &mask, &cancel, *step_delay, &mut progress),
-        (Backend::Fake { step_delay }, _) => backend::run_fill(&image, &mask, &cancel, *step_delay, &mut progress),
-        (Backend::Real { birefnet: Some(pipeline), device: setting, .. }, TASK_MASK) => {
-            let decision = decision_for(*setting, pipeline.manifest(), TASK_MASK, crate::birefnet::BIREFNET_ID, pipeline.session_card());
-            pipeline.run_mask_on(&image, &mask, &decision, &cancel, &mut progress)
+    let outcome = if is_retired(shared, &task) {
+        // Accepted before the window removed the model, so it never reaches a backend.
+        Err(Fail::bad_request(routing::not_ready_sentence(&task)))
+    } else {
+        match (backend.as_ref(), task.as_str()) {
+            (Backend::NoModel, _) => Err(Fail::bad_request(routing::not_ready_sentence(&task))),
+            (Backend::Fake { step_delay }, TASK_MASK) => backend::run_mask(&image, &mask, &cancel, *step_delay, &mut progress),
+            (Backend::Fake { step_delay }, _) => backend::run_fill(&image, &mask, &cancel, *step_delay, &mut progress),
+            (Backend::Real { birefnet: Some(pipeline), device: setting, .. }, TASK_MASK) => {
+                let decision = decision_for(*setting, pipeline.manifest(), TASK_MASK, crate::birefnet::BIREFNET_ID, pipeline.session_card());
+                pipeline.run_mask_on(&image, &mask, &decision, &cancel, &mut progress)
+            }
+            (Backend::Real { birefnet: None, .. }, TASK_MASK) => Err(Fail::bad_request(routing::not_ready_sentence(TASK_MASK))),
+            (Backend::Real { lama: Some(pipeline), device: setting, .. }, _) => {
+                let decision = decision_for(*setting, pipeline.manifest(), &task, lama::LAMA_ID, pipeline.session_card());
+                pipeline.run_fill_on(&image, &mask, &decision, &cancel, &mut progress)
+            }
+            (Backend::Real { lama: None, .. }, _) => Err(Fail::bad_request(routing::not_ready_sentence(&task))),
         }
-        (Backend::Real { birefnet: None, .. }, TASK_MASK) => Err(Fail::bad_request(routing::not_ready_sentence(TASK_MASK))),
-        (Backend::Real { lama: Some(pipeline), device: setting, .. }, _) => {
-            let decision = decision_for(*setting, pipeline.manifest(), &task, lama::LAMA_ID, pipeline.session_card());
-            pipeline.run_fill_on(&image, &mask, &decision, &cancel, &mut progress)
-        }
-        (Backend::Real { lama: None, .. }, _) => Err(Fail::bad_request(routing::not_ready_sentence(&task))),
     };
     drop(image);
     drop(mask);
@@ -635,7 +841,9 @@ fn finish(shared: &Arc<Mutex<Shared>>, id: &str, cancel: &std::sync::atomic::Ato
 /// device, requested, fallback, timings, state". Every field comes from the same provenance the
 /// result reports, so the log and the answer cannot disagree about which device ran or why. A job
 /// that never reached a backend has no provenance, so its line says so with nulls rather than
-/// inventing a device.
+/// inventing a device - but it still gets a time, because the window's recent activity keeps only
+/// the lines that report one (MG-13 review round 7, finding 4331629581), and a job stopped while it
+/// was inside a model gets the time it had run by the moment the stop was asked (finding 4331921368).
 fn activity_record(entry: &Entry) -> activity::Record {
     let provenance = entry.provenance.as_ref();
     activity::Record {
@@ -646,9 +854,22 @@ fn activity_record(entry: &Entry) -> activity::Record {
         device: provenance.map(|source| source.device.clone()),
         device_requested: provenance.map(|source| source.device_requested.clone()),
         fallback_reason: provenance.and_then(|source| source.fallback_reason.clone()),
-        elapsed_ms: provenance.map(|source| source.elapsed_ms),
+        elapsed_ms: Some(provenance.map_or_else(|| entry_elapsed_ms(entry), |source| source.elapsed_ms)),
         state: entry.state.wire().to_string(),
     }
+}
+
+/// How long the job took on the manager's own clock: the moment the worker took it to the moment it
+/// ended. A job stopped while it was inside a model has not ended - the worker is still in there, and
+/// `finished_at` stays empty until it reports, because that flag is what [Runner::task_in_flight]
+/// uses to keep a Remove away from a model a cancelled job still holds (MG-13 review round 3, finding
+/// 4321829672). So the line ends when it is written, which is the moment the stop was asked for
+/// (MG-13 review round 7, finding 4331921368). A job cancelled while it waited never started at all,
+/// so it ran for no time, and a failed job has its end recorded like any other.
+fn entry_elapsed_ms(entry: &Entry) -> u64 {
+    let ended = entry.finished_at.unwrap_or_else(Instant::now);
+    let started = entry.started_at.unwrap_or(ended);
+    u64::try_from(ended.saturating_duration_since(started).as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Write one finished job, and never let the log change what a job reported: amendment 18 says a
@@ -717,6 +938,8 @@ mod tests {
                 memory: None,
                 provenance: None,
                 finished_at: Some(std::time::Instant::now()),
+                started_at: None,
+                backend: std::sync::Arc::new(super::Backend::NoModel),
             });
         }
         assert_eq!(runner.admit(0).err().expect("record cap").status.code(), 503);
@@ -728,7 +951,7 @@ mod tests {
         }
         runner.admit(0).expect("expired records free admission");
     }
-    use super::{Backend, MAX_QUEUE, Provenance, Runner, State, decision_for, find, lock};
+    use super::{Backend, MAX_QUEUE, Provenance, Runner, Snapshot, State, decision_for, find, lock};
     use crate::backend;
     use crate::device;
     use crate::image::Frame;
@@ -1023,6 +1246,8 @@ mod tests {
                 diagnostics: Some("the card would not start".to_string()),
             }),
             finished_at: Some(std::time::Instant::now()),
+            started_at: None,
+            backend: Arc::new(Backend::NoModel),
         };
         let record = super::activity_record(&entry);
         assert_eq!(record.task.as_deref(), Some(TASK_FILL));
@@ -1033,6 +1258,83 @@ mod tests {
         assert_eq!(record.fallback_reason.as_deref(), Some("unsupported_model"), "and why they differ");
         assert_eq!(record.elapsed_ms, Some(1_234), "the timings are still there");
         assert_eq!(record.state, "done");
+    }
+
+    /// MG-13 review round 7, finding 4331629581: the window keeps the activity lines that report a
+    /// time, and provenance exists only for a job that reached a backend, so every failed and
+    /// cancelled job was dropped from recent activity. The newest thing the person did - the failure
+    /// they are asking about - vanished, and an older success was shown as "Last" instead.
+    #[test]
+    fn a_job_that_never_reached_a_backend_still_gives_the_window_a_time() {
+        let started = std::time::Instant::now();
+        let entry = super::Entry {
+            id: "job-1".to_string(),
+            task: TASK_FILL.to_string(),
+            state: State::Failed,
+            progress: 0.4,
+            message: "Craft AI Manager has no model for that task.".to_string(),
+            cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            input: None,
+            png: None,
+            delivering: false,
+            memory: None,
+            provenance: None,
+            finished_at: Some(started + Duration::from_millis(250)),
+            started_at: Some(started),
+            backend: Arc::new(Backend::NoModel),
+        };
+        let record = super::activity_record(&entry);
+        assert_eq!(record.state, "failed");
+        assert_eq!(record.model, None, "a job that reached no model still says it reached none");
+        let facts = crate::window::facts::job_facts(record).expect("the line the job wrote is recent activity");
+        assert_eq!(facts.task, TASK_FILL, "the failure keeps its task");
+        assert!(facts.elapsed_ms >= 250, "and reports how long it ran: {} ms", facts.elapsed_ms);
+        let cancelled = super::Entry { state: State::Cancelled, started_at: None, finished_at: Some(std::time::Instant::now()), ..entry };
+        let facts = crate::window::facts::job_facts(super::activity_record(&cancelled)).expect("a job stopped before it started is activity too");
+        assert_eq!(facts.elapsed_ms, 0, "it never started, so it ran for no time at all");
+    }
+
+    /// MG-13 review round 7, finding 4331921368: a job stopped while it was inside the model has no
+    /// `finished_at` yet, because that flag is the worker's own report and a Remove has to wait for
+    /// it. The line the Cancel writes therefore had no time, and the window filtered the one event
+    /// the person just caused out of recent activity.
+    #[test]
+    fn a_job_cancelled_while_it_is_running_still_gives_the_window_a_time() {
+        let scratch = crate::testkit::Scratch::new("job-cancel-activity");
+        let log = scratch.path.join("activity.jsonl");
+        let runner = Runner::with_routing(
+            Snapshot::new(Offered::fake(), Backend::Fake { step_delay: Duration::from_millis(40) }),
+            MAX_QUEUE,
+            super::DEFAULT_MEMORY_BYTES,
+        )
+        .expect("the worker starts");
+        runner.set_activity_log(Some(log.clone()));
+        let id = runner.submit(TASK_FILL, frame(), mask()).expect("the job is accepted");
+        let until_running = std::time::Instant::now() + PATIENCE;
+        while runner.state(&id).expect("the job exists").1 == 0.0 && std::time::Instant::now() < until_running {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(runner.state(&id).expect("the job exists").1 > 0.0, "the worker is inside the model by now");
+        runner.cancel(&id).expect("the person asks the job to stop");
+        let written = crate::activity::read_recent(&log, 10);
+        let cancelled: Vec<_> = written.iter().filter(|line| line.state == "cancelled").collect();
+        assert_eq!(cancelled.len(), 1, "the Cancel writes its line straight away");
+        let facts = crate::window::facts::job_facts(cancelled[0].clone()).expect("the window keeps the line the Cancel wrote");
+        assert_eq!(facts.task, TASK_FILL, "the cancellation keeps its task");
+        assert!(facts.elapsed_ms > 0, "it had been running when the stop was asked: {} ms", facts.elapsed_ms);
+        let until_report = std::time::Instant::now() + PATIENCE;
+        while runner.task_in_flight(TASK_FILL) && std::time::Instant::now() < until_report {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!runner.task_in_flight(TASK_FILL), "the worker has reported");
+        assert_eq!(runner.state(&id).expect("the job exists").0, State::Cancelled, "and the job stays cancelled");
+        assert_eq!(
+            crate::activity::read_recent(&log, 10).iter().filter(|line| line.state == "cancelled").count(),
+            1,
+            "the worker's report does not write the same job a second time"
+        );
+        runner.stop();
+        drop(scratch);
     }
 
     #[test]
@@ -1187,6 +1489,30 @@ mod tests {
         runner.stop();
     }
 
+    /// MG-13 review round 3, finding 4321829672: the cancel answers the client at once, so the job
+    /// is no longer the active one while the worker is still inside the model. What has to be
+    /// waited for is the worker's own report.
+    #[test]
+    fn a_cancelled_job_holds_its_model_until_the_worker_reports() {
+        let (loads, runs) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let runner = lama_runner(Duration::from_millis(20), &loads, &runs);
+        let id = runner.submit(TASK_FILL, frame(), mask()).expect("the job is accepted");
+        assert_eq!(settle(&runner, &id), State::Running, "the worker is inside the model");
+        assert!(runner.task_in_flight(TASK_FILL), "and the model is in use");
+        runner.cancel(&id).expect("a running job can be cancelled");
+        assert_eq!(runner.state(&id).expect("the record").0, State::Cancelled, "the client sees it stop straight away");
+        assert!(runner.active().is_none(), "and it is no longer the active job");
+        assert!(runner.task_in_flight(TASK_FILL), "yet the worker has not reported, so the model is still in use");
+        let reported = std::time::Instant::now() + PATIENCE;
+        while runner.task_in_flight(TASK_FILL) && std::time::Instant::now() < reported {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!runner.task_in_flight(TASK_FILL), "once the worker reports, the model is free");
+        assert_eq!(runner.state(&id).expect("the record").0, State::Cancelled, "and the client's answer never changed");
+        assert_eq!(runs.load(Ordering::SeqCst), 0, "the run never completed");
+        runner.stop();
+    }
+
     #[test]
     fn two_lama_jobs_finish_in_the_order_they_arrived() {
         let (loads, runs) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
@@ -1287,5 +1613,152 @@ mod tests {
         for _ in 0..MAX_QUEUE + 1 {
             assert_eq!(runner.submit(TASK_FILL, frame(), mask()).expect_err("still no worker").status.code(), 500, "never a 503 from leftovers");
         }
+    }
+
+    /// The window asks what the worker is inside, so it never keeps a copy of a job of its own.
+    #[test]
+    fn the_running_job_is_visible_with_its_task_and_how_long_it_has_been_running() {
+        let runner = Runner::new(Backend::Fake { step_delay: Duration::from_millis(40) }, MAX_QUEUE).expect("the worker starts");
+        assert!(runner.active().is_none(), "an idle manager has no running job");
+        let id = runner.submit(TASK_MASK, frame(), mask()).expect("the job is accepted");
+        assert_eq!(settle(&runner, &id), State::Running, "the job is inside the backend");
+        let active = runner.active().expect("the worker is inside a job");
+        assert_eq!(active.id, id);
+        assert_eq!(active.task, TASK_MASK, "the window picks its sentence from the task");
+        assert!(active.started_secs < 60, "the clock starts when the worker takes the job");
+        assert!(active.progress_percent <= 100, "a percentage is a percentage");
+        let deadline = std::time::Instant::now() + PATIENCE;
+        while runner.active().is_some() {
+            assert!(std::time::Instant::now() < deadline, "the job never finished");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(runner.active().is_none(), "a finished job is not a running job");
+        runner.stop();
+    }
+
+    /// Brief §5.2: the window removes a model this very process is serving.
+    #[test]
+    fn a_retired_task_is_refused_with_the_uninstalled_model_sentence() {
+        let runner = Runner::new(Backend::Fake { step_delay: Duration::ZERO }, MAX_QUEUE).expect("the worker starts");
+        runner.retire_task(TASK_MASK);
+        runner.retire_task(TASK_MASK);
+        let fail = runner.submit(TASK_MASK, frame(), mask()).expect_err("the model has been removed");
+        assert_eq!(fail.status.code(), 400, "{fail}");
+        assert_eq!(fail.sentence, "The Select Subject model isn't installed.", "the same sentence an uninstalled model gets");
+        assert!(lock(&runner.shared).jobs.is_empty(), "the refused job is never queued");
+        let other = runner.submit(TASK_FILL, frame(), mask()).expect("the other feature still works");
+        assert_eq!(settle(&runner, &other), State::Done, "retiring one feature leaves the other alone");
+        runner.stop();
+    }
+
+    #[test]
+    fn a_job_queued_before_the_removal_fails_with_that_sentence_instead_of_running() {
+        let runner = Runner::new(Backend::Fake { step_delay: Duration::from_millis(30) }, MAX_QUEUE).expect("the worker starts");
+        let first = runner.submit(TASK_FILL, frame(), mask()).expect("the first job holds the worker");
+        assert_eq!(settle(&runner, &first), State::Running, "the worker is busy with the first job");
+        let second = runner.submit(TASK_MASK, frame(), mask()).expect("the second job is queued");
+        runner.retire_task(TASK_MASK);
+        assert_eq!(finish(&runner, &first), State::Done, "the job already inside the backend finishes normally");
+        let deadline = std::time::Instant::now() + PATIENCE;
+        let (state, message) = loop {
+            let (state, _, message) = runner.state(&second).expect("the job exists");
+            if state.is_finished() {
+                break (state, message);
+            }
+            assert!(std::time::Instant::now() < deadline, "the queued job never reached a final state");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(state, State::Failed, "it never reaches a backend that is still holding the file");
+        assert_eq!(message, "The Select Subject model isn't installed.");
+        runner.stop();
+    }
+
+    /// MG-13 review round 2: the window installs a model while this manager is already serving.
+    #[test]
+    fn a_backend_pointed_at_an_installed_model_serves_the_next_job() {
+        let runner = Runner::new(Backend::NoModel, MAX_QUEUE).expect("the worker starts");
+        let before = runner.submit(TASK_FILL, frame(), mask()).expect("the queue takes the job");
+        assert_eq!(finish(&runner, &before), State::Failed, "nothing is installed yet");
+        assert_eq!(
+            runner.state(&before).expect("the job exists").2,
+            crate::routing::not_ready_sentence(TASK_FILL),
+            "the same sentence an uninstalled model gets"
+        );
+        runner.set_routing(crate::routing::Offered::fake(), Backend::Fake { step_delay: Duration::ZERO });
+        let id = runner.submit(TASK_FILL, frame(), mask()).expect("the model the window just installed");
+        assert_eq!(finish(&runner, &id), State::Done, "the next job runs on the backend the refresh pointed at");
+        runner.stop();
+    }
+
+    /// A refresh must not reach into a job that is already inside a backend.
+    #[test]
+    fn a_job_already_running_keeps_the_backend_it_took_when_the_backend_is_swapped() {
+        let runner = Runner::new(Backend::Fake { step_delay: Duration::from_millis(40) }, MAX_QUEUE).expect("the worker starts");
+        let first = runner.submit(TASK_FILL, frame(), mask()).expect("the first job holds the worker");
+        assert_eq!(settle(&runner, &first), State::Running, "the worker is inside the fake backend");
+        runner.set_routing(crate::routing::Offered::default(), Backend::NoModel);
+        assert_eq!(finish(&runner, &first), State::Done, "the job that was already running finishes on the backend it took");
+        let second = runner.submit(TASK_FILL, frame(), mask()).expect("the next job is still accepted");
+        assert_eq!(finish(&runner, &second), State::Failed, "the next job gets the new backend");
+        assert_eq!(runner.state(&second).expect("the job exists").2, crate::routing::not_ready_sentence(TASK_FILL));
+        runner.stop();
+    }
+
+    /// MG-13 review round 2: a Remove that did not delete must not leave the task retired.
+    #[test]
+    fn restoring_a_retired_task_routes_it_again() {
+        let runner = Runner::new(Backend::Fake { step_delay: Duration::ZERO }, MAX_QUEUE).expect("the worker starts");
+        runner.retire_task(TASK_MASK);
+        let fail = runner.submit(TASK_MASK, frame(), mask()).expect_err("the task was retired");
+        assert_eq!(fail.status.code(), 400, "{fail}");
+        runner.restore_task(TASK_MASK);
+        runner.restore_task(TASK_MASK);
+        let id = runner.submit(TASK_MASK, frame(), mask()).expect("the model is still installed, so the task routes again");
+        assert_eq!(finish(&runner, &id), State::Done, "and the job runs");
+        runner.stop();
+    }
+
+    /// MG-13 review round 3: the task list a request is checked against and the backend its job runs
+    /// on are one value, so they cannot be seen half-updated. The race itself is a window of one
+    /// instruction, which no test can land in on purpose; what this test pins is the agreement -
+    /// a start that found nothing advertises nothing, and a refresh moves both together.
+    #[test]
+    fn the_task_list_and_the_backend_move_as_one_pair() {
+        let runner =
+            Runner::with_routing(Snapshot::new(Offered::default(), Backend::NoModel), MAX_QUEUE, super::DEFAULT_MEMORY_BYTES).expect("the worker starts");
+        assert!(!runner.offered().is_ready(TASK_FILL), "a start that found no model advertises no model");
+        let early = runner.submit(TASK_FILL, frame(), mask()).expect("the queue still takes the job");
+        assert_eq!(finish(&runner, &early), State::Failed, "and it fails rather than running on a backend that was never pointed at it");
+        assert_eq!(runner.state(&early).expect("the job exists").2, crate::routing::not_ready_sentence(TASK_FILL));
+        runner.set_routing(Offered::fake(), Backend::Fake { step_delay: Duration::ZERO });
+        assert!(runner.offered().is_ready(TASK_FILL), "the same call that points the queue at a backend advertises it");
+        let id = runner.submit(TASK_FILL, frame(), mask()).expect("the model the window just installed");
+        assert_eq!(finish(&runner, &id), State::Done, "the job accepted against that list runs on that backend");
+        runner.stop();
+    }
+
+    /// MG-13 review round 7, finding 4331629574: a "Check again" landing between accepting a job and
+    /// starting it used to move the job onto whatever backend the refresh had just worked out, so a
+    /// request that had been answered "accepted" against a ready model failed as "isn't installed"
+    /// without ever reaching one. The job keeps the backend its request was checked against; only a
+    /// removal this run made (the retirement check in [run_one]) still refuses it.
+    #[test]
+    fn a_queued_job_runs_on_the_backend_its_request_was_accepted_against() {
+        let runner = Runner::with_routing(
+            Snapshot::new(Offered::fake(), Backend::Fake { step_delay: Duration::from_millis(40) }),
+            MAX_QUEUE,
+            super::DEFAULT_MEMORY_BYTES,
+        )
+        .expect("the worker starts");
+        let first = runner.submit(TASK_FILL, frame(), mask()).expect("the first job holds the worker");
+        assert_eq!(settle(&runner, &first), State::Running, "the worker is inside the first job");
+        let second = runner.submit(TASK_FILL, frame(), mask()).expect("the second job is queued against the ready model");
+        runner.set_routing(Offered::default(), Backend::NoModel);
+        assert_eq!(finish(&runner, &first), State::Done, "the job already running finishes");
+        assert_eq!(finish(&runner, &second), State::Done, "the queued job runs on the backend it was accepted against, not the refreshed one");
+        let third = runner.submit(TASK_FILL, frame(), mask()).expect("a job accepted after the refresh is queued too");
+        assert_eq!(finish(&runner, &third), State::Failed, "a job accepted against the new pair gets the new backend");
+        assert_eq!(runner.state(&third).expect("the job exists").2, crate::routing::not_ready_sentence(TASK_FILL));
+        runner.stop();
     }
 }

@@ -396,6 +396,38 @@ fn a_model_that_is_installed_and_acknowledged_is_offered_without_loading_it() {
     assert_eq!(server.get("/v1/health").status, 200, "the session is still lazy, so the start stayed fast");
 }
 
+/// MG-13 review round 2: the window installs and removes models while the manager is already
+/// serving, so the task list has to follow the disk rather than the moment the socket was bound.
+#[test]
+fn a_model_installed_after_the_start_is_offered_once_the_routing_refreshes() {
+    let root: PathBuf = support::empty_store("lama-refresh");
+    let server = support::TestServer::lama_store("lama-refresh", &root);
+    let at_start = server.get("/v1/tasks").json();
+    assert!(
+        at_start.get("tasks").and_then(Value::as_array).expect("a task list").iter().all(|task| task.get("ready").and_then(Value::as_bool) == Some(false)),
+        "nothing is installed when the server starts: {at_start:?}"
+    );
+    install(&root, "lama", true);
+    server.refresh_routing();
+    assert_eq!(
+        server.get("/v1/tasks").json().get("tasks"),
+        Some(&json!([
+            { "id": TASK, "needs_prompt": false, "max_pixels": protocol::MAX_PIXELS, "output": "image", "ready": true, "model": "lama" },
+            { "id": MASK_TASK, "needs_prompt": false, "max_pixels": 1_048_576, "output": "mask", "ready": false, "model": "birefnet-lite" }
+        ])),
+        "the model the window installed is routable without restarting the manager"
+    );
+    let model = catalog::load().expect("the catalog is part of the binary").into_iter().find(|model| model.id == "lama").expect("lama is in the catalog");
+    let _ = std::fs::remove_file(store::verified_file(&root, &model));
+    let _ = std::fs::remove_file(store::model_file(&root, &model));
+    server.refresh_routing();
+    let after_removal = server.get("/v1/tasks").json();
+    assert!(
+        after_removal.get("tasks").and_then(Value::as_array).expect("a task list").iter().all(|task| task.get("ready").and_then(Value::as_bool) == Some(false)),
+        "a model the window removed stops being offered: {after_removal:?}"
+    );
+}
+
 #[test]
 fn the_mask_model_makes_only_the_mask_task_ready() {
     let root: PathBuf = support::empty_store("birefnet-offered");
