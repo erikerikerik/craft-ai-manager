@@ -315,7 +315,9 @@ fn cuda_libraries(source: &Source, accept_note: bool, fetcher: &dyn Fetch, cance
         let (done, total) = overall.report(done, seen);
         lock(&work).cuda_progress(done, total);
     };
-    let outcome = cuda::install(&root, accept_note, fetcher, &mut progress);
+    // MG-13 review round 7, finding 4331629578: the flag has to reach the unpacking as well as the
+    // network reader, or a Cancel pressed while cuDNN is being extracted only lands in the next read.
+    let outcome = cuda::install(&root, accept_note, fetcher, &mut progress, &|| cancel.load(Ordering::Relaxed));
     let guard = source.work();
     let mut work = lock(&guard);
     if let Err(fail) = outcome {
@@ -690,6 +692,12 @@ mod tests {
         assert_eq!(done, total, "the four archives are the whole download the offer promised, so the row can read finished");
     }
 
+    /// Whether the job has reported a step, which is the only sign the worker is inside the backend
+    /// rather than about to enter it.
+    fn reported_a_step(runner: &Runner, id: &str) -> bool {
+        matches!(runner.state(id), Ok((_, progress, _)) if progress > 0.0)
+    }
+
     /// MG-13 review round 3, finding 4321829672: asking a job to stop answers the person straight
     /// away, so the model stops looking busy while the worker is still inside it. Remove has to wait
     /// for the worker's own report before it deletes anything.
@@ -699,11 +707,14 @@ mod tests {
         let (_server, source) = window_at(scratch.path.clone(), true, Duration::from_secs(2));
         let runner = source.runner();
         let id = runner.submit(TASK_FILL, frame(), mask()).expect("a job is inside the model");
+        // MG-13 review round 7: `active` says the worker has taken the job, not that it has reached
+        // the model, so a cancel landing in between used to end the job before it was ever inside.
+        // The first progress report is the proof it is in there.
         let until_running = Instant::now() + Duration::from_secs(5);
-        while runner.active().is_none() && Instant::now() < until_running {
+        while !reported_a_step(&runner, &id) && Instant::now() < until_running {
             std::thread::sleep(Duration::from_millis(5));
         }
-        assert!(runner.active().is_some(), "the worker is inside the model by now");
+        assert!(reported_a_step(&runner, &id), "the worker is inside the model by now");
         runner.cancel(&id).expect("the person asks the job to stop");
         assert!(runner.active().is_none(), "the client sees it stop straight away");
         assert!(

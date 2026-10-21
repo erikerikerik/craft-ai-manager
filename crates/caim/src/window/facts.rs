@@ -439,9 +439,10 @@ impl Source {
 /// One log line, if it is a finished job the window has words for.
 ///
 /// The brief's rule is the newest line that names a task and reports a time, which is what a done,
-/// failed or cancelled job always does. A line with no task, or one written by a run that never
-/// reached a backend, is skipped rather than guessed at.
-fn job_facts(record: activity::Record) -> Option<state::JobFacts> {
+/// failed or cancelled job always does: with no provenance to take one from, the time comes from the
+/// job's own clock, so a failure is not dropped from the list (MG-13 review round 7, finding
+/// 4331629581). A line with no task is skipped rather than guessed at.
+pub(crate) fn job_facts(record: activity::Record) -> Option<state::JobFacts> {
     let task = record.task?;
     let elapsed_ms = record.elapsed_ms?;
     let now = store::now_unix();

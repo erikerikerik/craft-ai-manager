@@ -778,7 +778,11 @@ fn submit(stream: &mut Connection, context: &Context, head: &Head, unread: &mut 
     *unread = Unread::Nothing;
     let parts = multipart::parse(head.header("content-type"), &body)?;
     let request = JobRequest::parse(parts.job)?;
-    request.validate(&context.offered())?;
+    // MG-13 review round 7, finding 4331629574: the request is checked against the task list of the
+    // snapshot this queue slot was taken from, and that snapshot's backend is the one its job runs on.
+    // Checking a fresh copy here and letting the worker take a third would let a "Check again" land
+    // between the two and run an accepted job against a backend that was never offered to it.
+    request.validate(admission.offered())?;
     let [width, height] = request.image_size;
     admission.reserve_work(width, height)?;
     let frame = image::decode_image(parts.image, width, height, usize::from(request.channels), request.bit_depth)?;

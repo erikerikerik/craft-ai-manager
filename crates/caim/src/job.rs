@@ -201,6 +201,13 @@ struct Entry {
     finished_at: Option<Instant>,
     /// When the worker took the job, which is what lets the window say "Started 2 s ago".
     started_at: Option<Instant>,
+    /// The backend this job was accepted against (MG-13 review round 7, finding 4331629574).
+    ///
+    /// A request is checked against the task list of one routing snapshot, and this is the backend
+    /// from that same snapshot, so the job runs on what the answer of "accepted" was based on even if
+    /// a "Check again" has pointed the queue somewhere else by the time the job reaches the front.
+    /// A model this run removed is still refused, because [Runner::retire_task] is checked first.
+    backend: Arc<Backend>,
 }
 
 /// The jobs this manager knows about, in the order they arrived.
@@ -229,14 +236,25 @@ pub struct Active {
 }
 
 /// A queue slot is reserved before HTTP buffers a body; all failure paths release it.
+///
+/// It also carries the routing snapshot the slot was taken from, so the task list a request is
+/// checked against and the backend its job runs on are the same pair to the end (MG-13 review
+/// round 7, finding 4331629574).
 pub(crate) struct Admission {
     shared: Arc<Mutex<Shared>>,
     body: Option<Reservation>,
     work: Option<Reservation>,
     pending: bool,
+    routing: Snapshot,
 }
 
 impl Admission {
+    /// The tasks this slot was admitted against, from the snapshot whose backend will run the job.
+    #[must_use]
+    pub(crate) fn offered(&self) -> &routing::Offered {
+        &self.routing.offered
+    }
+
     pub(crate) fn reserve_work(&mut self, width: u32, height: u32) -> Result<()> {
         let body = self.body.as_mut().ok_or_else(|| Fail::internal("This upload has already reserved its working space."))?;
         let bytes = memory::upload_work_bytes(width, height, body.bytes())?;
@@ -337,8 +355,8 @@ pub struct Runner {
     max_queue: usize,
     budget: Budget,
     /// What the worker runs jobs on, and what this manager advertises, in one cell the window can
-    /// change while the manager is serving (MG-13 review round 2, round 3). The worker takes its own
-    /// copy per job, so a job already running keeps the backend it started with and a model installed
+    /// change while the manager is serving (MG-13 review round 2, round 3). Each job takes the pair it
+    /// was accepted against, so a job keeps the backend it was promised and a model installed
     /// afterwards is used by the next job.
     routing: Arc<Mutex<Snapshot>>,
 }
@@ -364,10 +382,9 @@ impl Runner {
         let worker_shared = Arc::clone(&shared);
         let worker_stop = Arc::clone(&stop);
         let routing_cell = Arc::new(Mutex::new(routing));
-        let worker_routing = Arc::clone(&routing_cell);
         let handle = std::thread::Builder::new()
             .name("caim-jobs".to_string())
-            .spawn(move || worker(worker_shared, queue_rx, worker_stop, worker_routing))
+            .spawn(move || worker(worker_shared, queue_rx, worker_stop))
             .map_err(|error| Fail::internal(format!("Craft AI Manager could not start its job worker: {error}")))?;
         Ok(Runner {
             shared,
@@ -389,10 +406,11 @@ impl Runner {
     /// Point the queue and the task list at a new routing (MG-13 review round 2, round 3).
     ///
     /// The window installs, acknowledges and removes models while this manager is already serving, so
-    /// the models on disk are not the models this start found. A job already inside a backend keeps
-    /// the one it took - a session is never pulled out from under a running job - and the next job
-    /// gets the new one. The task list and the backend change inside one lock, so a request is never
-    /// accepted against a task list the queue has not caught up with.
+    /// the models on disk are not the models this start found. A job keeps the backend it was accepted
+    /// against - a session is never pulled out from under a running job, and a job still waiting in the
+    /// queue was promised the backend its request was checked against (MG-13 review round 7, finding
+    /// 4331629574) - and the next job gets the new one. The task list and the backend change inside one
+    /// lock, so a request is never accepted against a task list the queue has not caught up with.
     pub fn set_routing(&self, offered: routing::Offered, backend: Backend) {
         let mut cell = self.routing.lock().unwrap_or_else(PoisonError::into_inner);
         cell.offered = offered;
@@ -461,6 +479,10 @@ impl Runner {
     }
 
     pub(crate) fn admit(&self, body_bytes: usize) -> Result<Admission> {
+        // MG-13 review round 7, finding 4331629574: the pair is read here, before the queue lock, so
+        // the request can be checked against the same snapshot whose backend runs its job. The two
+        // locks are never held at once.
+        let routing = snapshot_of(&self.routing);
         let mut shared = lock(&self.shared);
         if self.stop.load(std::sync::atomic::Ordering::Relaxed) {
             return Err(Fail::internal(NO_WORKER));
@@ -475,7 +497,7 @@ impl Runner {
         }
         let body = self.budget.reserve(body_bytes)?;
         shared.pending += 1;
-        Ok(Admission { shared: Arc::clone(&self.shared), body: Some(body), work: None, pending: true })
+        Ok(Admission { shared: Arc::clone(&self.shared), body: Some(body), work: None, pending: true, routing })
     }
 
     /// Accept a job and put it at the back of the queue. The id is opaque to the client, and safe
@@ -488,6 +510,7 @@ impl Runner {
 
     pub(crate) fn submit_admitted(&self, task: &str, frame: Frame, mask: Vec<u8>, mut admission: Admission) -> Result<String> {
         admission.body = None;
+        let backend = Arc::clone(&admission.routing.backend);
         let id = {
             let mut shared = lock(&self.shared);
             if self.stop.load(std::sync::atomic::Ordering::Relaxed) {
@@ -518,6 +541,7 @@ impl Runner {
                 provenance: None,
                 finished_at: None,
                 started_at: None,
+                backend,
             });
             id
         };
@@ -658,16 +682,14 @@ impl Drop for Runner {
 }
 
 /// The worker loop: take the next job, run it, then sweep finished results.
-fn worker(shared: Arc<Mutex<Shared>>, queue_rx: Receiver<String>, stop: Arc<std::sync::atomic::AtomicBool>, routing: Arc<Mutex<Snapshot>>) {
+fn worker(shared: Arc<Mutex<Shared>>, queue_rx: Receiver<String>, stop: Arc<std::sync::atomic::AtomicBool>) {
     use std::sync::atomic::Ordering;
     while !stop.load(Ordering::Relaxed) {
         match queue_rx.recv_timeout(WORKER_POLL) {
-            // The routing is taken per job, so the window can change what runs next without waiting
-            // for, or interrupting, the job this worker is inside.
-            Ok(id) => {
-                let running = snapshot_of(&routing);
-                run_one(&shared, &id, &running.backend);
-            }
+            // Each job carries the backend it was accepted against, so the window can change what runs
+            // next without waiting for, or interrupting, the job this worker is inside (MG-13 review
+            // round 7, finding 4331629574).
+            Ok(id) => run_one(&shared, &id),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
@@ -675,8 +697,9 @@ fn worker(shared: Arc<Mutex<Shared>>, queue_rx: Receiver<String>, stop: Arc<std:
     }
 }
 
-/// Run one job from the queue. A job cancelled while it waited never starts.
-fn run_one(shared: &Arc<Mutex<Shared>>, id: &str, backend: &Backend) {
+/// Run one job from the queue on the backend it was accepted against. A job cancelled while it
+/// waited never starts.
+fn run_one(shared: &Arc<Mutex<Shared>>, id: &str) {
     let taken = {
         let mut shared = lock(shared);
         match find_mut(&mut shared.jobs, id) {
@@ -684,12 +707,12 @@ fn run_one(shared: &Arc<Mutex<Shared>>, id: &str, backend: &Backend) {
                 entry.state = State::Running;
                 entry.message = routing::running_message(&entry.task).to_string();
                 entry.started_at = Some(Instant::now());
-                Some((entry.task.clone(), entry.input.take()))
+                Some((entry.task.clone(), entry.input.take(), Arc::clone(&entry.backend)))
             }
             _ => None,
         }
     };
-    let Some((task, Some((image, mask)))) = taken else { return };
+    let Some((task, Some((image, mask)), backend)) = taken else { return };
     let cancel = match find(&lock(shared).jobs, id) {
         Some(entry) => Arc::clone(&entry.cancel),
         None => return,
@@ -715,7 +738,7 @@ fn run_one(shared: &Arc<Mutex<Shared>>, id: &str, backend: &Backend) {
         // Accepted before the window removed the model, so it never reaches a backend.
         Err(Fail::bad_request(routing::not_ready_sentence(&task)))
     } else {
-        match (backend, task.as_str()) {
+        match (backend.as_ref(), task.as_str()) {
             (Backend::NoModel, _) => Err(Fail::bad_request(routing::not_ready_sentence(&task))),
             (Backend::Fake { step_delay }, TASK_MASK) => backend::run_mask(&image, &mask, &cancel, *step_delay, &mut progress),
             (Backend::Fake { step_delay }, _) => backend::run_fill(&image, &mask, &cancel, *step_delay, &mut progress),
@@ -818,7 +841,8 @@ fn finish(shared: &Arc<Mutex<Shared>>, id: &str, cancel: &std::sync::atomic::Ato
 /// device, requested, fallback, timings, state". Every field comes from the same provenance the
 /// result reports, so the log and the answer cannot disagree about which device ran or why. A job
 /// that never reached a backend has no provenance, so its line says so with nulls rather than
-/// inventing a device.
+/// inventing a device - but it still gets a time, because the window's recent activity keeps only
+/// the lines that report one (MG-13 review round 7, finding 4331629581).
 fn activity_record(entry: &Entry) -> activity::Record {
     let provenance = entry.provenance.as_ref();
     activity::Record {
@@ -829,9 +853,19 @@ fn activity_record(entry: &Entry) -> activity::Record {
         device: provenance.map(|source| source.device.clone()),
         device_requested: provenance.map(|source| source.device_requested.clone()),
         fallback_reason: provenance.and_then(|source| source.fallback_reason.clone()),
-        elapsed_ms: provenance.map(|source| source.elapsed_ms),
+        elapsed_ms: provenance.map(|source| source.elapsed_ms).or_else(|| entry_elapsed_ms(entry)),
         state: entry.state.wire().to_string(),
     }
+}
+
+/// How long the job took on the manager's own clock: the moment the worker took it to the moment it
+/// ended. A failed or cancelled job has no provenance to take a timing from, and a job cancelled
+/// while it waited never started at all, so it ran for no time - but its line is the one the person
+/// pressing Cancel or reading a failure needs, so it gets a time rather than a gap.
+fn entry_elapsed_ms(entry: &Entry) -> Option<u64> {
+    let finished = entry.finished_at?;
+    let started = entry.started_at.unwrap_or(finished);
+    Some(u64::try_from(finished.saturating_duration_since(started).as_millis()).unwrap_or(u64::MAX))
 }
 
 /// Write one finished job, and never let the log change what a job reported: amendment 18 says a
@@ -901,6 +935,7 @@ mod tests {
                 provenance: None,
                 finished_at: Some(std::time::Instant::now()),
                 started_at: None,
+                backend: std::sync::Arc::new(super::Backend::NoModel),
             });
         }
         assert_eq!(runner.admit(0).err().expect("record cap").status.code(), 503);
@@ -1208,6 +1243,7 @@ mod tests {
             }),
             finished_at: Some(std::time::Instant::now()),
             started_at: None,
+            backend: Arc::new(Backend::NoModel),
         };
         let record = super::activity_record(&entry);
         assert_eq!(record.task.as_deref(), Some(TASK_FILL));
@@ -1218,6 +1254,40 @@ mod tests {
         assert_eq!(record.fallback_reason.as_deref(), Some("unsupported_model"), "and why they differ");
         assert_eq!(record.elapsed_ms, Some(1_234), "the timings are still there");
         assert_eq!(record.state, "done");
+    }
+
+    /// MG-13 review round 7, finding 4331629581: the window keeps the activity lines that report a
+    /// time, and provenance exists only for a job that reached a backend, so every failed and
+    /// cancelled job was dropped from recent activity. The newest thing the person did - the failure
+    /// they are asking about - vanished, and an older success was shown as "Last" instead.
+    #[test]
+    fn a_job_that_never_reached_a_backend_still_gives_the_window_a_time() {
+        let started = std::time::Instant::now();
+        let entry = super::Entry {
+            id: "job-1".to_string(),
+            task: TASK_FILL.to_string(),
+            state: State::Failed,
+            progress: 0.4,
+            message: "Craft AI Manager has no model for that task.".to_string(),
+            cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            input: None,
+            png: None,
+            delivering: false,
+            memory: None,
+            provenance: None,
+            finished_at: Some(started + Duration::from_millis(250)),
+            started_at: Some(started),
+            backend: Arc::new(Backend::NoModel),
+        };
+        let record = super::activity_record(&entry);
+        assert_eq!(record.state, "failed");
+        assert_eq!(record.model, None, "a job that reached no model still says it reached none");
+        let facts = crate::window::facts::job_facts(record).expect("the line the job wrote is recent activity");
+        assert_eq!(facts.task, TASK_FILL, "the failure keeps its task");
+        assert!(facts.elapsed_ms >= 250, "and reports how long it ran: {} ms", facts.elapsed_ms);
+        let cancelled = super::Entry { state: State::Cancelled, started_at: None, finished_at: Some(std::time::Instant::now()), ..entry };
+        let facts = crate::window::facts::job_facts(super::activity_record(&cancelled)).expect("a job stopped before it started is activity too");
+        assert_eq!(facts.elapsed_ms, 0, "it never started, so it ran for no time at all");
     }
 
     #[test]
@@ -1617,6 +1687,31 @@ mod tests {
         assert!(runner.offered().is_ready(TASK_FILL), "the same call that points the queue at a backend advertises it");
         let id = runner.submit(TASK_FILL, frame(), mask()).expect("the model the window just installed");
         assert_eq!(finish(&runner, &id), State::Done, "the job accepted against that list runs on that backend");
+        runner.stop();
+    }
+
+    /// MG-13 review round 7, finding 4331629574: a "Check again" landing between accepting a job and
+    /// starting it used to move the job onto whatever backend the refresh had just worked out, so a
+    /// request that had been answered "accepted" against a ready model failed as "isn't installed"
+    /// without ever reaching one. The job keeps the backend its request was checked against; only a
+    /// removal this run made (the retirement check in [run_one]) still refuses it.
+    #[test]
+    fn a_queued_job_runs_on_the_backend_its_request_was_accepted_against() {
+        let runner = Runner::with_routing(
+            Snapshot::new(Offered::fake(), Backend::Fake { step_delay: Duration::from_millis(40) }),
+            MAX_QUEUE,
+            super::DEFAULT_MEMORY_BYTES,
+        )
+        .expect("the worker starts");
+        let first = runner.submit(TASK_FILL, frame(), mask()).expect("the first job holds the worker");
+        assert_eq!(settle(&runner, &first), State::Running, "the worker is inside the first job");
+        let second = runner.submit(TASK_FILL, frame(), mask()).expect("the second job is queued against the ready model");
+        runner.set_routing(Offered::default(), Backend::NoModel);
+        assert_eq!(finish(&runner, &first), State::Done, "the job already running finishes");
+        assert_eq!(finish(&runner, &second), State::Done, "the queued job runs on the backend it was accepted against, not the refreshed one");
+        let third = runner.submit(TASK_FILL, frame(), mask()).expect("a job accepted after the refresh is queued too");
+        assert_eq!(finish(&runner, &third), State::Failed, "a job accepted against the new pair gets the new backend");
+        assert_eq!(runner.state(&third).expect("the job exists").2, crate::routing::not_ready_sentence(TASK_FILL));
         runner.stop();
     }
 }
