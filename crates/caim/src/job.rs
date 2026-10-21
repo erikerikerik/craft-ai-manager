@@ -842,7 +842,8 @@ fn finish(shared: &Arc<Mutex<Shared>>, id: &str, cancel: &std::sync::atomic::Ato
 /// result reports, so the log and the answer cannot disagree about which device ran or why. A job
 /// that never reached a backend has no provenance, so its line says so with nulls rather than
 /// inventing a device - but it still gets a time, because the window's recent activity keeps only
-/// the lines that report one (MG-13 review round 7, finding 4331629581).
+/// the lines that report one (MG-13 review round 7, finding 4331629581), and a job stopped while it
+/// was inside a model gets the time it had run by the moment the stop was asked (finding 4331921368).
 fn activity_record(entry: &Entry) -> activity::Record {
     let provenance = entry.provenance.as_ref();
     activity::Record {
@@ -853,19 +854,22 @@ fn activity_record(entry: &Entry) -> activity::Record {
         device: provenance.map(|source| source.device.clone()),
         device_requested: provenance.map(|source| source.device_requested.clone()),
         fallback_reason: provenance.and_then(|source| source.fallback_reason.clone()),
-        elapsed_ms: provenance.map(|source| source.elapsed_ms).or_else(|| entry_elapsed_ms(entry)),
+        elapsed_ms: Some(provenance.map_or_else(|| entry_elapsed_ms(entry), |source| source.elapsed_ms)),
         state: entry.state.wire().to_string(),
     }
 }
 
 /// How long the job took on the manager's own clock: the moment the worker took it to the moment it
-/// ended. A failed or cancelled job has no provenance to take a timing from, and a job cancelled
-/// while it waited never started at all, so it ran for no time - but its line is the one the person
-/// pressing Cancel or reading a failure needs, so it gets a time rather than a gap.
-fn entry_elapsed_ms(entry: &Entry) -> Option<u64> {
-    let finished = entry.finished_at?;
-    let started = entry.started_at.unwrap_or(finished);
-    Some(u64::try_from(finished.saturating_duration_since(started).as_millis()).unwrap_or(u64::MAX))
+/// ended. A job stopped while it was inside a model has not ended - the worker is still in there, and
+/// `finished_at` stays empty until it reports, because that flag is what [Runner::task_in_flight]
+/// uses to keep a Remove away from a model a cancelled job still holds (MG-13 review round 3, finding
+/// 4321829672). So the line ends when it is written, which is the moment the stop was asked for
+/// (MG-13 review round 7, finding 4331921368). A job cancelled while it waited never started at all,
+/// so it ran for no time, and a failed job has its end recorded like any other.
+fn entry_elapsed_ms(entry: &Entry) -> u64 {
+    let ended = entry.finished_at.unwrap_or_else(Instant::now);
+    let started = entry.started_at.unwrap_or(ended);
+    u64::try_from(ended.saturating_duration_since(started).as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Write one finished job, and never let the log change what a job reported: amendment 18 says a
@@ -1288,6 +1292,49 @@ mod tests {
         let cancelled = super::Entry { state: State::Cancelled, started_at: None, finished_at: Some(std::time::Instant::now()), ..entry };
         let facts = crate::window::facts::job_facts(super::activity_record(&cancelled)).expect("a job stopped before it started is activity too");
         assert_eq!(facts.elapsed_ms, 0, "it never started, so it ran for no time at all");
+    }
+
+    /// MG-13 review round 7, finding 4331921368: a job stopped while it was inside the model has no
+    /// `finished_at` yet, because that flag is the worker's own report and a Remove has to wait for
+    /// it. The line the Cancel writes therefore had no time, and the window filtered the one event
+    /// the person just caused out of recent activity.
+    #[test]
+    fn a_job_cancelled_while_it_is_running_still_gives_the_window_a_time() {
+        let scratch = crate::testkit::Scratch::new("job-cancel-activity");
+        let log = scratch.path.join("activity.jsonl");
+        let runner = Runner::with_routing(
+            Snapshot::new(Offered::fake(), Backend::Fake { step_delay: Duration::from_millis(40) }),
+            MAX_QUEUE,
+            super::DEFAULT_MEMORY_BYTES,
+        )
+        .expect("the worker starts");
+        runner.set_activity_log(Some(log.clone()));
+        let id = runner.submit(TASK_FILL, frame(), mask()).expect("the job is accepted");
+        let until_running = std::time::Instant::now() + PATIENCE;
+        while runner.state(&id).expect("the job exists").1 == 0.0 && std::time::Instant::now() < until_running {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(runner.state(&id).expect("the job exists").1 > 0.0, "the worker is inside the model by now");
+        runner.cancel(&id).expect("the person asks the job to stop");
+        let written = crate::activity::read_recent(&log, 10);
+        let cancelled: Vec<_> = written.iter().filter(|line| line.state == "cancelled").collect();
+        assert_eq!(cancelled.len(), 1, "the Cancel writes its line straight away");
+        let facts = crate::window::facts::job_facts(cancelled[0].clone()).expect("the window keeps the line the Cancel wrote");
+        assert_eq!(facts.task, TASK_FILL, "the cancellation keeps its task");
+        assert!(facts.elapsed_ms > 0, "it had been running when the stop was asked: {} ms", facts.elapsed_ms);
+        let until_report = std::time::Instant::now() + PATIENCE;
+        while runner.task_in_flight(TASK_FILL) && std::time::Instant::now() < until_report {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!runner.task_in_flight(TASK_FILL), "the worker has reported");
+        assert_eq!(runner.state(&id).expect("the job exists").0, State::Cancelled, "and the job stays cancelled");
+        assert_eq!(
+            crate::activity::read_recent(&log, 10).iter().filter(|line| line.state == "cancelled").count(),
+            1,
+            "the worker's report does not write the same job a second time"
+        );
+        runner.stop();
+        drop(scratch);
     }
 
     #[test]
